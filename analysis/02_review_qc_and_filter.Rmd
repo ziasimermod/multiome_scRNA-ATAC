@@ -1,0 +1,349 @@
+---
+title: "Step 2 — Review Multiome QC and create post-QC objects"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The decision made in this notebook
+
+This is the first formal manual checkpoint. We review RNA and ATAC distributions separately within each sample, record thresholds, and then make one joint keep/remove decision for every paired barcode.
+
+The logical rule is:
+
+```text
+qc_pass = qc_pass_rna AND qc_pass_atac AND qc_pass_doublet
+```
+
+A barcode with excellent RNA but unusable ATAC is not suitable for a joint WNN analysis. The reverse is also true. The separate flags remain in the metadata so the reason for failure is auditable.
+
+Use **4 CPU cores, 64 GiB memory, 8 hours, R 4.4.2, no GPU**. Only one full Seurat object is loaded at a time.
+
+# 1. Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+})
+```
+
+# 2. Load the small QC tables first
+
+Reviewing CSV metadata does not require loading the large RDS checkpoints. This lets us inspect distributions before spending memory on filtering.
+
+```{r load-qc-tables}
+step_one_marker <- file.path(OUTPUT_DIR, "01_qc", "STEP_01_COMPLETE.txt")
+assert_file(step_one_marker, "Step 1 completion marker")
+
+sample_sheet <- read_sample_sheet()
+
+metadata_tables <- lapply(sample_sheet$sample_id, function(sample_id) {
+  path <- file.path(
+    OUTPUT_DIR,
+    "01_qc",
+    "metadata",
+    paste0(sample_id, "_qc_metrics.csv")
+  )
+  assert_file(path, paste(sample_id, "QC metadata"))
+  suppressMessages(readr::read_csv(path, show_col_types = FALSE))
+})
+names(metadata_tables) <- sample_sheet$sample_id
+qc_metadata <- dplyr::bind_rows(metadata_tables)
+
+suggestions <- suppressMessages(readr::read_csv(
+  file.path(OUTPUT_DIR, "01_qc", "qc_thresholds_suggested.csv"),
+  show_col_types = FALSE
+))
+decisions <- suppressMessages(readr::read_csv(
+  QC_DECISION_PATH,
+  show_col_types = FALSE
+))
+
+suggestions
+decisions
+```
+
+# 3. Compare samples without pooling their thresholds
+
+The following plots put samples side by side for diagnosis. This does **not** imply one threshold must be shared. Look for whether an entire library shifts, whether low RNA and low ATAC coincide, and whether a high-count tail is continuous or separated.
+
+```{r compare-distributions}
+metric_order <- c(
+  "nCount_RNA",
+  "nFeature_RNA",
+  "percent.mt",
+  "nCount_ATAC",
+  "TSS.enrichment",
+  "nucleosome_signal",
+  "frip_cr"
+)
+
+qc_long <- tidyr::pivot_longer(
+  qc_metadata,
+  cols = dplyr::all_of(metric_order),
+  names_to = "metric",
+  values_to = "value"
+)
+qc_long$metric <- factor(qc_long$metric, levels = metric_order)
+
+ggplot2::ggplot(qc_long, ggplot2::aes(sample_id, value, fill = sample_id)) +
+  ggplot2::geom_violin(scale = "width", color = "grey25") +
+  ggplot2::facet_wrap(~ metric, scales = "free_y", ncol = 4) +
+  ggplot2::labs(
+    title = "Pre-filter QC distributions by Cell Ranger library",
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_classic(base_size = 11) +
+  ggplot2::theme(legend.position = "none")
+```
+
+```{r compare-rna}
+ggplot2::ggplot(
+  qc_metadata,
+  ggplot2::aes(nCount_RNA, nFeature_RNA, color = percent.mt)
+) +
+  ggplot2::geom_point(alpha = 0.25, size = 0.35) +
+  ggplot2::scale_x_log10() +
+  ggplot2::scale_y_log10() +
+  ggplot2::scale_color_viridis_c() +
+  ggplot2::facet_wrap(~ sample_id) +
+  ggplot2::labs(title = "RNA complexity before filtering") +
+  ggplot2::theme_classic(base_size = 11)
+```
+
+```{r compare-atac}
+ggplot2::ggplot(
+  qc_metadata,
+  ggplot2::aes(nCount_ATAC, TSS.enrichment, color = nucleosome_signal)
+) +
+  ggplot2::geom_point(alpha = 0.25, size = 0.35) +
+  ggplot2::scale_x_log10() +
+  ggplot2::scale_color_viridis_c() +
+  ggplot2::facet_wrap(~ sample_id) +
+  ggplot2::labs(title = "ATAC quality before filtering") +
+  ggplot2::theme_classic(base_size = 11)
+```
+
+# 4. Record the decision
+
+Open `config/qc_thresholds.csv` in RStudio. Step 1 populated blank numeric cells with starting suggestions. For every sample:
+
+1. compare the threshold to its full distribution;
+2. change values when biology or a clear quality mode supports the change;
+3. enter `reviewer`, `review_date`, and a short `decision_notes` explanation;
+4. set `approved` to `TRUE` only after review.
+
+The file is deliberately version-controlled. A future reader should be able to see not only the final cells, but the decision that produced them.
+
+```{r open-decision-file, eval=FALSE}
+file.edit(QC_DECISION_PATH)
+```
+
+Questions to discuss while reviewing:
+
+- Would the lower RNA cutoff remove a coherent low-RNA cell population or mostly a diffuse poor-quality tail?
+- Do high RNA counts and high ATAC counts occur together, consistent with possible doublets?
+- Does low TSS enrichment coincide with low ATAC counts?
+- Are thresholds broadly comparable between samples, and if not, is the difference technically plausible?
+- Is the retained fraction unexpectedly different between CON and HFD?
+
+# 5. Preview the recorded thresholds on each sample
+
+Rerun this chunk after saving the CSV. It produces threshold-overlay PDFs, but it does not yet filter cells.
+
+```{r preview-thresholds}
+decisions_preview <- suppressMessages(readr::read_csv(
+  QC_DECISION_PATH,
+  show_col_types = FALSE
+))
+
+for (sample_id in sample_sheet$sample_id) {
+  sample_metadata <- metadata_tables[[sample_id]]
+  threshold_row <- decisions_preview[
+    decisions_preview$sample_id == sample_id,
+    ,
+    drop = FALSE
+  ]
+
+  save_sample_qc_plots(
+    sample_metadata,
+    sample_id,
+    file.path(
+      OUTPUT_DIR,
+      "01_qc",
+      "plots",
+      paste0(sample_id, "_threshold_preview")
+    ),
+    thresholds = threshold_row
+  )
+}
+```
+
+# 6. Approval gate
+
+This chunk stops on purpose if a threshold is missing or a sample is not approved. That is not a software failure; it prevents an unreviewed filtering decision from propagating downstream.
+
+```{r approval-gate}
+qc_decisions <- read_and_validate_qc_decisions(sample_sheet)
+qc_decisions
+```
+
+# 7. Apply separate modality flags and one joint decision
+
+This loop never overwrites the Step 1 checkpoints. It writes new post-QC RDS objects to `02_objects/`.
+
+```{r filter-and-save, cache=FALSE}
+retention_summaries <- vector("list", nrow(sample_sheet))
+names(retention_summaries) <- sample_sheet$sample_id
+
+for (row_index in seq_len(nrow(sample_sheet))) {
+  sample_id <- sample_sheet$sample_id[row_index]
+  message_step("Step 2 sample: ", sample_id)
+
+  input_checkpoint <- file.path(
+    OUTPUT_DIR,
+    "01_qc",
+    "checkpoints",
+    paste0(sample_id, "_qc_metrics_unfiltered.rds")
+  )
+  output_checkpoint <- file.path(
+    OUTPUT_DIR,
+    "02_objects",
+    paste0(sample_id, "_post_QC.rds")
+  )
+  assert_file(input_checkpoint, paste(sample_id, "unfiltered QC checkpoint"))
+
+  object <- readRDS(input_checkpoint)
+  threshold_row <- qc_decisions[
+    qc_decisions$sample_id == sample_id,
+    ,
+    drop = FALSE
+  ]
+
+  object <- add_joint_qc_flags(object, threshold_row)
+  retention_summaries[[sample_id]] <- summarize_qc_decision(object, sample_id)
+
+  metadata_with_decision <- object[[]]
+  metadata_with_decision$barcode <- rownames(metadata_with_decision)
+  readr::write_csv(
+    metadata_with_decision,
+    file.path(
+      OUTPUT_DIR,
+      "01_qc",
+      "metadata",
+      paste0(sample_id, "_qc_decision_all_barcodes.csv")
+    )
+  )
+
+  passing_cells <- rownames(metadata_with_decision)[metadata_with_decision$qc_pass]
+  filtered_object <- subset(object, cells = passing_cells)
+  DefaultAssay(filtered_object) <- "RNA"
+  saveRDS(filtered_object, output_checkpoint, compress = FALSE)
+
+  filtered_metadata <- filtered_object[[]]
+  filtered_metadata$barcode <- rownames(filtered_metadata)
+  readr::write_csv(
+    filtered_metadata,
+    file.path(
+      OUTPUT_DIR,
+      "01_qc",
+      "metadata",
+      paste0(sample_id, "_post_QC_metadata.csv")
+    )
+  )
+
+  save_sample_qc_plots(
+    filtered_metadata,
+    sample_id,
+    file.path(
+      OUTPUT_DIR,
+      "01_qc",
+      "plots",
+      paste0(sample_id, "_after_filtering")
+    )
+  )
+
+  rm(object, filtered_object, metadata_with_decision, filtered_metadata)
+  invisible(gc())
+}
+
+retention_summary <- dplyr::bind_rows(retention_summaries)
+retention_summary
+```
+
+# 8. Save the audit trail and completion marker
+
+```{r save-step-two}
+readr::write_csv(
+  retention_summary,
+  file.path(OUTPUT_DIR, "01_qc", "qc_cell_retention_summary.csv")
+)
+readr::write_csv(
+  qc_decisions,
+  file.path(OUTPUT_DIR, "01_qc", "qc_thresholds_used.csv")
+)
+
+writeLines(
+  paste("Step 2 completed:", format(Sys.time())),
+  file.path(OUTPUT_DIR, "02_objects", "STEP_02_COMPLETE.txt")
+)
+```
+
+# 9. Final checks before common peaks
+
+```{r verify-post-qc-objects}
+post_qc_paths <- file.path(
+  OUTPUT_DIR,
+  "02_objects",
+  paste0(sample_sheet$sample_id, "_post_QC.rds")
+)
+
+data.frame(
+  sample_id = sample_sheet$sample_id,
+  checkpoint = post_qc_paths,
+  exists = file.exists(post_qc_paths),
+  size_gb = unname(file.info(post_qc_paths)$size / 1024^3)
+)
+```
+
+Before proceeding, inspect `qc_cell_retention_summary.csv` and the after-filtering plots. A very different retained fraction between CON and HFD is not automatically wrong, but it must be understood before biological comparisons.
+
+# Interpretation checkpoint
+
+1. Which metrics were evaluated separately for RNA and ATAC?
+2. At what level was the final decision made?
+3. How would you find cells that failed only ATAC QC?
+4. Why are the unfiltered QC checkpoints preserved?
+5. Which parts of the threshold decision should be committed to GitHub?
+
+# References
+
+See `docs/REFERENCES.md` for the official Signac QC and Multiome analysis documentation and the `scDblFinder` vignette.
+

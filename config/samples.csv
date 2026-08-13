@@ -1,0 +1,4 @@
+sample_id,replicate_id,genotype,diet,outs_dir
+Ppar-CON-1,Ppar-CON-1,Ppara_Ppard_iKO,CON,/scratch/dsaiz/Yesenia_scData2026/CON_cellranger-arc-output/Ppar-CON-1/outs
+Ppar-HFD-1,Ppar-HFD-1,Ppara_Ppard_iKO,HFD,/scratch/dsaiz/Yesenia_scData2026/HFD_cellranger-arc-output/Ppar-HFD-1/outs
+

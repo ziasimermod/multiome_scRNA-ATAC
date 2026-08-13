@@ -1,0 +1,281 @@
+---
+title: "Step 1 — Import each library and calculate Multiome QC metrics"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# What this step does—and does not do
+
+This step imports one Cell Ranger ARC library at a time and calculates QC information. It deliberately **does not make the final keep/remove decision**.
+
+For each paired barcode it records:
+
+- RNA counts, detected genes, mitochondrial fraction, and RNA complexity;
+- ATAC counts, TSS enrichment, nucleosome signal, and Cell Ranger FRiP;
+- a likely singlet/doublet call from `scDblFinder` using RNA counts.
+
+The output is an unfiltered QC checkpoint for each sample, a metadata CSV that is easy to plot, and a sample-aware starting suggestion for thresholds.
+
+This is a substantial computation. Begin with **8 CPU cores, 96 GiB memory, 12 hours, R 4.4.2, no GPU**. If SOL reports an out-of-memory termination, rerun this same step with 128 GiB; completed sample checkpoints are reused.
+
+# 1. Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+configure_parallel_plan()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+})
+
+# TRUE resumes from an existing per-sample QC-metric checkpoint.
+# Set FALSE only when the import/QC calculation itself must be rebuilt.
+REUSE_QC_METRIC_CHECKPOINTS <- TRUE
+```
+
+# 2. Confirm Step 0 and load project metadata
+
+```{r confirm-step-zero}
+step_zero_marker <- file.path(
+  OUTPUT_DIR,
+  "00_run_info",
+  "STEP_00_COMPLETE.txt"
+)
+assert_file(step_zero_marker, "Step 0 completion marker")
+
+sample_sheet <- read_sample_sheet()
+validate_cellranger_inputs(sample_sheet)
+
+annotation_path <- file.path(
+  OUTPUT_DIR,
+  "00_run_info",
+  "mm10_gene_annotation.rds"
+)
+assert_file(annotation_path, "saved mm10 annotation")
+gene_annotation <- readRDS(annotation_path)
+```
+
+# 3. Why QC begins separately by sample
+
+Two libraries can differ in capture efficiency, sequencing depth, or ATAC complexity even when they contain similar biology. A global count cutoff applied after merging can preferentially remove cells from the shallower library. We therefore calculate and inspect distributions within each library.
+
+RNA and ATAC metrics are also not interchangeable:
+
+| Metric | Modality | What an extreme value can suggest |
+|---|---|---|
+| `nCount_RNA` | RNA | very low RNA content or unusually high counts/doublet |
+| `nFeature_RNA` | RNA | low complexity or unusually broad expression |
+| `percent.mt` | RNA | stressed/damaged cell or ambient mitochondrial RNA; context dependent in nuclei |
+| `nCount_ATAC` | ATAC | too few fragments/cut sites or unusually high accessibility counts |
+| `TSS.enrichment` | ATAC | enrichment of insertions near promoters; low values suggest poor signal-to-background |
+| `nucleosome_signal` | ATAC | mono-nucleosomal relative to nucleosome-free fragments; lower is generally cleaner |
+| `frip_cr` | ATAC | fraction of ATAC fragments overlapping called peak regions |
+
+# 4. Import and calculate metrics one sample at a time
+
+The loop below is intentionally sample-by-sample. It saves a checkpoint and releases memory before proceeding to the next library.
+
+Only near-empty barcodes are removed before `scDblFinder`. Cell Ranger's filtered matrix has already performed cell calling, and ordinary low-quality cells should remain present while doublets are modeled. Final QC happens in Step 2.
+
+```{r calculate-qc, cache=FALSE}
+threshold_suggestions <- vector("list", nrow(sample_sheet))
+names(threshold_suggestions) <- sample_sheet$sample_id
+
+for (row_index in seq_len(nrow(sample_sheet))) {
+  sample_id <- sample_sheet$sample_id[row_index]
+  message_step("Step 1 sample: ", sample_id)
+
+  checkpoint_path <- file.path(
+    OUTPUT_DIR,
+    "01_qc",
+    "checkpoints",
+    paste0(sample_id, "_qc_metrics_unfiltered.rds")
+  )
+  metadata_path <- file.path(
+    OUTPUT_DIR,
+    "01_qc",
+    "metadata",
+    paste0(sample_id, "_qc_metrics.csv")
+  )
+
+  if (REUSE_QC_METRIC_CHECKPOINTS && file.exists(checkpoint_path)) {
+    message("Loading completed checkpoint: ", checkpoint_path)
+    object <- readRDS(checkpoint_path)
+  } else {
+    counts <- extract_10x_modalities(sample_sheet$h5[row_index])
+    rna_counts <- counts[["Gene Expression"]]
+    atac_counts <- counts[["Peaks"]]
+
+    if (!identical(colnames(rna_counts), colnames(atac_counts))) {
+      stop("RNA and ATAC barcodes differ in ", sample_id)
+    }
+
+    object <- CreateSeuratObject(
+      counts = rna_counts,
+      assay = "RNA",
+      project = sample_id,
+      min.cells = 0,
+      min.features = 0
+    )
+    object[["ATAC"]] <- CreateChromatinAssay(
+      counts = atac_counts,
+      sep = c(":", "-"),
+      fragments = sample_sheet$fragments[row_index],
+      annotation = gene_annotation,
+      min.cells = 0,
+      min.features = 0
+    )
+
+    object$sample_id <- sample_id
+    object$replicate_id <- sample_sheet$replicate_id[row_index]
+    object$genotype <- sample_sheet$genotype[row_index]
+    object$diet <- sample_sheet$diet[row_index]
+
+    object$percent.mt <- PercentageFeatureSet(
+      object,
+      assay = "RNA",
+      pattern = "^(mt-|MT-)"
+    )
+    object$percent.ribo <- PercentageFeatureSet(
+      object,
+      assay = "RNA",
+      pattern = "^(Rpl|Rps)"
+    )
+    object$log10_genes_per_umi <- log10(object$nFeature_RNA + 1) /
+      log10(object$nCount_RNA + 1)
+    object <- add_cellranger_metrics(
+      object,
+      sample_sheet$barcode_metrics[row_index]
+    )
+
+    initial_keep <- (
+      object$nCount_RNA >= ULTRA_LOW_RNA_UMI &
+        object$nFeature_RNA >= ULTRA_LOW_RNA_FEATURES
+    )
+    object <- subset(object, cells = colnames(object)[initial_keep])
+
+    DefaultAssay(object) <- "ATAC"
+    object <- NucleosomeSignal(object)
+    object <- TSSEnrichment(object, fast = TRUE)
+
+    DefaultAssay(object) <- "RNA"
+    object <- run_scdblfinder(object)
+
+    saveRDS(object, checkpoint_path, compress = FALSE)
+    rm(counts, rna_counts, atac_counts)
+  }
+
+  required_metadata <- c(
+    "nCount_RNA",
+    "nFeature_RNA",
+    "percent.mt",
+    "nCount_ATAC",
+    "TSS.enrichment",
+    "nucleosome_signal",
+    "frip_cr",
+    "scDblFinder.class"
+  )
+  absent_metadata <- setdiff(required_metadata, colnames(object[[]]))
+  if (length(absent_metadata) > 0L) {
+    stop(
+      "Checkpoint for ", sample_id, " lacks: ",
+      paste(absent_metadata, collapse = ", "),
+      ". Set REUSE_QC_METRIC_CHECKPOINTS <- FALSE to rebuild it."
+    )
+  }
+
+  metadata <- object[[]]
+  metadata$barcode <- rownames(metadata)
+  readr::write_csv(metadata, metadata_path)
+
+  plot_prefix <- file.path(
+    OUTPUT_DIR,
+    "01_qc",
+    "plots",
+    paste0(sample_id, "_before_filtering")
+  )
+  save_sample_qc_plots(metadata, sample_id, plot_prefix)
+
+  threshold_suggestions[[sample_id]] <- make_qc_threshold_suggestion(
+    object,
+    sample_id
+  )
+
+  rm(object, metadata)
+  invisible(gc())
+}
+```
+
+# 5. Save starting suggestions—without approving them
+
+Count cutoffs are suggested from broad hard limits plus four median absolute deviations on a log scale within each sample. This is a robust way to identify extreme tails, but it cannot decide whether a tail represents a rare, valid colon population. That requires plots and marker-aware biological judgment.
+
+This chunk fills previously blank numeric cells in `config/qc_thresholds.csv`. It does **not** change `approved` to `TRUE` and does not overwrite numeric decisions that are already present.
+
+```{r save-suggestions}
+threshold_suggestions <- dplyr::bind_rows(threshold_suggestions)
+
+suggestion_path <- file.path(
+  OUTPUT_DIR,
+  "01_qc",
+  "qc_thresholds_suggested.csv"
+)
+readr::write_csv(threshold_suggestions, suggestion_path)
+
+qc_decision_draft <- populate_qc_decision_draft(threshold_suggestions)
+qc_decision_draft
+```
+
+```{r complete-step-one}
+writeLines(
+  paste("Step 1 completed:", format(Sys.time())),
+  file.path(OUTPUT_DIR, "01_qc", "STEP_01_COMPLETE.txt")
+)
+```
+
+# What to inspect before Step 2
+
+For each sample, inspect the three PDFs under `01_qc/plots/`:
+
+1. QC distributions: are there shoulders, long tails, or clear low-quality modes?
+2. RNA complexity: is the count–feature relationship smooth, and do high-mitochondrial cells occupy a distinct region?
+3. ATAC quality: do low-count barcodes also show low TSS enrichment or high nucleosome signal?
+
+Do not select a threshold because one isolated cell looks unusual. Look for distributions and joint patterns.
+
+# Interpretation checkpoint
+
+1. Why were samples processed separately at this stage?
+2. Why were only near-empty barcodes removed before doublet calling?
+3. What biological or technical property does each QC metric measure?
+4. Why are the automatically suggested thresholds still marked unapproved?
+
+# References
+
+See `docs/REFERENCES.md` for the official Signac QC workflow, 10x per-barcode metrics, and `scDblFinder` vignette.
+

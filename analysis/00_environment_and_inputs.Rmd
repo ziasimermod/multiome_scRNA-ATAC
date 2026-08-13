@@ -1,0 +1,185 @@
+---
+title: "Step 0 — Check the R environment and Cell Ranger ARC inputs"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# What this step teaches
+
+Before creating a Seurat object, we verify three things:
+
+1. R can load every required package from the same library that will be used for the analysis.
+2. Each row of the sample sheet represents a real biological library and points to the expected Cell Ranger ARC outputs.
+3. The genome annotation uses the same mouse genome naming convention as the ATAC data.
+
+This is a light validation step. A reasonable SOL RStudio request is **2 CPU cores, 16 GiB memory, 2 hours, R 4.4.2, no GPU**.
+
+Do not run analysis on a SOL login node. Open this notebook from an allocated Open OnDemand RStudio Server session.
+
+# 1. Open the RStudio Project
+
+Open `multiome_scRNA-ATAC.Rproj` before running this notebook. The setup chunk finds the repository root whether the notebook working directory is the project root or the `analysis/` directory.
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+```
+
+# 2. Confirm R and package namespaces
+
+`installed.packages()` can report that a top-level package exists even when one of its imported dependencies is missing. For that reason, this check calls `loadNamespace()` on each required package. It catches the same class of dependency failures previously seen for `RANN`, `spam`, `cluster`, `igraph`, `fastmatch`, and `biovizBase`.
+
+If this chunk stops, run `setup/install_packages.R` in a clean R 4.4.2 session and then restart RStudio.
+
+```{r package-preflight}
+check_r_version()
+package_status <- package_preflight()
+package_status
+```
+
+```{r current-libraries}
+cat("R version:\n", R.version.string, "\n\n")
+cat("R executable:\n", Sys.which("R"), "\n\n")
+cat("R_LIBS_USER:\n", Sys.getenv("R_LIBS_USER"), "\n\n")
+cat("Library search paths:\n")
+print(.libPaths())
+```
+
+# 3. Read the sample sheet
+
+The sample sheet is the biological map for the analysis. `sample_id` names a library; `replicate_id` names the independent animal/specimen that could eventually support statistical replication.
+
+```{r read-sample-sheet}
+sample_sheet <- read_sample_sheet()
+sample_sheet[, c(
+  "sample_id",
+  "replicate_id",
+  "genotype",
+  "diet",
+  "outs_dir"
+)]
+```
+
+## Important design limitation
+
+There is one `CON` sample and one `HFD` sample. Therefore, diet and sample are completely confounded. Thousands of nuclei do not turn one mouse into thousands of biological replicates. Downstream HFD-versus-CON summaries will be descriptive until additional independent animals are added.
+
+```{r replication-table}
+replication_table <- as.data.frame(with(
+  sample_sheet,
+  table(diet, replicate_id)
+))
+replication_table[replication_table$Freq > 0, ]
+```
+
+# 4. Validate required Cell Ranger ARC files
+
+For each library we require:
+
+- `filtered_feature_bc_matrix.h5`: paired Gene Expression and Peaks matrices;
+- `atac_fragments.tsv.gz` and `.tbi`: ATAC fragments plus tabix index;
+- `atac_peaks.bed`: sample-specific Cell Ranger peak calls;
+- `per_barcode_metrics.csv`: paired RNA/ATAC barcode metrics.
+
+The optional `web_summary.html` should also be reviewed before cell-level QC because a severely failed library cannot be rescued by filtering individual barcodes.
+
+```{r validate-inputs}
+input_report <- validate_cellranger_inputs(sample_sheet)
+input_report
+```
+
+```{r locate-web-summaries}
+data.frame(
+  sample_id = sample_sheet$sample_id,
+  web_summary = sample_sheet$web_summary,
+  exists = file.exists(sample_sheet$web_summary)
+)
+```
+
+Open each existing `web_summary.html` from the RStudio Files pane. At the library level, discuss:
+
+- how many nuclei Cell Ranger called;
+- sequencing saturation and read depth;
+- fraction of reads in peaks;
+- TSS enrichment;
+- whether RNA and ATAC metrics both look plausible;
+- whether one library differs dramatically from the other.
+
+# 5. Build the mm10 gene annotation
+
+Signac needs gene coordinates to calculate TSS enrichment and later to connect peaks to genes. The annotation is derived from `EnsDb.Mmusculus.v79`, converted to UCSC chromosome names such as `chr1`, and labeled `mm10` to match the current Cell Ranger ARC reference.
+
+```{r build-annotation}
+initialize_output_dirs()
+
+annotation_path <- file.path(
+  OUTPUT_DIR,
+  "00_run_info",
+  "mm10_gene_annotation.rds"
+)
+
+gene_annotation <- build_mm10_annotation()
+saveRDS(gene_annotation, annotation_path, compress = FALSE)
+
+gene_annotation
+```
+
+# 6. Save the validation record
+
+These small files document exactly what R environment and input paths were used. They are written to the project results directory on SOL, not to GitHub.
+
+```{r save-validation}
+readr::write_csv(
+  input_report,
+  file.path(OUTPUT_DIR, "00_run_info", "cellranger_input_report.csv")
+)
+readr::write_csv(
+  sample_sheet,
+  file.path(OUTPUT_DIR, "00_run_info", "sample_sheet_used.csv")
+)
+save_run_information(package_status)
+
+writeLines(
+  paste("Step 0 completed:", format(Sys.time())),
+  file.path(OUTPUT_DIR, "00_run_info", "STEP_00_COMPLETE.txt")
+)
+```
+
+# Interpretation checkpoint
+
+Before moving to Step 1, you should be able to answer:
+
+1. What is the difference between a sequencing library and a biological replicate?
+2. Why are `atac_fragments.tsv.gz` and its `.tbi` index both required?
+3. Why do we inspect Cell Ranger's library-level report before filtering cells?
+4. Why is HFD-versus-CON inference not valid with one mouse per diet?
+
+Expected completion marker:
+
+```{r expected-output, eval=FALSE}
+file.path(OUTPUT_DIR, "00_run_info", "STEP_00_COMPLETE.txt")
+```
+
+# References
+
+See `docs/REFERENCES.md`, especially the official 10x Genomics output documentation and the Signac Multiome vignette.
+

@@ -1,0 +1,42 @@
+# R and RStudio session files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Rendered notebooks and local caches
+*_cache/
+*_files/
+*.html
+*.nb.html
+
+# Package-library state (a lockfile may be added later)
+renv/library/
+renv/staging/
+
+# Large single-cell objects and sequencing files
+*.rds
+*.qs
+*.h5
+*.hdf5
+*.fastq
+*.fastq.gz
+*.bam
+*.bam.bai
+*.cram
+*.cram.crai
+*.tsv.gz
+*.tsv.gz.tbi
+
+# Logs and scheduler output
+*.log
+slurm-*.out
+
+# Generated results if someone points the output directory into this repository
+results/*
+!results/README.md
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
