@@ -635,6 +635,31 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
       call. = FALSE
     )
   }
+  required_audit_fields <- c(
+    "reviewer",
+    "review_date",
+    "decision_notes"
+  )
+
+  missing_audit <- vapply(
+    required_audit_fields,
+    function(column_name) {
+      values <- trimws(as.character(decisions[[column_name]]))
+      any(is.na(values) | values == "")
+    },
+    logical(1)
+  )
+
+  if (any(missing_audit)) {
+    stop(
+      "Approved QC decisions require completed audit fields: ",
+      paste(
+        required_audit_fields[missing_audit],
+        collapse = ", "
+      ),
+      call. = FALSE
+    )
+  }
   decisions$approved <- approved
   decisions[match(sample_sheet$sample_id, decisions$sample_id), , drop = FALSE]
 }

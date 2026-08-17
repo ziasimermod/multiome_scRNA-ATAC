@@ -74,10 +74,22 @@ validate_cellranger_inputs(sample_sheet)
 annotation_path <- file.path(
   OUTPUT_DIR,
   "00_run_info",
-  "mm10_gene_annotation.rds"
+  "GRCm39_GENCODE_vM33_gene_annotation.rds"
 )
-assert_file(annotation_path, "saved mm10 annotation")
+
+assert_file(
+  annotation_path,
+  "saved GRCm39 GENCODE vM33 annotation"
+)
+
 gene_annotation <- readRDS(annotation_path)
+
+if (!identical(unique(GenomeInfoDb::genome(gene_annotation)), "GRCm39")) {
+  stop(
+    "The saved gene annotation is not labeled as GRCm39.",
+    call. = FALSE
+  )
+}
 ```
 
 # 3. Why QC begins separately by sample
@@ -116,16 +128,30 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     "checkpoints",
     paste0(sample_id, "_qc_metrics_unfiltered.rds")
   )
-  metadata_path <- file.path(
-    OUTPUT_DIR,
-    "01_qc",
-    "metadata",
-    paste0(sample_id, "_qc_metrics.csv")
-  )
+  metadata_path <- file.path(OUTPUT_DIR,
+                             "01_qc",
+                             "metadata",
+                             paste0(sample_id, "_qc_metrics.csv"))
 
   if (REUSE_QC_METRIC_CHECKPOINTS && file.exists(checkpoint_path)) {
     message("Loading completed checkpoint: ", checkpoint_path)
     object <- readRDS(checkpoint_path)
+
+    checkpoint_genome <- unique(GenomeInfoDb::genome(Signac::Annotation(object[["ATAC"]])))
+
+    if (!identical(checkpoint_genome, GRCM39_GENOME_LABEL)) {
+      stop(
+        "Checkpoint for ",
+        sample_id,
+        " was created using genome annotation ",
+        paste(checkpoint_genome, collapse = ", "),
+        " rather than ",
+        GRCM39_GENOME_LABEL,
+        ". Rebuild this checkpoint.",
+        call. = FALSE
+      )
+    }
+
   } else {
     counts <- extract_10x_modalities(sample_sheet$h5[row_index])
     rna_counts <- counts[["Gene Expression"]]
@@ -156,22 +182,11 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     object$genotype <- sample_sheet$genotype[row_index]
     object$diet <- sample_sheet$diet[row_index]
 
-    object$percent.mt <- PercentageFeatureSet(
-      object,
-      assay = "RNA",
-      pattern = "^(mt-|MT-)"
-    )
-    object$percent.ribo <- PercentageFeatureSet(
-      object,
-      assay = "RNA",
-      pattern = "^(Rpl|Rps)"
-    )
+    object$percent.mt <- PercentageFeatureSet(object, assay = "RNA", pattern = "^(mt-|MT-)")
+    object$percent.ribo <- PercentageFeatureSet(object, assay = "RNA", pattern = "^(Rpl|Rps)")
     object$log10_genes_per_umi <- log10(object$nFeature_RNA + 1) /
       log10(object$nCount_RNA + 1)
-    object <- add_cellranger_metrics(
-      object,
-      sample_sheet$barcode_metrics[row_index]
-    )
+    object <- add_cellranger_metrics(object, sample_sheet$barcode_metrics[row_index])
 
     initial_keep <- (
       object$nCount_RNA >= ULTRA_LOW_RNA_UMI &
@@ -203,7 +218,9 @@ for (row_index in seq_len(nrow(sample_sheet))) {
   absent_metadata <- setdiff(required_metadata, colnames(object[[]]))
   if (length(absent_metadata) > 0L) {
     stop(
-      "Checkpoint for ", sample_id, " lacks: ",
+      "Checkpoint for ",
+      sample_id,
+      " lacks: ",
       paste(absent_metadata, collapse = ", "),
       ". Set REUSE_QC_METRIC_CHECKPOINTS <- FALSE to rebuild it."
     )
@@ -213,18 +230,13 @@ for (row_index in seq_len(nrow(sample_sheet))) {
   metadata$barcode <- rownames(metadata)
   readr::write_csv(metadata, metadata_path)
 
-  plot_prefix <- file.path(
-    OUTPUT_DIR,
-    "01_qc",
-    "plots",
-    paste0(sample_id, "_before_filtering")
-  )
+  plot_prefix <- file.path(OUTPUT_DIR,
+                           "01_qc",
+                           "plots",
+                           paste0(sample_id, "_before_filtering"))
   save_sample_qc_plots(metadata, sample_id, plot_prefix)
 
-  threshold_suggestions[[sample_id]] <- make_qc_threshold_suggestion(
-    object,
-    sample_id
-  )
+  threshold_suggestions[[sample_id]] <- make_qc_threshold_suggestion(object, sample_id)
 
   rm(object, metadata)
   invisible(gc())

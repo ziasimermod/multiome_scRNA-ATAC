@@ -151,6 +151,284 @@ ggplot2::ggplot(
   ggplot2::theme_classic(base_size = 11)
 ```
 
+# 3A. Inspect doublet calls relative to library size
+```{r inspect doublets}
+doublet_summary <- qc_metadata |>
+  dplyr::count(
+    sample_id,
+    scDblFinder.class,
+    name = "n"
+  ) |>
+  dplyr::group_by(sample_id) |>
+  dplyr::mutate(
+    percent = 100 * n / sum(n)
+  ) |>
+  dplyr::ungroup()
+
+doublet_summary
+
+ggplot2::ggplot(
+  qc_metadata,
+  ggplot2::aes(
+    x = nCount_RNA,
+    y = nCount_ATAC,
+    color = scDblFinder.class
+  )
+) +
+  ggplot2::geom_point(
+    alpha = 0.35,
+    size = 0.45
+  ) +
+  ggplot2::scale_x_log10() +
+  ggplot2::scale_y_log10() +
+  ggplot2::facet_wrap(~ sample_id) +
+  ggplot2::labs(
+    title = "RNA and ATAC library size by scDblFinder call",
+    x = "RNA UMIs",
+    y = "ATAC counts",
+    color = "scDblFinder"
+  ) +
+  ggplot2::theme_classic(base_size = 11)
+```
+# 3B. Lower limit summary for RNA and ATAC
+```{r}
+lower_tail_summary <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    metadata |>
+      dplyr::mutate(
+        RNA_bin = cut(
+          nCount_RNA,
+          breaks = c(-Inf, 200, 300, 400, 500, 750, 1000, Inf),
+          labels = c(
+            "<200",
+            "200-299",
+            "300-399",
+            "400-499",
+            "500-749",
+            "750-999",
+            ">=1000"
+          ),
+          right = FALSE
+        ),
+        ATAC_bin = cut(
+          nCount_ATAC,
+          breaks = c(-Inf, 500, 750, 1000, 1500, 2000, Inf),
+          labels = c(
+            "<500",
+            "500-749",
+            "750-999",
+            "1000-1499",
+            "1500-1999",
+            ">=2000"
+          ),
+          right = FALSE
+        )
+      ) |>
+      dplyr::group_by(RNA_bin) |>
+      dplyr::summarise(
+        sample_id = .env$sample_id,
+        modality = "RNA",
+        n = dplyr::n(),
+        median_features = median(nFeature_RNA),
+        median_mt = median(percent.mt),
+        singlet_pct = 100 * mean(scDblFinder.class == "singlet"),
+        .groups = "drop"
+      )
+  }
+) |>
+  dplyr::bind_rows()
+
+lower_tail_summary
+
+lower_atac_summary <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    metadata |>
+      dplyr::mutate(
+        ATAC_bin = cut(
+          nCount_ATAC,
+          breaks = c(-Inf, 500, 750, 1000, 1500, 2000, Inf),
+          labels = c(
+            "<500",
+            "500-749",
+            "750-999",
+            "1000-1499",
+            "1500-1999",
+            ">=2000"
+          ),
+          right = FALSE
+        )
+      ) |>
+      dplyr::group_by(ATAC_bin) |>
+      dplyr::summarise(
+        sample_id = .env$sample_id,
+        n = dplyr::n(),
+        median_TSS = median(TSS.enrichment, na.rm = TRUE),
+        median_FRiP = median(frip_cr, na.rm = TRUE),
+        median_nucleosome = median(nucleosome_signal, na.rm = TRUE),
+        singlet_pct = 100 * mean(scDblFinder.class == "singlet"),
+        .groups = "drop"
+      )
+  }
+) |>
+  dplyr::bind_rows()
+
+lower_atac_summary
+
+# Percentage passing independent QC metrics within RNA-count bins
+
+rna_bin_pass_summary <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    thresholds <- decisions_preview[
+      decisions_preview$sample_id == sample_id,
+      ,
+      drop = FALSE
+    ]
+
+    metadata |>
+      dplyr::mutate(
+        RNA_bin = cut(
+          nCount_RNA,
+          breaks = c(-Inf, 200, 300, 400, 500, 750, 1000, Inf),
+          labels = c(
+            "<200",
+            "200-299",
+            "300-399",
+            "400-499",
+            "500-749",
+            "750-999",
+            ">=1000"
+          ),
+          right = FALSE
+        )
+      ) |>
+      dplyr::group_by(RNA_bin) |>
+      dplyr::summarise(
+        sample_id = .env$sample_id,
+        n = dplyr::n(),
+
+        feature_pass_pct =
+          100 * mean(
+            nFeature_RNA >= thresholds$nFeature_RNA_min,
+            na.rm = TRUE
+          ),
+
+        mt_pass_pct =
+          100 * mean(
+            percent.mt <= thresholds$percent_mt_max,
+            na.rm = TRUE
+          ),
+
+        TSS_pass_pct =
+          100 * mean(
+            TSS.enrichment >= thresholds$TSS_enrichment_min,
+            na.rm = TRUE
+          ),
+
+        FRiP_pass_pct =
+          100 * mean(
+            frip_cr >= thresholds$frip_min,
+            na.rm = TRUE
+          ),
+
+        singlet_pct =
+          100 * mean(
+            scDblFinder.class == "singlet",
+            na.rm = TRUE
+          ),
+
+        .groups = "drop"
+      )
+  }
+) |>
+  dplyr::bind_rows()
+
+rna_bin_pass_summary
+
+# Percentage passing independent QC metrics within ATAC-count bins
+
+atac_bin_pass_summary <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    thresholds <- decisions_preview[
+      decisions_preview$sample_id == sample_id,
+      ,
+      drop = FALSE
+    ]
+
+    metadata |>
+      dplyr::mutate(
+        ATAC_bin = cut(
+          nCount_ATAC,
+          breaks = c(-Inf, 500, 750, 1000, 1500, 2000, Inf),
+          labels = c(
+            "<500",
+            "500-749",
+            "750-999",
+            "1000-1499",
+            "1500-1999",
+            ">=2000"
+          ),
+          right = FALSE
+        )
+      ) |>
+      dplyr::group_by(ATAC_bin) |>
+      dplyr::summarise(
+        sample_id = .env$sample_id,
+        n = dplyr::n(),
+
+        RNA_feature_pass_pct =
+          100 * mean(
+            nFeature_RNA >= thresholds$nFeature_RNA_min,
+            na.rm = TRUE
+          ),
+
+        mt_pass_pct =
+          100 * mean(
+            percent.mt <= thresholds$percent_mt_max,
+            na.rm = TRUE
+          ),
+
+        TSS_pass_pct =
+          100 * mean(
+            TSS.enrichment >= thresholds$TSS_enrichment_min,
+            na.rm = TRUE
+          ),
+
+        FRiP_pass_pct =
+          100 * mean(
+            frip_cr >= thresholds$frip_min,
+            na.rm = TRUE
+          ),
+
+        singlet_pct =
+          100 * mean(
+            scDblFinder.class == "singlet",
+            na.rm = TRUE
+          ),
+
+        .groups = "drop"
+      )
+  }
+) |>
+  dplyr::bind_rows()
+
+atac_bin_pass_summary
+```
 # 4. Record the decision
 
 Open `config/qc_thresholds.csv` in RStudio. Step 1 populated blank numeric cells with starting suggestions. For every sample:
@@ -204,6 +482,125 @@ for (sample_id in sample_sheet$sample_id) {
     thresholds = threshold_row
   )
 }
+
+candidate_retention <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    thresholds <- decisions_preview[
+      decisions_preview$sample_id == sample_id,
+      ,
+      drop = FALSE
+    ]
+
+    pass_rna <- with(
+      metadata,
+      nCount_RNA >= thresholds$nCount_RNA_min &
+        nCount_RNA <= thresholds$nCount_RNA_max &
+        nFeature_RNA >= thresholds$nFeature_RNA_min &
+        nFeature_RNA <= thresholds$nFeature_RNA_max &
+        percent.mt <= thresholds$percent_mt_max
+    )
+
+    pass_atac <- with(
+      metadata,
+      nCount_ATAC >= thresholds$nCount_ATAC_min &
+        nCount_ATAC <= thresholds$nCount_ATAC_max &
+        TSS.enrichment >= thresholds$TSS_enrichment_min &
+        nucleosome_signal <= thresholds$nucleosome_signal_max &
+        frip_cr >= thresholds$frip_min
+    )
+
+    pass_doublet <- metadata$scDblFinder.class == "singlet"
+
+    pass_joint <- pass_rna & pass_atac & pass_doublet
+
+    data.frame(
+      sample_id = sample_id,
+      total_barcodes = nrow(metadata),
+      pass_rna = sum(pass_rna, na.rm = TRUE),
+      pass_atac = sum(pass_atac, na.rm = TRUE),
+      pass_doublet = sum(pass_doublet, na.rm = TRUE),
+      pass_joint = sum(pass_joint, na.rm = TRUE),
+      percent_joint_retained =
+        100 * mean(pass_joint, na.rm = TRUE),
+      percent_doublets =
+        100 * mean(!pass_doublet, na.rm = TRUE)
+    )
+  }
+) |>
+  dplyr::bind_rows()
+
+candidate_retention
+
+criterion_failure_summary <- lapply(
+  sample_sheet$sample_id,
+  function(sample_id) {
+
+    metadata <- metadata_tables[[sample_id]]
+
+    thresholds <- decisions_preview[
+      decisions_preview$sample_id == sample_id,
+      ,
+      drop = FALSE
+    ]
+
+    criterion_pass <- data.frame(
+      RNA_count_min =
+        metadata$nCount_RNA >= thresholds$nCount_RNA_min,
+
+      RNA_count_max =
+        metadata$nCount_RNA <= thresholds$nCount_RNA_max,
+
+      RNA_features_min =
+        metadata$nFeature_RNA >= thresholds$nFeature_RNA_min,
+
+      RNA_features_max =
+        metadata$nFeature_RNA <= thresholds$nFeature_RNA_max,
+
+      mitochondrial =
+        metadata$percent.mt <= thresholds$percent_mt_max,
+
+      ATAC_count_min =
+        metadata$nCount_ATAC >= thresholds$nCount_ATAC_min,
+
+      ATAC_count_max =
+        metadata$nCount_ATAC <= thresholds$nCount_ATAC_max,
+
+      TSS =
+        metadata$TSS.enrichment >= thresholds$TSS_enrichment_min,
+
+      nucleosome =
+        metadata$nucleosome_signal <= thresholds$nucleosome_signal_max,
+
+      FRiP =
+        metadata$frip_cr >= thresholds$frip_min,
+
+      singlet =
+        metadata$scDblFinder.class == "singlet"
+    )
+
+    data.frame(
+      sample_id = sample_id,
+      criterion = names(criterion_pass),
+      n_failed = vapply(
+        criterion_pass,
+        function(x) sum(!x, na.rm = TRUE),
+        integer(1)
+      ),
+      percent_failed = vapply(
+        criterion_pass,
+        function(x) 100 * mean(!x, na.rm = TRUE),
+        numeric(1)
+      )
+    )
+  }
+) |>
+  dplyr::bind_rows()
+
+criterion_failure_summary
 ```
 
 # 6. Approval gate
@@ -241,6 +638,26 @@ for (row_index in seq_len(nrow(sample_sheet))) {
   assert_file(input_checkpoint, paste(sample_id, "unfiltered QC checkpoint"))
 
   object <- readRDS(input_checkpoint)
+  checkpoint_genome <- unique(
+  GenomeInfoDb::genome(
+    Signac::Annotation(object[["ATAC"]])
+  )
+)
+
+if (!identical(
+  checkpoint_genome,
+  GRCM39_GENOME_LABEL
+)) {
+  stop(
+    "Checkpoint for ", sample_id,
+    " uses genome annotation ",
+    paste(checkpoint_genome, collapse = ", "),
+    " rather than ",
+    GRCM39_GENOME_LABEL,
+    ".",
+    call. = FALSE
+  )
+}
   threshold_row <- qc_decisions[
     qc_decisions$sample_id == sample_id,
     ,
