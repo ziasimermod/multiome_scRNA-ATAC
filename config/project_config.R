@@ -47,7 +47,14 @@ QC_LIMITS <- list(
   frip_min = 0.10
 )
 
-MM10_GENOME_LABEL <- "mm10"
+GRCM39_GENOME_LABEL <- "GRCm39"
+
+GRCM39_GTF <- file.path(
+  PROJECT_DIR,
+  "reference",
+  "GRCm39_2024-A",
+  "gencode.vM33.primary_assembly.annotation.gtf.gz"
+)
 
 RESULT_DIRS <- c(
   "00_run_info",

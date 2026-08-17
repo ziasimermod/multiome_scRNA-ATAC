@@ -11,9 +11,9 @@ output:
 
 Before creating a Seurat object, we verify three things:
 
-1. R can load every required package from the same library that will be used for the analysis.
-2. Each row of the sample sheet represents a real biological library and points to the expected Cell Ranger ARC outputs.
-3. The genome annotation uses the same mouse genome naming convention as the ATAC data.
+1.  R can load every required package from the same library that will be used for the analysis.
+2.  Each row of the sample sheet represents a real biological library and points to the expected Cell Ranger ARC outputs.
+3.  The genome annotation uses the same mouse genome naming convention as the ATAC data.
 
 This is a light validation step. A reasonable SOL RStudio request is **2 CPU cores, 16 GiB memory, 2 hours, R 4.4.2, no GPU**.
 
@@ -134,10 +134,10 @@ initialize_output_dirs()
 annotation_path <- file.path(
   OUTPUT_DIR,
   "00_run_info",
-  "mm10_gene_annotation.rds"
+  "GRCm39_GENCODE_vM33_gene_annotation.rds"
 )
 
-gene_annotation <- build_mm10_annotation()
+gene_annotation <- build_grcm39_annotation()
 saveRDS(gene_annotation, annotation_path, compress = FALSE)
 
 gene_annotation
@@ -168,10 +168,10 @@ writeLines(
 
 Before moving to Step 1, you should be able to answer:
 
-1. What is the difference between a sequencing library and a biological replicate?
-2. Why are `atac_fragments.tsv.gz` and its `.tbi` index both required?
-3. Why do we inspect Cell Ranger's library-level report before filtering cells?
-4. Why is HFD-versus-CON inference not valid with one mouse per diet?
+1.  What is the difference between a sequencing library and a biological replicate?
+2.  Why are `atac_fragments.tsv.gz` and its `.tbi` index both required?
+3.  Why do we inspect Cell Ranger's library-level report before filtering cells?
+4.  Why is HFD-versus-CON inference not valid with one mouse per diet?
 
 Expected completion marker:
 
@@ -182,4 +182,3 @@ file.path(OUTPUT_DIR, "00_run_info", "STEP_00_COMPLETE.txt")
 # References
 
 See `docs/REFERENCES.md`, especially the official 10x Genomics output documentation and the Signac Multiome vignette.
-

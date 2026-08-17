@@ -8,6 +8,7 @@ required_packages <- c(
   "Seurat",
   "SeuratObject",
   "Signac",
+  "rtracklayer",
   "sctransform",
   "hdf5r",
   "future",
@@ -94,7 +95,12 @@ package_preflight <- function(packages = required_packages, stop_on_failure = TR
   status <- lapply(packages, function(package_name) {
     tryCatch(
       {
-        loadNamespace(package_name, quietly = TRUE)
+        available <- requireNamespace(package_name, quietly = TRUE)
+
+        if (!available) {
+          stop("Package is not installed or its namespace could not be loaded.")
+        }
+
         data.frame(
           package = package_name,
           version = as.character(utils::packageVersion(package_name)),
@@ -114,9 +120,11 @@ package_preflight <- function(packages = required_packages, stop_on_failure = TR
       }
     )
   })
+
   status <- do.call(rbind, status)
 
   failures <- status[status$status != "OK", , drop = FALSE]
+
   if (stop_on_failure && nrow(failures) > 0L) {
     failure_text <- paste0(
       failures$package,
@@ -124,6 +132,7 @@ package_preflight <- function(packages = required_packages, stop_on_failure = TR
       failures$error,
       collapse = "\n  "
     )
+
     stop(
       "Package preflight failed. Resolve these namespace errors before ",
       "continuing:\n  ", failure_text,
@@ -141,6 +150,7 @@ package_preflight <- function(packages = required_packages, stop_on_failure = TR
       },
       logical(1)
     )]
+
     if (length(too_old) > 0L) {
       stop(
         "Package version is below the supported minimum: ",
@@ -156,6 +166,7 @@ package_preflight <- function(packages = required_packages, stop_on_failure = TR
       )
     }
   }
+
   status
 }
 
@@ -321,12 +332,59 @@ validate_cellranger_inputs <- function(sample_sheet) {
   report
 }
 
-build_mm10_annotation <- function() {
-  annotation <- Signac::GetGRangesFromEnsDb(
-    ensdb = EnsDb.Mmusculus.v79::EnsDb.Mmusculus.v79
+build_grcm39_annotation <- function(gtf_path = GRCM39_GTF) {
+  assert_file(gtf_path, "GRCm39 GENCODE vM33 GTF")
+
+  annotation <- rtracklayer::import(gtf_path)
+
+  if (!inherits(annotation, "GRanges")) {
+    stop(
+      "Imported GTF did not produce a GRanges object.",
+      call. = FALSE
+    )
+  }
+
+  # GENCODE uses `gene_type`, while Signac expects `gene_biotype`.
+  if (
+    !"gene_biotype" %in% colnames(S4Vectors::mcols(annotation)) &&
+    "gene_type" %in% colnames(S4Vectors::mcols(annotation))
+  ) {
+    annotation$gene_biotype <- annotation$gene_type
+  }
+
+  required_annotation_columns <- c(
+    "gene_name",
+    "gene_id",
+    "gene_biotype",
+    "type"
   )
-  GenomeInfoDb::seqlevelsStyle(annotation) <- "UCSC"
-  GenomeInfoDb::genome(annotation) <- MM10_GENOME_LABEL
+
+  missing_columns <- setdiff(
+    required_annotation_columns,
+    colnames(S4Vectors::mcols(annotation))
+  )
+
+  has_transcript_id <- any(
+    c("tx_id", "transcript_id") %in%
+      colnames(S4Vectors::mcols(annotation))
+  )
+
+  if (length(missing_columns) > 0L || !has_transcript_id) {
+    stop(
+      "GTF annotation is missing columns required by Signac. ",
+      "Missing: ",
+      paste(missing_columns, collapse = ", "),
+      if (!has_transcript_id) {
+        "; no tx_id or transcript_id column was found."
+      } else {
+        ""
+      },
+      call. = FALSE
+    )
+  }
+
+  GenomeInfoDb::genome(annotation) <- GRCM39_GENOME_LABEL
+
   annotation
 }
 

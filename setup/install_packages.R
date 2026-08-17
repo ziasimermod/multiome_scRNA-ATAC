@@ -64,6 +64,7 @@ cran_packages <- c(
 )
 
 bioconductor_packages <- c(
+  "rtracklayer",
   "EnsDb.Mmusculus.v79",
   "ensembldb",
   "GenomeInfoDb",
@@ -75,13 +76,12 @@ bioconductor_packages <- c(
 )
 
 is_loadable <- function(package_name) {
-  isTRUE(tryCatch(
-    {
-      loadNamespace(package_name, quietly = TRUE)
-      TRUE
-    },
-    error = function(error_condition) FALSE
-  ))
+  isTRUE(
+    tryCatch(
+      requireNamespace(package_name, quietly = TRUE),
+      error = function(error_condition) FALSE
+    )
+  )
 }
 
 cran_to_install <- cran_packages[
