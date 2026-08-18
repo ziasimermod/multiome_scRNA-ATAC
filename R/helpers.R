@@ -241,7 +241,7 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
 
   required_columns <- c(
     "sample_id",
-    "replicate_id",
+    "pool_id",
     "genotype",
     "diet",
     "outs_dir"
@@ -259,10 +259,10 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
   if (anyDuplicated(sample_sheet$sample_id)) {
     stop("Every sample_id must be unique.", call. = FALSE)
   }
-  if (anyDuplicated(sample_sheet$replicate_id)) {
+  if (anyDuplicated(sample_sheet$pool_id)) {
     warning(
-      "Repeated replicate_id values are valid only for technical libraries ",
-      "from the same biological specimen.",
+      "Repeated pool_id values indicate multiple libraries derived from ",
+      "the same biological pool.",
       call. = FALSE
     )
   }

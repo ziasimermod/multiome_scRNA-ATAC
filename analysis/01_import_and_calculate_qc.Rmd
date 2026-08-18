@@ -178,7 +178,7 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     )
 
     object$sample_id <- sample_id
-    object$replicate_id <- sample_sheet$replicate_id[row_index]
+    object$pool_id <- sample_sheet$pool_id[row_index]
     object$genotype <- sample_sheet$genotype[row_index]
     object$diet <- sample_sheet$diet[row_index]
 

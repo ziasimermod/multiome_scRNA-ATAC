@@ -1,0 +1,1299 @@
+---
+title: "Step 5 - Build the WNN graph and evaluate multimodal clusters"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 4 described every retained nucleus in two independent low-dimensional
+coordinate systems:
+
+- **RNA PCA** describes coordinated transcriptional variation;
+- **ATAC LSI** describes coordinated chromatin-accessibility variation.
+
+Step 5 combines those two descriptions using **weighted nearest neighbors
+(WNN)**. WNN does not simply average RNA and ATAC. Instead, it estimates how
+informative each modality is for defining the neighborhood of each individual
+nucleus and builds a multimodal neighbor graph from those cell-specific
+weights.
+
+This notebook will:
+
+1. load and validate the completed Step 4 object;
+2. construct the WNN neighbor graph using RNA PCs 1–30 and ATAC LSI dimensions 2–30;
+3. visualize the WNN embedding by sample identity;
+4. inspect the RNA-versus-ATAC modality weights learned for each nucleus;
+5. explore several graph-clustering resolutions without silently choosing one;
+6. compare cluster sizes and descriptive sample composition across resolutions;
+7. pause for a **manual clustering-resolution decision**;
+8. after a resolution is chosen, inspect mouse-colon epithelial marker programs;
+9. save a clustered WNN object for downstream annotation and biological analysis.
+
+A practical SOL allocation for this step is **4 CPU cores, 64–96 GiB memory, 8–12 hours, R 4.4.2, no GPU**.
+
+## One statistical limitation remains important
+
+There is one pooled CON Cell Ranger library and one pooled HFD Cell Ranger library. Each library contains colon epithelial cells pooled from multiple mice, so individual mouse identities are not recoverable after pooling.
+Therefore, pooled-library identity and diet condition remain perfectly confounded.
+
+Cluster composition can therefore be described by pooled library, but a difference in CON-versus-HFD abundance must not be presented as a replicated treatment effect.
+
+# 1. Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(ggplot2)
+  library(dplyr)
+})
+
+configure_parallel_plan()
+
+cat("Configured future workers:", future::nbrOfWorkers(), "\n")
+```
+
+# 2. Define Step 5 parameters and outputs
+
+The dimensional choices below are carried forward from Step 4 rather than
+selected again after seeing the WNN result.
+
+RNA uses PCs 1–30. ATAC uses LSI dimensions 2–30 because Step 4 showed that
+LSI 1 was almost perfectly associated with ATAC sequencing depth
+(Spearman rho approximately -0.992).
+
+We begin clustering with a small **resolution grid**. Resolution is not a
+measure of statistical significance. It controls how finely the shared-neighbor
+graph is partitioned: larger values generally produce more clusters.
+
+```{r step-five-parameters}
+STEP5_DIR <- file.path(
+  OUTPUT_DIR,
+  "05_wnn"
+)
+
+STEP5_PLOT_DIR <- file.path(
+  STEP5_DIR,
+  "plots"
+)
+
+dir.create(
+  STEP5_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  STEP5_PLOT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+RNA_DIMS_WNN <- 1:30
+ATAC_DIMS_WNN <- 2:30
+WNN_K <- 20L
+
+CLUSTER_RESOLUTIONS <- c(
+  0.2,
+  0.4,
+  0.6,
+  0.8,
+  1.0
+)
+
+resolution_column <- function(resolution) {
+  paste0(
+    "wnn_res_",
+    format(
+      resolution,
+      trim = TRUE,
+      scientific = FALSE,
+      nsmall = 1
+    )
+  )
+}
+
+step5_parameters <- data.frame(
+  parameter = c(
+    "RNA WNN dimensions",
+    "ATAC WNN dimensions",
+    "WNN neighbors (k.nn)",
+    "Clustering algorithm",
+    "Resolution grid"
+  ),
+  value = c(
+    paste(RNA_DIMS_WNN, collapse = ","),
+    paste(ATAC_DIMS_WNN, collapse = ","),
+    as.character(WNN_K),
+    "3 (SLM)",
+    paste(CLUSTER_RESOLUTIONS, collapse = ",")
+  )
+)
+
+step5_parameters
+```
+
+# 3. Load and validate the Step 4 checkpoint
+
+Step 5 should never silently rebuild PCA or LSI. Those decisions were made and
+audited in Step 4, so this notebook requires the Step 4 completion marker and
+saved reduced object.
+
+```{r load-step-four}
+step4_marker <- file.path(
+  OUTPUT_DIR,
+  "04_reduction",
+  "STEP_04_COMPLETE.txt"
+)
+
+step4_object_path <- file.path(
+  OUTPUT_DIR,
+  "04_reduction",
+  "Ppar_iKO_multiome_merged_reduced.rds"
+)
+
+assert_file(
+  step4_marker,
+  "Step 4 completion marker"
+)
+
+assert_file(
+  step4_object_path,
+  "Step 4 reduced merged object"
+)
+
+merged <- readRDS(
+  step4_object_path
+)
+
+required_reductions <- c(
+  "pca",
+  "lsi",
+  "umap.rna",
+  "umap.atac"
+)
+
+missing_reductions <- setdiff(
+  required_reductions,
+  names(merged@reductions)
+)
+
+if (length(missing_reductions) > 0L) {
+  stop(
+    "Step 4 object is missing reduction(s): ",
+    paste(missing_reductions, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (max(RNA_DIMS_WNN) > ncol(Embeddings(merged, "pca"))) {
+  stop(
+    "Requested RNA WNN dimensions exceed the available PCA dimensions.",
+    call. = FALSE
+  )
+}
+
+if (max(ATAC_DIMS_WNN) > ncol(Embeddings(merged, "lsi"))) {
+  stop(
+    "Requested ATAC WNN dimensions exceed the available LSI dimensions.",
+    call. = FALSE
+  )
+}
+
+step4_validation <- data.frame(
+  cells = ncol(merged),
+  RNA_features = nrow(merged[["RNA"]]),
+  ATAC_features = nrow(merged[["ATAC"]]),
+  PCA_dimensions = ncol(Embeddings(merged, "pca")),
+  LSI_dimensions = ncol(Embeddings(merged, "lsi")),
+  fragment_objects = length(Signac::Fragments(merged[["ATAC"]])),
+  samples = length(unique(merged$sample_id))
+)
+
+step4_validation
+
+table(
+  merged$sample_id
+)
+```
+
+# 4. Construct the weighted nearest-neighbor graph
+
+A nearest-neighbor graph asks which nuclei are most similar to each other.
+WNN extends this idea by asking how useful RNA and ATAC are **for each nucleus**
+when defining that neighborhood.
+
+Conceptually:
+
+```text
+RNA PCA similarity ----\
+                        > cell-specific modality weighting -> WNN neighbors
+ATAC LSI similarity ---/
+```
+
+The resulting objects have different jobs:
+
+- `weighted.nn` stores the multimodal nearest-neighbor structure;
+- `wknn` is the weighted k-nearest-neighbor graph;
+- `wsnn` is the weighted shared-nearest-neighbor graph used for clustering;
+- `RNA.weight` records the learned RNA contribution for each nucleus.
+
+```{r build-wnn, cache=FALSE}
+set.seed(20260727)
+
+merged <- FindMultiModalNeighbors(
+  merged,
+  reduction.list = list(
+    "pca",
+    "lsi"
+  ),
+  dims.list = list(
+    RNA_DIMS_WNN,
+    ATAC_DIMS_WNN
+  ),
+  k.nn = WNN_K,
+  knn.graph.name = "wknn",
+  snn.graph.name = "wsnn",
+  weighted.nn.name = "weighted.nn",
+  modality.weight.name = c(
+  "RNA.weight",
+  "ATAC.weight"
+),
+  verbose = TRUE
+)
+```
+
+# 5. Validate and inspect the WNN modality weights
+
+The WNN graph should contain every nucleus from Step 4. The RNA modality weight
+should also be finite and between zero and one.
+
+For this two-modality WNN analysis, Seurat stores both `RNA.weight` and `ATAC.weight` directly in the metadata. These weights describe how informative each modality is for local neighborhood prediction. They are **not** RNA or ATAC expression/accessibility percentages.
+
+```{r validate-wnn}
+if (!"weighted.nn" %in% names(merged@neighbors)) {
+  stop(
+    "The weighted.nn neighbor object was not created.",
+    call. = FALSE
+  )
+}
+
+required_graphs <- c(
+  "wknn",
+  "wsnn"
+)
+
+missing_graphs <- setdiff(
+  required_graphs,
+  names(merged@graphs)
+)
+
+if (length(missing_graphs) > 0L) {
+  stop(
+    "WNN graph(s) were not created: ",
+    paste(missing_graphs, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+required_weights <- c(
+  "RNA.weight",
+  "ATAC.weight"
+)
+
+missing_weights <- setdiff(
+  required_weights,
+  colnames(merged[[]])
+)
+
+if (length(missing_weights) > 0L) {
+  stop(
+    "WNN modality weight(s) were not stored in the merged metadata: ",
+    paste(missing_weights, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+rna_weight <- as.numeric(
+  merged$RNA.weight
+)
+
+atac_weight <- as.numeric(
+  merged$ATAC.weight
+)
+
+if (any(!is.finite(rna_weight))) {
+  stop(
+    "Non-finite RNA modality weights were detected.",
+    call. = FALSE
+  )
+}
+
+if (any(!is.finite(atac_weight))) {
+  stop(
+    "Non-finite ATAC modality weights were detected.",
+    call. = FALSE
+  )
+}
+
+if (any(rna_weight < 0 | rna_weight > 1)) {
+  stop(
+    "RNA modality weights fall outside the expected 0-1 range.",
+    call. = FALSE
+  )
+}
+
+if (any(atac_weight < 0 | atac_weight > 1)) {
+  stop(
+    "ATAC modality weights fall outside the expected 0-1 range.",
+    call. = FALSE
+  )
+}
+
+modality_weight_summary <- merged[[]] |>
+  dplyr::group_by(sample_id) |>
+  dplyr::summarise(
+    cells = dplyr::n(),
+    RNA_weight_q25 = stats::quantile(
+      RNA.weight,
+      0.25
+    ),
+    RNA_weight_median = stats::median(
+      RNA.weight
+    ),
+    RNA_weight_q75 = stats::quantile(
+      RNA.weight,
+      0.75
+    ),
+    ATAC_weight_median = stats::median(
+      ATAC.weight
+    ),
+    .groups = "drop"
+  )
+
+modality_weight_summary
+
+summary(merged$RNA.weight)
+summary(merged$ATAC.weight)
+```
+
+## Plot modality weights by sample
+
+A systematic shift in modality weight between libraries is worth noticing, but
+it is not automatically evidence of a technical problem. Different biological
+cell-state composition can also change which modality is locally informative.
+
+```{r modality-weight-by-sample, fig.width=9, fig.height=5}
+p_weight_violin <- ggplot2::ggplot(
+  merged[[]],
+  ggplot2::aes(
+    x = sample_id,
+    y = RNA.weight
+  )
+) +
+  ggplot2::geom_violin(
+    scale = "width",
+    trim = TRUE
+  ) +
+  ggplot2::geom_boxplot(
+    width = 0.12,
+    outlier.shape = NA
+  ) +
+  ggplot2::labs(
+    title = "RNA modality weight by sample",
+    x = NULL,
+    y = "RNA modality weight"
+  ) +
+  ggplot2::theme_classic(base_size = 11)
+
+print(p_weight_violin)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    "01_RNA_modality_weight_by_sample.pdf"
+  ),
+  plot = p_weight_violin,
+  width = 8,
+  height = 5
+)
+```
+
+# 6. Build the WNN UMAP
+
+UMAP is now constructed from the multimodal `weighted.nn` neighborhood rather
+than from RNA PCA or ATAC LSI alone.
+
+The WNN UMAP is a visualization of the multimodal neighborhood graph. The graph,
+not the two-dimensional UMAP coordinates, is what will be used for clustering.
+
+```{r run-wnn-umap, cache=FALSE}
+set.seed(20260727)
+
+merged <- RunUMAP(
+  merged,
+  nn.name = "weighted.nn",
+  reduction.name = "wnn.umap",
+  reduction.key = "wnnUMAP_",
+  seed.use = 20260727,
+  verbose = TRUE
+)
+```
+
+## WNN UMAP by sample
+
+Because there is one pooled Cell Ranger library per condition, this plot is descriptive. We want to know whether both pooled libraries occupy the major multimodal states, not to claim that local sample-density differences are replicated diet effects.
+
+```{r plot-wnn-by-sample, fig.width=9, fig.height=7}
+p_wnn_sample <- DimPlot(
+  merged,
+  reduction = "wnn.umap",
+  group.by = "sample_id",
+  pt.size = 0.25
+) +
+  ggplot2::ggtitle(
+    "WNN UMAP by Cell Ranger library"
+  )
+
+print(p_wnn_sample)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    "02_WNN_UMAP_by_sample.pdf"
+  ),
+  plot = p_wnn_sample,
+  width = 9,
+  height = 7
+)
+```
+
+## Map modality weights onto the WNN embedding
+
+```{r plot-modality-weights-on-wnn, fig.width=12, fig.height=6}
+wnn_embedding <- as.data.frame(
+  Embeddings(
+    merged,
+    "wnn.umap"
+  )
+)
+
+colnames(wnn_embedding)[1:2] <- c(
+  "WNN_1",
+  "WNN_2"
+)
+
+wnn_embedding$RNA.weight <- merged$RNA.weight
+wnn_embedding$ATAC.weight <- merged$ATAC.weight
+wnn_embedding$sample_id <- merged$sample_id
+
+p_rna_weight <- ggplot2::ggplot(
+  wnn_embedding,
+  ggplot2::aes(
+    x = WNN_1,
+    y = WNN_2,
+    color = RNA.weight
+  )
+) +
+  ggplot2::geom_point(
+    size = 0.25,
+    alpha = 0.8
+  ) +
+  ggplot2::scale_color_viridis_c() +
+  ggplot2::labs(
+    title = "RNA contribution to WNN neighborhoods",
+    x = "WNN UMAP 1",
+    y = "WNN UMAP 2",
+    color = "RNA weight"
+  ) +
+  ggplot2::theme_classic(base_size = 11)
+
+p_atac_weight <- ggplot2::ggplot(
+  wnn_embedding,
+  ggplot2::aes(
+    x = WNN_1,
+    y = WNN_2,
+    color = ATAC.weight
+  )
+) +
+  ggplot2::geom_point(
+    size = 0.25,
+    alpha = 0.8
+  ) +
+  ggplot2::scale_color_viridis_c() +
+  ggplot2::labs(
+    title = "ATAC contribution to WNN neighborhoods",
+    x = "WNN UMAP 1",
+    y = "WNN UMAP 2",
+    color = "ATAC weight"
+  ) +
+  ggplot2::theme_classic(base_size = 11)
+
+print(p_rna_weight)
+print(p_atac_weight)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    "03_WNN_UMAP_RNA_weight.pdf"
+  ),
+  plot = p_rna_weight,
+  width = 8,
+  height = 6
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    "04_WNN_UMAP_ATAC_weight.pdf"
+  ),
+  plot = p_atac_weight,
+  width = 8,
+  height = 6
+)
+```
+
+# 7. Explore a clustering-resolution grid
+
+Clusters are communities in the WNN shared-nearest-neighbor graph. They are not
+created from the visual shape of the UMAP.
+
+We deliberately calculate several plausible resolutions before choosing one.
+A useful resolution should separate coherent biological programs without
+splitting continuous populations into many arbitrary microclusters.
+
+**Do not choose a resolution because it produces the number of cell types you
+expected in advance.**
+
+```{r cluster-resolution-grid, cache=FALSE}
+# Clustering uses random starts.
+# Seurat parallelizes FindClusters() through future_lapply() when
+# multiple future workers are active, which can trigger an
+# undeclared parallel-RNG warning.
+#
+# For reproducibility, run this small resolution grid sequentially.
+
+future::plan(future::sequential)
+
+cat(
+  "Workers used for clustering:",
+  future::nbrOfWorkers(),
+  "\n"
+)
+
+for (resolution in CLUSTER_RESOLUTIONS) {
+
+  cluster_column <- resolution_column(
+    resolution
+  )
+
+  merged <- FindClusters(
+    merged,
+    graph.name = "wsnn",
+    algorithm = 3,
+    resolution = resolution,
+    cluster.name = cluster_column,
+    random.seed = 20260727,
+    verbose = FALSE
+  )
+}
+
+# Restore the project-wide parallel configuration afterward.
+configure_parallel_plan()
+
+cat(
+  "Workers restored after clustering:",
+  future::nbrOfWorkers(),
+  "\n"
+)
+```
+
+## Summarize cluster number and size
+
+A very small cluster is not automatically invalid: rare enteroendocrine or tuft
+populations can be biologically real. This table is meant to expose the
+consequences of resolution, not impose a minimum cluster size by itself.
+
+```{r summarize-resolution-grid}
+cluster_count_summary <- dplyr::bind_rows(
+  lapply(
+    CLUSTER_RESOLUTIONS,
+    function(resolution) {
+
+      cluster_column <- resolution_column(
+        resolution
+      )
+
+      cluster_values <- merged[[]][[
+        cluster_column
+      ]]
+
+      cluster_sizes <- table(
+        cluster_values
+      )
+
+      data.frame(
+        resolution = resolution,
+        cluster_column = cluster_column,
+        n_clusters = length(cluster_sizes),
+        smallest_cluster = min(cluster_sizes),
+        median_cluster = stats::median(as.numeric(cluster_sizes)),
+        largest_cluster = max(cluster_sizes)
+      )
+    }
+  )
+)
+
+cluster_count_summary
+```
+
+## Descriptive sample composition of each resolution
+
+These are **descriptive counts**, not treatment-abundance statistics. Because
+sample and diet are confounded, do not use this table to perform a CON-versus-HFD
+hypothesis test.
+
+```{r cluster-sample-composition}
+cluster_sample_composition <- dplyr::bind_rows(
+  lapply(
+    CLUSTER_RESOLUTIONS,
+    function(resolution) {
+
+      cluster_column <- resolution_column(
+        resolution
+      )
+
+      temp <- data.frame(
+        resolution = resolution,
+        cluster = as.character(
+          merged[[]][[
+            cluster_column
+          ]]
+        ),
+        sample_id = merged$sample_id
+      )
+
+      temp |>
+        dplyr::count(
+          resolution,
+          cluster,
+          sample_id,
+          name = "cells"
+        ) |>
+        dplyr::group_by(
+          resolution,
+          cluster
+        ) |>
+        dplyr::mutate(
+          percent_of_cluster = 100 * cells / sum(cells)
+        ) |>
+        dplyr::ungroup()
+    }
+  )
+)
+
+cluster_sample_composition
+```
+
+## Plot every candidate resolution on the same WNN embedding
+
+The coordinates remain fixed. Only the graph partition changes.
+
+```{r plot-resolution-grid, fig.width=9, fig.height=7}
+for (resolution in CLUSTER_RESOLUTIONS) {
+  cluster_column <- resolution_column(resolution)
+
+  p_resolution <- DimPlot(
+    merged,
+    reduction = "wnn.umap",
+    group.by = cluster_column,
+    label = TRUE,
+    repel = TRUE,
+    label.size = 3,
+    pt.size = 0.2
+  ) +
+    NoLegend() +
+    ggplot2::ggtitle(paste("WNN clusters - resolution", resolution))
+
+  print(p_resolution)
+
+  ggplot2::ggsave(
+    filename = file.path(
+      STEP5_PLOT_DIR,
+      paste0("WNN_clusters_resolution_", resolution, ".pdf")
+    ),
+    plot = p_resolution,
+    width = 9,
+    height = 7
+  )
+}
+```
+
+# 8. Save the WNN resolution-grid checkpoint
+
+At this point the WNN analysis is complete, but the clustering resolution has
+**not** been biologically approved. We save this state so that changing the
+chosen resolution later does not require rebuilding WNN.
+
+```{r save-resolution-grid-checkpoint}
+readr::write_csv(
+  step5_parameters,
+  file.path(
+    STEP5_DIR,
+    "WNN_parameters.csv"
+  )
+)
+
+readr::write_csv(
+  modality_weight_summary,
+  file.path(
+    STEP5_DIR,
+    "modality_weight_summary.csv"
+  )
+)
+
+readr::write_csv(
+  cluster_count_summary,
+  file.path(
+    STEP5_DIR,
+    "cluster_resolution_summary.csv"
+  )
+)
+
+readr::write_csv(
+  cluster_sample_composition,
+  file.path(
+    STEP5_DIR,
+    "cluster_sample_composition_descriptive.csv"
+  )
+)
+
+step5_review_object_path <- file.path(
+  STEP5_DIR,
+  "Ppar_iKO_multiome_WNN_resolution_grid.rds"
+)
+
+saveRDS(
+  merged,
+  step5_review_object_path,
+  compress = FALSE
+)
+
+step5_review_object_info <- data.frame(
+  path = step5_review_object_path,
+  exists = file.exists(step5_review_object_path),
+  size_gb = file.info(step5_review_object_path)$size / 1024^3
+)
+
+step5_review_object_info
+
+writeLines(
+  c(
+    paste(
+      "Step 5 WNN review checkpoint created:",
+      format(Sys.time())
+    ),
+    paste(
+      "Cells:",
+      ncol(merged)
+    ),
+    paste(
+      "RNA WNN dimensions:",
+      paste(RNA_DIMS_WNN, collapse = ",")
+    ),
+    paste(
+      "ATAC WNN dimensions:",
+      paste(ATAC_DIMS_WNN, collapse = ",")
+    ),
+    paste(
+      "Resolution grid:",
+      paste(CLUSTER_RESOLUTIONS, collapse = ",")
+    ),
+    "Final clustering resolution approved: FALSE"
+  ),
+  file.path(
+    STEP5_DIR,
+    "STEP_05_READY_FOR_CLUSTER_REVIEW.txt"
+  )
+)
+```
+
+# STOP HERE FOR THE MANUAL RESOLUTION REVIEW
+
+Before continuing, inspect:
+
+1. `02_WNN_UMAP_by_sample.pdf`;
+2. the RNA- and ATAC-weight WNN plots;
+3. `cluster_resolution_summary.csv`;
+4. each candidate-resolution UMAP;
+5. whether any clusters are populated almost exclusively by one library;
+6. whether increasing resolution is separating visibly coherent states or only
+   fragmenting continuous structures.
+
+Then discuss the candidate resolutions before setting `CHOSEN_RESOLUTION` below.
+
+---
+
+# 9. Choose one clustering resolution after review
+
+Do **not** edit this value until the resolution-grid checkpoint has been
+reviewed. Leaving it as `NA_real_` intentionally stops the notebook here.
+
+```{r choose-resolution}
+CHOSEN_RESOLUTION <- 0.8
+
+if (
+  length(CHOSEN_RESOLUTION) != 1L ||
+    is.na(CHOSEN_RESOLUTION) ||
+    !CHOSEN_RESOLUTION %in% CLUSTER_RESOLUTIONS
+) {
+  stop(
+    paste0(
+      "Manual checkpoint: choose one reviewed value from CLUSTER_RESOLUTIONS ",
+      "and assign it to CHOSEN_RESOLUTION before continuing."
+    ),
+    call. = FALSE
+  )
+}
+
+CHOSEN_CLUSTER_COLUMN <- resolution_column(
+  CHOSEN_RESOLUTION
+)
+
+Idents(merged) <- merged[[]][[
+  CHOSEN_CLUSTER_COLUMN
+]]
+
+cat(
+  "Chosen WNN clustering resolution:",
+  CHOSEN_RESOLUTION,
+  "\n"
+)
+
+cat(
+  "Number of clusters:",
+  length(levels(Idents(merged))),
+  "\n"
+)
+```
+
+# 10. Audit a mouse-colon epithelial marker panel
+
+This dataset contains **mouse colonic epithelium**, not small-intestinal
+epithelium. Annotation therefore uses a colon-focused marker framework.
+
+A marker should not silently disappear from a plot. Before visualization, this
+chunk records whether each requested symbol exists in the RNA feature set and
+whether any RNA molecules were actually detected.
+
+This is a symbol/detection audit, not a comprehensive synonym database. A gene
+that is absent from the matrix can be investigated for aliases later if needed.
+
+```{r colon-marker-audit}
+colon_marker_panel <- list(
+  Stem_crypt = c(
+    "Lgr5",
+    "Ascl2",
+    "Smoc2",
+    "Axin2",
+    "Sox9"
+  ),
+  Proliferative_TA = c(
+    "Mki67",
+    "Top2a",
+    "Ccnb1",
+    "Ccna2"
+  ),
+  Absorptive_colonocyte = c(
+    "Slc26a3",
+    "Car1",
+    "Aqp8",
+    "Krt20"
+  ),
+  Goblet = c(
+    "Muc2",
+    "Tff3",
+    "Clca1",
+    "Fcgbp",
+    "Agr2"
+  ),
+  Deep_crypt_secretory = c(
+    "Reg4",
+    "Mptx1",
+    "Kit",
+    "Spink4"
+  ),
+  Enteroendocrine = c(
+    "Chga",
+    "Chgb",
+    "Neurod1",
+    "Pyy",
+    "Gcg",
+    "Tph1"
+  ),
+  Tuft = c(
+    "Dclk1",
+    "Pou2f3",
+    "Trpm5"
+  )
+)
+
+marker_lookup <- data.frame(
+  marker_program = rep(
+    names(colon_marker_panel),
+    lengths(colon_marker_panel)
+  ),
+  gene = unname(
+    unlist(
+      colon_marker_panel
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+DefaultAssay(merged) <- "RNA"
+
+rna_counts <- SeuratObject::LayerData(
+  merged,
+  assay = "RNA",
+  layer = "counts"
+)
+
+marker_audit <- lapply(
+  seq_len(nrow(marker_lookup)),
+  function(i) {
+
+    gene <- marker_lookup$gene[i]
+    program <- marker_lookup$marker_program[i]
+
+    exact_present <- gene %in% rownames(rna_counts)
+
+    case_insensitive_matches <- grep(
+      paste0("^", gene, "$"),
+      rownames(rna_counts),
+      value = TRUE,
+      ignore.case = TRUE
+    )
+
+    if (exact_present) {
+      x <- rna_counts[
+        gene,
+        ,
+        drop = TRUE
+      ]
+
+      total_umis <- sum(x)
+      positive_cells <- sum(x > 0)
+      percent_positive <- 100 * mean(x > 0)
+    } else {
+      total_umis <- NA_real_
+      positive_cells <- NA_integer_
+      percent_positive <- NA_real_
+    }
+
+    data.frame(
+      marker_program = program,
+      gene = gene,
+      exact_symbol_present = exact_present,
+      case_insensitive_match = paste(
+        case_insensitive_matches,
+        collapse = ";"
+      ),
+      total_UMIs = total_umis,
+      positive_cells = positive_cells,
+      percent_positive = percent_positive,
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+marker_audit <- dplyr::bind_rows(
+  marker_audit
+)
+
+marker_audit$status <- ifelse(
+  !marker_audit$exact_symbol_present,
+  "not_in_RNA_feature_set",
+  ifelse(
+    marker_audit$total_UMIs == 0,
+    "present_but_zero_counts",
+    "detected"
+  )
+)
+
+marker_audit
+```
+
+# 11. Visualize colon marker programs across the chosen WNN clusters
+
+A cluster should be annotated from coordinated marker programs, not from one
+marker in isolation. The dot plot summarizes both the prevalence and average
+expression of the detected marker genes across the chosen WNN clusters.
+
+```{r colon-marker-dotplot, fig.width=15, fig.height=8}
+detected_marker_genes <- marker_audit$gene[
+  marker_audit$status == "detected"
+]
+
+detected_marker_genes <- unique(
+  detected_marker_genes
+)
+
+if (length(detected_marker_genes) == 0L) {
+  stop(
+    "None of the requested mouse-colon marker genes were detected.",
+    call. = FALSE
+  )
+}
+
+p_colon_markers <- DotPlot(
+  merged,
+  features = detected_marker_genes,
+  group.by = CHOSEN_CLUSTER_COLUMN
+) +
+  RotatedAxis() +
+  ggplot2::ggtitle(
+    paste0(
+      "Mouse-colon marker programs across WNN clusters (resolution ",
+      CHOSEN_RESOLUTION,
+      ")"
+    )
+  )
+
+print(
+  p_colon_markers
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    paste0(
+      "05_colon_marker_DotPlot_resolution_",
+      CHOSEN_RESOLUTION,
+      ".pdf"
+    )
+  ),
+  plot = p_colon_markers,
+  width = 15,
+  height = 8
+)
+```
+
+## Chosen clusters on the WNN embedding
+
+```{r chosen-resolution-plot, fig.width=9, fig.height=7}
+p_chosen_clusters <- DimPlot(
+  merged,
+  reduction = "wnn.umap",
+  group.by = CHOSEN_CLUSTER_COLUMN,
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3,
+  pt.size = 0.2
+) +
+  NoLegend() +
+  ggplot2::ggtitle(
+    paste0(
+      "Chosen WNN clusters - resolution ",
+      CHOSEN_RESOLUTION
+    )
+  )
+
+print(
+  p_chosen_clusters
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP5_PLOT_DIR,
+    paste0(
+      "06_chosen_WNN_clusters_resolution_",
+      CHOSEN_RESOLUTION,
+      ".pdf"
+    )
+  ),
+  plot = p_chosen_clusters,
+  width = 9,
+  height = 7
+)
+```
+
+# 12. Save the finalized Step 5 checkpoint
+
+This checkpoint preserves the WNN graph, WNN UMAP, all tested clustering
+resolutions, the manually selected resolution, and the marker-audit metadata.
+It does **not** assign final biological cell-type labels yet.
+
+```{r save-step-five}
+chosen_cluster_sizes <- as.data.frame(
+  table(
+    cluster = as.character(
+      merged[[]][[
+        CHOSEN_CLUSTER_COLUMN
+      ]]
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+colnames(chosen_cluster_sizes) <- c(
+  "cluster",
+  "cells"
+)
+
+readr::write_csv(
+  marker_audit,
+  file.path(
+    STEP5_DIR,
+    "mouse_colon_marker_audit.csv"
+  )
+)
+
+readr::write_csv(
+  chosen_cluster_sizes,
+  file.path(
+    STEP5_DIR,
+    paste0(
+      "chosen_cluster_sizes_resolution_",
+      CHOSEN_RESOLUTION,
+      ".csv"
+    )
+  )
+)
+
+step5_final_object_path <- file.path(
+  STEP5_DIR,
+  "Ppar_iKO_multiome_WNN_clustered.rds"
+)
+
+DefaultAssay(merged) <- "RNA"
+
+saveRDS(
+  merged,
+  step5_final_object_path,
+  compress = FALSE
+)
+
+step5_final_object_info <- data.frame(
+  path = step5_final_object_path,
+  exists = file.exists(step5_final_object_path),
+  size_gb = file.info(step5_final_object_path)$size / 1024^3,
+  chosen_resolution = CHOSEN_RESOLUTION,
+  chosen_cluster_column = CHOSEN_CLUSTER_COLUMN,
+  clusters = length(levels(Idents(merged)))
+)
+
+step5_final_object_info
+
+if (!isTRUE(step5_final_object_info$exists)) {
+  stop(
+    "The finalized Step 5 WNN object was not saved successfully.",
+    call. = FALSE
+  )
+}
+
+writeLines(
+  c(
+    paste(
+      "Step 5 completed:",
+      format(Sys.time())
+    ),
+    paste(
+      "Cells:",
+      ncol(merged)
+    ),
+    paste(
+      "RNA WNN dimensions:",
+      paste(RNA_DIMS_WNN, collapse = ",")
+    ),
+    paste(
+      "ATAC WNN dimensions:",
+      paste(ATAC_DIMS_WNN, collapse = ",")
+    ),
+    paste(
+      "Chosen clustering resolution:",
+      CHOSEN_RESOLUTION
+    ),
+    paste(
+      "Chosen cluster column:",
+      CHOSEN_CLUSTER_COLUMN
+    ),
+    paste(
+      "Clusters:",
+      length(levels(Idents(merged)))
+    ),
+    "Final biological cell-type labels assigned: FALSE",
+    "CON-versus-HFD treatment inference performed: FALSE"
+  ),
+  file.path(
+    STEP5_DIR,
+    "STEP_05_COMPLETE.txt"
+  )
+)
+```
+
+# Interpretation checkpoint
+
+Before proceeding to formal cell-state annotation, be able to answer:
+
+1. What problem does WNN solve that RNA-only PCA or ATAC-only LSI cannot solve alone?
+2. What does `RNA.weight` mean for an individual nucleus?
+3. Why is a WNN UMAP not itself the object used to calculate clusters?
+4. What is the difference between the `weighted.nn`, `wknn`, and `wsnn` objects?
+5. What does the clustering-resolution parameter change?
+6. Why should the resolution not be chosen simply because it produces the expected number of cell types?
+7. Why can a small WNN cluster still be biologically plausible?
+8. Why do we inspect sample composition within clusters but avoid a formal CON-versus-HFD abundance test here?
+9. Why should a final cell identity be supported by a multi-gene marker program rather than a single marker?
+10. What additional evidence would you want before declaring a cluster a specific mouse-colon epithelial state?
+
+# What comes next?
+
+Step 6 will focus on **cell-state annotation and biological interpretation**.
+That step can combine:
+
+- cluster-level RNA marker discovery;
+- mouse-colon epithelial marker programs;
+- accessibility around lineage-defining genes;
+- RNA/ATAC concordance;
+- careful identification of rare populations;
+- descriptive comparison of cluster representation between the two libraries.
+
+Formal CON-versus-HFD treatment inference remains limited by the absence of
+independent biological replicates.
+
+# References used for this step
+
+- Seurat weighted nearest-neighbor analysis:
+  https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis
+- Seurat `FindMultiModalNeighbors()`:
+  https://satijalab.org/seurat/reference/findmultimodalneighbors
+- Seurat `FindClusters()`:
+  https://satijalab.org/seurat/reference/findclusters

@@ -66,27 +66,30 @@ print(.libPaths())
 
 # 3. Read the sample sheet
 
-The sample sheet is the biological map for the analysis. `sample_id` names a library; `replicate_id` names the independent animal/specimen that could eventually support statistical replication.
+The sample sheet is the biological map for the analysis. `sample_id` names a Cell Ranger library, while `pool_id` identifies the pooled biological material used to generate that library. In this dataset, each pool contains colon epithelial cells collected from multiple mice, so `pool_id` does not represent an independently measured biological replicate.
 
 ```{r read-sample-sheet}
 sample_sheet <- read_sample_sheet()
 sample_sheet[, c(
   "sample_id",
-  "replicate_id",
+  "pool_id",
   "genotype",
   "diet",
+  "mice_pooled",
+  "female_mice",
+  "male_mice",
   "outs_dir"
 )]
 ```
 
 ## Important design limitation
 
-There is one `CON` sample and one `HFD` sample. Therefore, diet and sample are completely confounded. Thousands of nuclei do not turn one mouse into thousands of biological replicates. Downstream HFD-versus-CON summaries will be descriptive until additional independent animals are added.
+There is one pooled CON library and one pooled HFD library. The CON library contains cells pooled from 6 mice (2 female, 4 male), while the HFD library contains cells pooled from 10 mice (2 female, 8 male). Individual mouse identities are not recoverable after pooling. Therefore, diet and pooled-library identity are completely confounded, and nuclei cannot be treated as independent biological replicates for CON-versus-HFD inference.
 
 ```{r replication-table}
 replication_table <- as.data.frame(with(
   sample_sheet,
-  table(diet, replicate_id)
+  table(diet, pool_id)
 ))
 replication_table[replication_table$Freq > 0, ]
 ```
@@ -171,7 +174,7 @@ Before moving to Step 1, you should be able to answer:
 1.  What is the difference between a sequencing library and a biological replicate?
 2.  Why are `atac_fragments.tsv.gz` and its `.tbi` index both required?
 3.  Why do we inspect Cell Ranger's library-level report before filtering cells?
-4.  Why is HFD-versus-CON inference not valid with one mouse per diet?
+4.  Why is HFD-versus-CON inference not valid with one pooled condition per diet?
 
 Expected completion marker:
 
