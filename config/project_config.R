@@ -63,9 +63,11 @@ RESULT_DIRS <- c(
   "01_qc/metadata",
   "02_objects",
   "03_common_peaks",
-  "04_wnn",
-  "05_annotation",
-  "06_composition",
+  "03_objects",
+  "04_reduction",
+  "05_wnn",
+  "06_annotation",
+  "07_composition",
   "07_pseudobulk"
 )
 
