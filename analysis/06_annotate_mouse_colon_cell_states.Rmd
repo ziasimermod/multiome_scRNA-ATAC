@@ -1,0 +1,4097 @@
+---
+title: "Step 6 - Annotate mouse-colon epithelial cell states"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 5 established the multimodal WNN graph and selected a working clustering resolution of 0.8. Those clusters are computational communities, not biological cell-type labels.
+
+Step 6 converts those clusters into reviewed mouse-colon epithelial cell-state annotations.
+
+The annotation strategy is deliberately evidence-based:
+
+1. discover RNA markers for every WNN cluster;
+2. examine marker effect size and prevalence rather than relying on P values;
+3. evaluate coordinated mouse-colon marker programs;
+4. determine whether cluster markers are consistent across the two pooled libraries;
+5. audit sex-associated transcription because the two pools differ in sex composition;
+6. investigate ambiguous or closely related populations directly;
+7. use ATAC accessibility or gene activity as targeted supporting evidence;
+8. record the final annotation decision separately from the Seurat object.
+
+Final biological labels will **not** be assigned automatically from `FindAllMarkers()`.
+
+## Statistical limitation
+
+Marker discovery compares cells belonging to different biological states and is useful for annotation. However, cell-level P values must not be interpreted as replicated CON-versus-HFD treatment inference.
+
+There is one pooled Cell Ranger library per diet, so diet and pooled-library identity remain confounded.
+
+# 1. Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+})
+
+configure_parallel_plan()
+
+cat(
+  "Configured future workers:",
+  future::nbrOfWorkers(),
+  "\n"
+)
+```
+
+# 2. Define Step 6 parameters and output directories
+
+The clustering resolution was reviewed in Step 5. Step 6 therefore treats it as
+an input rather than reopening the clustering-resolution decision.
+
+Marker discovery is intentionally permissive at first. We retain positive
+markers expressed in at least 10% of cells in a cluster and with at least
+0.25 log2-fold enrichment. Stronger prevalence and specificity filters are
+applied later when ranking annotation candidates.
+
+```{r step-six-parameters}
+STEP6_DIR <- file.path(
+  OUTPUT_DIR,
+  "06_annotation"
+)
+
+STEP6_PLOT_DIR <- file.path(
+  STEP6_DIR,
+  "plots"
+)
+
+STEP6_MARKER_DIR <- file.path(
+  STEP6_DIR,
+  "markers"
+)
+
+dir.create(
+  STEP6_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  STEP6_PLOT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  STEP6_MARKER_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+CHOSEN_RESOLUTION <- 0.8
+CHOSEN_CLUSTER_COLUMN <- "wnn_res_0.8"
+
+MARKER_MIN_PCT <- 0.10
+MARKER_LOGFC_THRESHOLD <- 0.25
+
+step6_parameters <- data.frame(
+  parameter = c(
+    "WNN clustering resolution",
+    "WNN cluster column",
+    "RNA marker minimum pct",
+    "RNA marker log2FC threshold"
+  ),
+  value = c(
+    CHOSEN_RESOLUTION,
+    CHOSEN_CLUSTER_COLUMN,
+    MARKER_MIN_PCT,
+    MARKER_LOGFC_THRESHOLD
+  )
+)
+
+step6_parameters
+```
+
+# 3. Load and validate the finalized Step 5 object
+
+Step 6 must begin from the finalized Step 5 checkpoint. It should never silently
+recalculate WNN or choose a new clustering resolution.
+
+```{r load-step-five}
+step5_marker <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "STEP_05_COMPLETE.txt"
+)
+
+step5_object_path <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "Ppar_iKO_multiome_WNN_clustered.rds"
+)
+
+assert_file(
+  step5_marker,
+  "Step 5 completion marker"
+)
+
+assert_file(
+  step5_object_path,
+  "finalized Step 5 WNN object"
+)
+
+multiome <- readRDS(
+  step5_object_path
+)
+
+required_assays <- c(
+  "RNA",
+  "ATAC"
+)
+
+missing_assays <- setdiff(
+  required_assays,
+  names(multiome)
+)
+
+if (length(missing_assays) > 0L) {
+  stop(
+    "Step 5 object is missing assay(s): ",
+    paste(missing_assays, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+required_reductions <- c(
+  "pca",
+  "lsi",
+  "wnn.umap"
+)
+
+missing_reductions <- setdiff(
+  required_reductions,
+  names(multiome@reductions)
+)
+
+if (length(missing_reductions) > 0L) {
+  stop(
+    "Step 5 object is missing reduction(s): ",
+    paste(missing_reductions, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!CHOSEN_CLUSTER_COLUMN %in% colnames(multiome[[]])) {
+  stop(
+    "The reviewed WNN cluster column was not found: ",
+    CHOSEN_CLUSTER_COLUMN,
+    call. = FALSE
+  )
+}
+
+# Synchronize sample-level metadata from the current sample sheet.
+#
+# Older checkpoints may predate metadata fields that were later added to the
+# workflow, such as pool_id. Rather than rebuilding expensive upstream
+# checkpoints solely to add sample-level metadata, reconstruct those fields
+# from sample_id and verify that any existing values agree with samples.csv.
+
+sample_sheet <- read_sample_sheet()
+
+sample_metadata_columns <- intersect(
+  c(
+    "sample_id",
+    "pool_id",
+    "genotype",
+    "diet",
+    "mice_pooled",
+    "female_mice",
+    "male_mice",
+    "pooling_design"
+  ),
+  colnames(sample_sheet)
+)
+
+sample_index <- match(
+  as.character(multiome$sample_id),
+  sample_sheet$sample_id
+)
+
+if (anyNA(sample_index)) {
+  missing_sample_ids <- unique(
+    as.character(multiome$sample_id)[
+      is.na(sample_index)
+    ]
+  )
+
+  stop(
+    "The Step 5 object contains sample_id values absent from samples.csv: ",
+    paste(missing_sample_ids, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+expected_sample_metadata <- sample_sheet[
+  sample_index,
+  sample_metadata_columns,
+  drop = FALSE
+]
+
+rownames(expected_sample_metadata) <- colnames(
+  multiome
+)
+
+# If a field already exists in the checkpoint, confirm that samples.csv does
+# not disagree with it before replacing/refreshing the metadata.
+existing_metadata_columns <- intersect(
+  sample_metadata_columns,
+  colnames(multiome[[]])
+)
+
+for (column_name in existing_metadata_columns) {
+
+  existing_values <- multiome[[]][[
+    column_name
+  ]]
+
+  expected_values <- expected_sample_metadata[[
+    column_name
+  ]]
+
+  disagreement <- (
+    !is.na(existing_values) &
+      !is.na(expected_values) &
+      as.character(existing_values) !=
+        as.character(expected_values)
+  )
+
+  if (any(disagreement)) {
+    stop(
+      "Checkpoint metadata disagrees with samples.csv for column: ",
+      column_name,
+      call. = FALSE
+    )
+  }
+}
+
+multiome <- AddMetaData(
+  object = multiome,
+  metadata = expected_sample_metadata
+)
+
+required_metadata <- c(
+  "sample_id",
+  "pool_id",
+  "diet",
+  CHOSEN_CLUSTER_COLUMN
+)
+
+missing_metadata <- setdiff(
+  required_metadata,
+  colnames(multiome[[]])
+)
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "Step 5 object is missing required metadata after synchronization: ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+DefaultAssay(multiome) <- "RNA"
+
+rna_layers <- SeuratObject::Layers(
+  multiome[["RNA"]]
+)
+
+if (!"data" %in% rna_layers) {
+  stop(
+    "RNA normalized data layer is absent. ",
+    "Step 6 should use the normalized RNA assay created in Step 4.",
+    call. = FALSE
+  )
+}
+
+Idents(multiome) <- multiome[[]][[
+  CHOSEN_CLUSTER_COLUMN
+]]
+
+step5_validation <- data.frame(
+  cells = ncol(multiome),
+  RNA_features = nrow(multiome[["RNA"]]),
+  ATAC_features = nrow(multiome[["ATAC"]]),
+  WNN_clusters = length(unique(Idents(multiome))),
+  samples = length(unique(multiome$sample_id)),
+  RNA_layers = paste(rna_layers, collapse = ",")
+)
+
+step5_validation
+
+table(
+  Idents(multiome)
+)
+```
+
+# 4. Inventory the WNN clusters before annotating them
+
+Before looking at marker genes, record how many nuclei from each pooled library
+occupy every WNN cluster.
+
+These counts are useful for identifying sample-restricted clusters or rare
+populations. They are **not** differential-abundance statistics.
+
+```{r cluster-inventory}
+# Total retained nuclei contributed by each pooled library.
+sample_totals <- multiome[[]] |>
+  dplyr::count(
+    sample_id,
+    diet,
+    name = "sample_total"
+  ) |>
+  dplyr::mutate(
+    global_sample_fraction =
+      sample_total / sum(sample_total)
+  )
+
+sample_totals
+
+cluster_inventory <- multiome[[]] |>
+  dplyr::mutate(
+    cluster = as.character(
+      .data[[CHOSEN_CLUSTER_COLUMN]]
+    )
+  ) |>
+  dplyr::count(
+    cluster,
+    sample_id,
+    diet,
+    name = "cells"
+  ) |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::mutate(
+    cluster_total = sum(cells),
+    percent_of_cluster =
+      100 * cells / cluster_total
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    sample_totals,
+    by = c(
+      "sample_id",
+      "diet"
+    )
+  ) |>
+  dplyr::mutate(
+    # Fraction of that library's entire retained-cell population
+    # represented by this cluster.
+    percent_of_sample =
+      100 * cells / sample_total,
+
+    # Number of cells expected in this cluster if cluster membership
+    # simply followed the overall library contribution.
+    expected_cells_from_global_fraction =
+      cluster_total * global_sample_fraction,
+
+    # Values >1 indicate over-representation relative to the
+    # library's overall contribution to the merged dataset.
+    representation_ratio =
+      cells / expected_cells_from_global_fraction,
+
+    log2_representation_ratio =
+      log2(representation_ratio)
+  )
+
+cluster_inventory
+
+cluster_composition_wide <- cluster_inventory |>
+  dplyr::select(
+    cluster,
+    diet,
+    cells,
+    percent_of_sample,
+    representation_ratio
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = c(
+      cells,
+      percent_of_sample,
+      representation_ratio
+    ),
+    values_fill = 0
+  ) |>
+  dplyr::mutate(
+    CON_to_HFD_fraction_ratio =
+      dplyr::if_else(
+        percent_of_sample_HFD > 0,
+        percent_of_sample_CON /
+          percent_of_sample_HFD,
+        NA_real_
+      )
+  ) |>
+  dplyr::arrange(
+    as.integer(cluster)
+  )
+
+cluster_composition_wide
+
+readr::write_csv(
+  cluster_inventory,
+  file.path(
+    STEP6_DIR,
+    "cluster_inventory_by_library.csv"
+  )
+)
+
+readr::write_csv(
+  cluster_composition_wide,
+  file.path(
+    STEP6_DIR,
+    "cluster_composition_normalized_by_library.csv"
+  )
+)
+```
+
+## Plot the reviewed WNN clusters
+
+```{r plot-reviewed-clusters, fig.width=10, fig.height=8}
+p_step6_clusters <- DimPlot(
+  multiome,
+  reduction = "wnn.umap",
+  group.by = CHOSEN_CLUSTER_COLUMN,
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3,
+  pt.size = 0.2
+) +
+  NoLegend() +
+  ggplot2::ggtitle(
+    "WNN clusters entering cell-state annotation"
+  )
+
+print(
+  p_step6_clusters
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "01_WNN_clusters_entering_annotation.pdf"
+  ),
+  plot = p_step6_clusters,
+  width = 10,
+  height = 8
+)
+```
+
+# 5. Discover positive RNA markers for every WNN cluster
+
+`FindAllMarkers()` compares each cluster with the remaining nuclei.
+
+The P values produced by this calculation are useful as part of marker
+discovery, but they are not the primary criterion for biological annotation.
+With thousands of nuclei, even very small effects can have extremely small
+P values.
+
+For annotation, we care especially about:
+
+- effect size;
+- fraction of cells expressing the marker in the cluster;
+- expression outside the cluster;
+- whether several genes support the same biological program;
+- whether the pattern is reproducible across the two pooled libraries.
+
+Marker discovery is run sequentially here so that the result is deterministic
+and does not multiply the large Seurat object across several R workers.
+
+```{r discover-rna-markers, cache=FALSE}
+DefaultAssay(multiome) <- "RNA"
+
+future::plan(
+  future::sequential
+)
+
+cat(
+  "Workers used for RNA marker discovery:",
+  future::nbrOfWorkers(),
+  "\n"
+)
+
+set.seed(20260727)
+
+rna_markers <- FindAllMarkers(
+  object = multiome,
+  assay = "RNA",
+  only.pos = TRUE,
+  test.use = "wilcox",
+  min.pct = MARKER_MIN_PCT,
+  logfc.threshold = MARKER_LOGFC_THRESHOLD,
+  return.thresh = 1,
+  verbose = TRUE
+)
+
+configure_parallel_plan()
+
+cat(
+  "Workers restored after marker discovery:",
+  future::nbrOfWorkers(),
+  "\n"
+)
+
+if (nrow(rna_markers) == 0L) {
+  stop(
+    "FindAllMarkers returned no RNA markers.",
+    call. = FALSE
+  )
+}
+
+fc_column <- intersect(
+  c(
+    "avg_log2FC",
+    "avg_logFC"
+  ),
+  colnames(rna_markers)
+)
+
+if (length(fc_column) != 1L) {
+  stop(
+    "Could not identify the fold-change column returned by FindAllMarkers().",
+    call. = FALSE
+  )
+}
+
+rna_markers$effect_size <- rna_markers[[
+  fc_column
+]]
+
+rna_markers$pct_delta <- (
+  rna_markers$pct.1 -
+    rna_markers$pct.2
+)
+
+readr::write_csv(
+  rna_markers,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_positive_markers_all_clusters.csv"
+  )
+)
+
+cat(
+  "RNA marker rows:",
+  nrow(rna_markers),
+  "\n"
+)
+
+cat(
+  "Clusters with RNA markers:",
+  length(unique(rna_markers$cluster)),
+  "\n"
+)
+```
+
+# 6. Rank marker candidates by effect size and prevalence
+
+The table below is a review tool, not an automated annotation algorithm.
+
+For the first-pass shortlist we require:
+
+- at least 20% of cells in the cluster expressing the gene;
+- at least a 10-percentage-point prevalence advantage over cells outside the
+  cluster;
+- positive effect size of at least 0.25 log2 fold-change.
+
+We then retain the 15 strongest genes by effect size for each cluster.
+
+```{r rank-rna-markers}
+rna_marker_candidates <- rna_markers |>
+  dplyr::filter(
+    effect_size >= 0.25,
+    pct.1 >= 0.20,
+    pct_delta >= 0.10
+  ) |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(effect_size),
+    dplyr::desc(pct_delta),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(
+    n = 15
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  rna_marker_candidates,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_top15_marker_candidates_by_cluster.csv"
+  )
+)
+
+marker_review_summary <- rna_marker_candidates |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::summarise(
+    top_genes = paste(
+      gene,
+      collapse = ", "
+    ),
+    .groups = "drop"
+  )
+
+marker_review_summary
+```
+
+# 7. Review broad mouse-colon epithelial marker programs
+
+The broad marker panel is intentionally redundant. A biological identity should
+be supported by several genes from the same program rather than one canonical
+marker.
+
+These programs are starting hypotheses. They will be refined after inspecting
+the unbiased cluster-marker tables.
+
+```{r define-colon-marker-programs}
+colon_marker_programs <- list(
+  Stem_crypt = c(
+    "Lgr5",
+    "Ascl2",
+    "Smoc2",
+    "Axin2",
+    "Sox9",
+    "Olfm4"
+  ),
+  Proliferative = c(
+    "Mki67",
+    "Top2a",
+    "Ccna2",
+    "Ccnb1",
+    "Cdk1"
+  ),
+  Absorptive_colonocyte = c(
+    "Slc26a3",
+    "Aqp8",
+    "Car1",
+    "Car2",
+    "Krt20"
+  ),
+  Goblet = c(
+    "Muc2",
+    "Tff3",
+    "Clca1",
+    "Fcgbp",
+    "Agr2",
+    "Spdef"
+  ),
+  Deep_crypt_secretory = c(
+    "Reg4",
+    "Mptx1",
+    "Spink4",
+    "Kit"
+  ),
+  Enteroendocrine = c(
+    "Chga",
+    "Chgb",
+    "Neurod1",
+    "Pyy",
+    "Gcg",
+    "Tph1"
+  ),
+  Tuft = c(
+    "Dclk1",
+    "Pou2f3",
+    "Trpm5",
+    "Avil"
+  )
+)
+
+colon_marker_table <- data.frame(
+  marker_program = rep(
+    names(colon_marker_programs),
+    lengths(colon_marker_programs)
+  ),
+  gene = unname(
+    unlist(
+      colon_marker_programs
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+colon_marker_table$detected <- (
+  colon_marker_table$gene %in%
+    rownames(multiome[["RNA"]])
+)
+
+colon_marker_table
+```
+
+```{r broad-marker-dotplot, fig.width=16, fig.height=9}
+detected_colon_markers <- unique(
+  colon_marker_table$gene[
+    colon_marker_table$detected
+  ]
+)
+
+p_broad_markers <- DotPlot(
+  multiome,
+  features = detected_colon_markers,
+  group.by = CHOSEN_CLUSTER_COLUMN,
+  assay = "RNA"
+) +
+  RotatedAxis() +
+  ggplot2::ggtitle(
+    "Broad mouse-colon epithelial programs across WNN clusters"
+  )
+
+print(
+  p_broad_markers
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "02_broad_colon_marker_programs.pdf"
+  ),
+  plot = p_broad_markers,
+  width = 16,
+  height = 9
+)
+```
+
+# 8. Audit sex-associated transcription before assigning labels
+
+The two pooled libraries differ in sex composition. This means that
+sex-associated transcription can contribute to apparent cluster or
+library-specific expression patterns.
+
+We do not attempt to infer the originating mouse for an individual nucleus.
+Instead, this audit asks whether canonical X- or Y-linked transcripts appear
+among the signals distinguishing clusters.
+
+```{r sex-associated-marker-audit}
+sex_associated_genes <- c(
+  "Xist",
+  "Tsix",
+  "Ddx3y",
+  "Eif2s3y",
+  "Kdm5d",
+  "Uty"
+)
+
+sex_marker_audit <- data.frame(
+  gene = sex_associated_genes,
+  present = sex_associated_genes %in%
+    rownames(multiome[["RNA"]])
+)
+
+sex_marker_audit
+```
+
+```{r sex-associated-dotplot, fig.width=10, fig.height=7}
+detected_sex_markers <- sex_marker_audit$gene[
+  sex_marker_audit$present
+]
+
+if (length(detected_sex_markers) > 0L) {
+
+  p_sex_markers <- DotPlot(
+    multiome,
+    features = detected_sex_markers,
+    group.by = CHOSEN_CLUSTER_COLUMN,
+    assay = "RNA"
+  ) +
+    RotatedAxis() +
+    ggplot2::ggtitle(
+      "Sex-associated transcription across WNN clusters"
+    )
+
+  print(
+    p_sex_markers
+  )
+
+  ggplot2::ggsave(
+    filename = file.path(
+      STEP6_PLOT_DIR,
+      "03_sex_associated_marker_audit.pdf"
+    ),
+    plot = p_sex_markers,
+    width = 10,
+    height = 7
+  )
+}
+```
+
+# 9. Audit broad epithelial, immune, vascular, and stromal lineages
+
+Although the input material was enriched for colonic epithelium, unbiased RNA
+marker discovery identified several clusters with strong immune, vascular, or
+stromal transcriptional programs.
+
+These populations should not be forced into epithelial cell-state labels.
+
+Before proceeding to detailed epithelial annotation, we therefore perform a
+broad-lineage audit using redundant marker programs. The purpose is to
+distinguish major cellular compartments, not to assign fine subtypes from a
+single marker.
+
+```{r broad-lineage-marker-audit}
+broad_lineage_programs <- list(
+  Epithelial = c(
+    "Epcam",
+    "Krt8",
+    "Krt18",
+    "Krt19"
+  ),
+  T_NK = c(
+    "Ptprc",
+    "Cd3d",
+    "Cd3e",
+    "Trbc1",
+    "Trbc2",
+    "Nkg7",
+    "Klrd1"
+  ),
+  B_cell = c(
+    "Ptprc",
+    "Cd79a",
+    "Cd79b",
+    "Ms4a1",
+    "Cd74"
+  ),
+  Macrophage_myeloid = c(
+    "Ptprc",
+    "Lyz2",
+    "Adgre1",
+    "Csf1r",
+    "C1qa",
+    "C1qb",
+    "C1qc"
+  ),
+  Mast = c(
+    "Ptprc",
+    "Kit",
+    "Ms4a2",
+    "Cpa3",
+    "Mcpt1",
+    "Mcpt2"
+  ),
+  Plasmacytoid_DC = c(
+    "Ptprc",
+    "Siglech",
+    "Flt3",
+    "Ccr9",
+    "Pld4"
+  ),
+  Vascular_endothelial = c(
+    "Cdh5",
+    "Pecam1",
+    "Kdr",
+    "Esam"
+  ),
+  Lymphatic_endothelial = c(
+    "Cdh5",
+    "Flt4",
+    "Prox1",
+    "Lyve1",
+    "Ccl21a",
+    "Pdpn"
+  ),
+  Smooth_muscle = c(
+    "Carmn",
+    "Acta2",
+    "Tagln",
+    "Myh11",
+    "Mylk"
+  ),
+  Fibroblast_stromal = c(
+    "Col1a1",
+    "Col1a2",
+    "Col3a1",
+    "Dcn",
+    "Pdgfra"
+  ),
+  Mesothelial = c(
+    "Lrrn4",
+    "Upk3b",
+    "Msln",
+    "Wt1",
+    "Rspo1"
+  )
+)
+
+broad_lineage_table <- data.frame(
+  marker_program = rep(
+    names(broad_lineage_programs),
+    lengths(broad_lineage_programs)
+  ),
+  gene = unname(
+    unlist(
+      broad_lineage_programs
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+broad_lineage_table$detected <- (
+  broad_lineage_table$gene %in%
+    rownames(multiome[["RNA"]])
+)
+
+broad_lineage_table
+```
+
+```{r broad-lineage-dotplot, fig.width=18, fig.height=9}
+detected_broad_lineage_markers <- unique(
+  broad_lineage_table$gene[
+    broad_lineage_table$detected
+  ]
+)
+
+p_broad_lineages <- DotPlot(
+  multiome,
+  features = detected_broad_lineage_markers,
+  group.by = CHOSEN_CLUSTER_COLUMN,
+  assay = "RNA"
+) +
+  RotatedAxis() +
+  ggplot2::ggtitle(
+    "Broad lineage programs across WNN clusters"
+  )
+
+print(
+  p_broad_lineages
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "04_broad_lineage_marker_audit.pdf"
+  ),
+  plot = p_broad_lineages,
+  width = 18,
+  height = 9
+)
+
+readr::write_csv(
+  broad_lineage_table,
+  file.path(
+    STEP6_DIR,
+    "broad_lineage_marker_audit.csv"
+  )
+)
+```
+
+# 10. Focused epithelial-state audit with literature-supported markers
+
+The broad-lineage audit separates epithelial cells from immune, vascular, stromal, and mesothelial populations. We can now examine epithelial states at higher resolution.
+
+Marker programs used here are not treated as undocumented canonical knowledge.
+Each program is linked to primary mouse-colon or large-intestinal literature, with curated marker resources used only as secondary support.
+
+The marker panel is intentionally conservative. Dataset-specific genes emerging from `FindAllMarkers()` are considered additional evidence but are not silently promoted to literature-defined markers.
+
+```{r epithelial-marker-sources}
+epithelial_marker_sources <- data.frame(
+  source_key = c(
+    "AGING_MOUSE_COLON_2022",
+    "CELLTAG_LARGE_INTESTINE_2019",
+    "ROTHENBERG_COLON_CRYPT",
+    "SASAKI_DCS_2016",
+    "LARGE_INTESTINE_EEC_2019",
+    "INTESTINAL_MARKER_REVIEW_2022",
+    "PANGLOADB_2019"
+  ),
+  source = c(
+    "Single-cell atlas of the aging mouse colon",
+    "CellTag indexing: large-intestinal single-cell dataset",
+    "Identification of a cKit+ colonic crypt base secretory cell",
+    "Reg4+ deep crypt secretory cells function as epithelial niche for Lgr5+ stem cells",
+    "Single-cell transcriptomic profiling of large intestinal enteroendocrine cells in mice",
+    "Intestinal cellular heterogeneity and disease development revealed by single-cell technology",
+    "PanglaoDB"
+  ),
+  evidence_scope = c(
+    "mouse colon",
+    "mouse large intestine",
+    "mouse colon",
+    "mouse colon",
+    "mouse colon and rectum",
+    "mouse and human intestine review",
+    "curated mouse/human marker database"
+  ),
+  url = c(
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9035718/",
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC6509836/",
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC3911891/",
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC5027439/",
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC6812004/",
+    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9433512/",
+    "https://doi.org/10.1093/database/baz046"
+  ),
+  stringsAsFactors = FALSE
+)
+
+epithelial_marker_sources
+
+readr::write_csv(
+  epithelial_marker_sources,
+  file.path(
+    STEP6_DIR,
+    "epithelial_marker_sources.csv"
+  )
+)
+```
+
+```{r define-evidence-backed-epithelial-programs}
+epithelial_cluster_ids <- c(
+  "0",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+  "11",
+  "12",
+  "14",
+  "16",
+  "18"
+)
+
+missing_epithelial_clusters <- setdiff(
+  epithelial_cluster_ids,
+  levels(Idents(multiome))
+)
+
+if (length(missing_epithelial_clusters) > 0L) {
+  stop(
+    "Requested epithelial cluster(s) are absent: ",
+    paste(missing_epithelial_clusters, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+epithelial_marker_programs <- list(
+  Stem_ISC = c(
+    "Lgr5",
+    "Ascl2",
+    "Smoc2",
+    "Slc12a2"
+  ),
+  Proliferative = c(
+    "Mki67",
+    "Pcna",
+    "Top2a"
+  ),
+  Colonocyte_precursor = c(
+    "Selenbp1",
+    "Cyp2c55",
+    "Car1"
+  ),
+  Mature_colonocyte = c(
+    "Krt20",
+    "Slc26a3"
+  ),
+  Goblet = c(
+    "Muc2",
+    "Tff3",
+    "Spdef",
+    "Agr2",
+    "Fcgbp",
+    "Clca1"
+  ),
+  Deep_crypt_secretory = c(
+    "Reg4",
+    "Kit"
+  ),
+  Enteroendocrine_general = c(
+    "Chga",
+    "Chgb",
+    "Neurod1"
+  ),
+  Enterochromaffin = c(
+    "Tph1"
+  ),
+  L_cell = c(
+    "Gcg",
+    "Pyy",
+    "Insl5"
+  ),
+  Tuft = c(
+    "Dclk1",
+    "Pou2f3",
+    "Trpm5"
+  )
+)
+
+marker_program_sources <- c(
+  Stem_ISC =
+    "AGING_MOUSE_COLON_2022;CELLTAG_LARGE_INTESTINE_2019",
+  Proliferative =
+    "AGING_MOUSE_COLON_2022;INTESTINAL_MARKER_REVIEW_2022",
+  Colonocyte_precursor =
+    "AGING_MOUSE_COLON_2022",
+  Mature_colonocyte =
+    "ROTHENBERG_COLON_CRYPT;CELLTAG_LARGE_INTESTINE_2019",
+  Goblet =
+    "ROTHENBERG_COLON_CRYPT;CELLTAG_LARGE_INTESTINE_2019",
+  Deep_crypt_secretory =
+    "SASAKI_DCS_2016;ROTHENBERG_COLON_CRYPT",
+  Enteroendocrine_general =
+    "LARGE_INTESTINE_EEC_2019;INTESTINAL_MARKER_REVIEW_2022",
+  Enterochromaffin =
+    "LARGE_INTESTINE_EEC_2019",
+  L_cell =
+    "LARGE_INTESTINE_EEC_2019",
+  Tuft =
+    "INTESTINAL_MARKER_REVIEW_2022;PANGLOADB_2019"
+)
+
+epithelial_marker_table <- data.frame(
+  marker_program = rep(
+    names(epithelial_marker_programs),
+    lengths(epithelial_marker_programs)
+  ),
+  gene = unname(
+    unlist(
+      epithelial_marker_programs
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+epithelial_marker_table$source_keys <- unname(
+  marker_program_sources[
+    epithelial_marker_table$marker_program
+  ]
+)
+
+# A gene being present as a row in the 10x feature matrix does not prove that
+# any RNA molecules were detected. Audit both feature-set presence and actual
+# nonzero counts.
+
+rna_counts <- SeuratObject::LayerData(
+  object = multiome,
+  assay = "RNA",
+  layer = "counts"
+)
+
+feature_index <- match(
+  epithelial_marker_table$gene,
+  rownames(rna_counts)
+)
+
+epithelial_marker_table$present_in_feature_set <- !is.na(
+  feature_index
+)
+
+epithelial_marker_table$total_UMIs <- NA_real_
+epithelial_marker_table$positive_nuclei <- NA_integer_
+epithelial_marker_table$percent_positive <- NA_real_
+
+present_rows <- which(
+  epithelial_marker_table$present_in_feature_set
+)
+
+if (length(present_rows) > 0L) {
+
+  marker_counts <- rna_counts[
+    feature_index[present_rows],
+    ,
+    drop = FALSE
+  ]
+
+  epithelial_marker_table$total_UMIs[present_rows] <-
+    as.numeric(
+      Matrix::rowSums(marker_counts)
+    )
+
+  epithelial_marker_table$positive_nuclei[present_rows] <-
+    as.integer(
+      Matrix::rowSums(marker_counts > 0)
+    )
+
+  epithelial_marker_table$percent_positive[present_rows] <-
+    100 *
+      epithelial_marker_table$positive_nuclei[present_rows] /
+      ncol(rna_counts)
+}
+
+epithelial_marker_table$detected <- (
+  epithelial_marker_table$present_in_feature_set &
+    !is.na(epithelial_marker_table$total_UMIs) &
+    epithelial_marker_table$total_UMIs > 0
+)
+
+epithelial_marker_table$status <- dplyr::case_when(
+  !epithelial_marker_table$present_in_feature_set ~
+    "not_in_RNA_feature_set",
+  epithelial_marker_table$total_UMIs == 0 ~
+    "present_but_zero_counts",
+  TRUE ~
+    "detected"
+)
+
+epithelial_marker_table
+
+readr::write_csv(
+  epithelial_marker_table,
+  file.path(
+    STEP6_DIR,
+    "epithelial_marker_evidence.csv"
+  )
+)
+```
+
+```{r focused-epithelial-dotplot, fig.width=19, fig.height=9.5}
+# Keep machine-readable program names in the evidence table, but use shorter
+# display labels so narrow DotPlot feature groups remain legible.
+
+epithelial_plot_labels <- c(
+  Stem_ISC = "Stem / ISC",
+  Proliferative = "Proliferative",
+  Colonocyte_precursor = "Colonocyte precursor",
+  Mature_colonocyte = "Mature colonocyte",
+  Goblet = "Goblet",
+  Deep_crypt_secretory = "DCS",
+  Enteroendocrine_general = "EEC",
+  Enterochromaffin = "EC",
+  L_cell = "L cell",
+  Tuft = "Tuft"
+)
+
+missing_plot_labels <- setdiff(
+  names(epithelial_marker_programs),
+  names(epithelial_plot_labels)
+)
+
+if (length(missing_plot_labels) > 0L) {
+  stop(
+    "Plot labels are missing for marker program(s): ",
+    paste(missing_plot_labels, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+detected_epithelial_genes <- unique(
+  epithelial_marker_table$gene[
+    epithelial_marker_table$detected
+  ]
+)
+
+epithelial_plot_programs <- lapply(
+  epithelial_marker_programs,
+  function(genes) {
+    genes[
+      genes %in% detected_epithelial_genes
+    ]
+  }
+)
+
+empty_programs <- names(
+  epithelial_plot_programs
+)[
+  lengths(epithelial_plot_programs) == 0L
+]
+
+if (length(empty_programs) > 0L) {
+  warning(
+    "No detected genes were available for program(s): ",
+    paste(empty_programs, collapse = ", ")
+  )
+}
+
+epithelial_plot_programs <- epithelial_plot_programs[
+  lengths(epithelial_plot_programs) > 0L
+]
+
+names(epithelial_plot_programs) <- unname(
+  epithelial_plot_labels[
+    names(epithelial_plot_programs)
+  ]
+)
+
+p_epithelial_states <- DotPlot(
+  multiome,
+  features = epithelial_plot_programs,
+  assay = "RNA",
+  idents = epithelial_cluster_ids,
+  group.by = CHOSEN_CLUSTER_COLUMN
+) +
+  RotatedAxis() +
+  ggplot2::labs(
+    title =
+      "Literature-supported epithelial-state programs across WNN clusters",
+    subtitle =
+      "DCS = deep-crypt secretory; EEC = enteroendocrine; EC = enterochromaffin"
+  ) +
+  ggplot2::theme(
+    strip.text.x = ggplot2::element_text(
+      size = 9,
+      face = "bold"
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 8
+    )
+  )
+
+print(
+  p_epithelial_states
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "05_focused_epithelial_state_audit.pdf"
+  ),
+  plot = p_epithelial_states,
+  width = 19,
+  height = 9.5
+)
+
+readr::write_csv(
+  p_epithelial_states$data,
+  file.path(
+    STEP6_DIR,
+    "focused_epithelial_state_DotPlot_data.csv"
+  )
+)
+```
+
+# 11. Focused adjudication of crypt, stem, and proliferative clusters
+
+The broad epithelial-state audit identified clusters 4, 7, and 18 as closely
+related crypt-associated populations requiring direct comparison.
+
+These clusters are not assigned final identities here. In particular,
+proliferation is treated as a cell state rather than as proof of a
+transit-amplifying lineage. A cycling ISC, absorptive progenitor, or
+secretory-committed progenitor can all express cell-cycle genes.
+
+This section asks:
+
+1. which genes distinguish clusters 4, 7, and 18 directly;
+2. whether ISC, proliferation, and secretory programs are detected in the same
+   nuclei;
+3. whether the distinguishing patterns are visible in both pooled libraries;
+4. whether cluster 18 shows evidence of abnormal complexity or residual
+   doublets.
+
+```{r define-focused-crypt-programs}
+crypt_cluster_ids <- c(
+  "4",
+  "7",
+  "18"
+)
+
+missing_crypt_clusters <- setdiff(
+  crypt_cluster_ids,
+  levels(Idents(multiome))
+)
+
+if (length(missing_crypt_clusters) > 0L) {
+  stop(
+    "Focused crypt cluster(s) are absent: ",
+    paste(missing_crypt_clusters, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+crypt_marker_programs <- list(
+  ISC_Wnt = c(
+    "Lgr5",
+    "Ascl2",
+    "Smoc2",
+    "Axin2",
+    "Olfm4",
+    "Lrig1",
+    "Ephb2",
+    "Tnfrsf19"
+  ),
+  Proliferative = c(
+    "Mki67",
+    "Pcna",
+    "Top2a",
+    "Cdk1",
+    "Ccnb1",
+    "Ube2c",
+    "Birc5"
+  ),
+  Secretory_commitment = c(
+    "Atoh1",
+    "Dll1",
+    "Gfi1",
+    "Spdef"
+  ),
+  Goblet_DCS = c(
+    "Muc2",
+    "Agr2",
+    "Tff3",
+    "Fcgbp",
+    "Clca1",
+    "Spink4",
+    "Mptx1",
+    "Reg4",
+    "Kit"
+  )
+)
+
+crypt_marker_table <- data.frame(
+  marker_program = rep(
+    names(crypt_marker_programs),
+    lengths(crypt_marker_programs)
+  ),
+  gene = unname(
+    unlist(crypt_marker_programs)
+  ),
+  stringsAsFactors = FALSE
+)
+
+rna_counts <- SeuratObject::LayerData(
+  multiome,
+  assay = "RNA",
+  layer = "counts"
+)
+
+crypt_feature_index <- match(
+  crypt_marker_table$gene,
+  rownames(rna_counts)
+)
+
+crypt_marker_table$present_in_feature_set <- !is.na(
+  crypt_feature_index
+)
+
+crypt_marker_table$total_UMIs <- NA_real_
+crypt_marker_table$positive_nuclei <- NA_integer_
+crypt_marker_table$percent_positive <- NA_real_
+
+present_crypt_rows <- which(
+  crypt_marker_table$present_in_feature_set
+)
+
+if (length(present_crypt_rows) > 0L) {
+
+  crypt_marker_counts <- rna_counts[
+    crypt_feature_index[present_crypt_rows],
+    ,
+    drop = FALSE
+  ]
+
+  crypt_marker_table$total_UMIs[present_crypt_rows] <-
+    as.numeric(
+      Matrix::rowSums(crypt_marker_counts)
+    )
+
+  crypt_marker_table$positive_nuclei[present_crypt_rows] <-
+    as.integer(
+      Matrix::rowSums(crypt_marker_counts > 0)
+    )
+
+  crypt_marker_table$percent_positive[present_crypt_rows] <-
+    100 *
+      crypt_marker_table$positive_nuclei[present_crypt_rows] /
+      ncol(rna_counts)
+}
+
+crypt_marker_table$detected <- (
+  crypt_marker_table$present_in_feature_set &
+    !is.na(crypt_marker_table$total_UMIs) &
+    crypt_marker_table$total_UMIs > 0
+)
+
+crypt_marker_table
+
+readr::write_csv(
+  crypt_marker_table,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_marker_evidence.csv"
+  )
+)
+```
+
+```{r focused-crypt-program-dotplot, fig.width=13, fig.height=5.5}
+detected_crypt_genes <- unique(
+  crypt_marker_table$gene[
+    crypt_marker_table$detected
+  ]
+)
+
+crypt_plot_programs <- lapply(
+  crypt_marker_programs,
+  function(genes) {
+    genes[
+      genes %in% detected_crypt_genes
+    ]
+  }
+)
+
+crypt_plot_programs <- crypt_plot_programs[
+  lengths(crypt_plot_programs) > 0L
+]
+
+names(crypt_plot_programs) <- c(
+  "ISC / Wnt",
+  "Proliferative",
+  "Secretory commitment",
+  "Goblet / DCS"
+)[
+  match(
+    names(crypt_plot_programs),
+    names(crypt_marker_programs)
+  )
+]
+
+p_crypt_programs <- DotPlot(
+  multiome,
+  features = crypt_plot_programs,
+  assay = "RNA",
+  idents = crypt_cluster_ids,
+  group.by = CHOSEN_CLUSTER_COLUMN
+) +
+  RotatedAxis() +
+  ggplot2::labs(
+    title =
+      "Focused crypt-state programs across clusters 4, 7, and 18",
+    subtitle =
+      "Proliferation is evaluated separately from lineage identity"
+  ) +
+  ggplot2::theme(
+    strip.text.x = ggplot2::element_text(
+      size = 10,
+      face = "bold"
+    )
+  )
+
+print(
+  p_crypt_programs
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "06_focused_crypt_program_audit.pdf"
+  ),
+  plot = p_crypt_programs,
+  width = 13,
+  height = 5.5
+)
+
+readr::write_csv(
+  p_crypt_programs$data,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_program_DotPlot_data.csv"
+  )
+)
+```
+
+## Direct pairwise RNA comparisons
+
+Each comparison uses the normalized RNA assay and asks which genes distinguish
+one cluster from the other. The adjusted P values are cell-level marker-ranking
+statistics, not replicated biological inference. Annotation decisions emphasize
+effect size, prevalence difference, coordinated programs, and consistency
+between the pooled libraries.
+
+```{r pairwise-rna-clusters-4-7-18, cache=FALSE}
+pairwise_comparisons <- data.frame(
+  ident_1 = c(
+    "4",
+    "4",
+    "7"
+  ),
+  ident_2 = c(
+    "7",
+    "18",
+    "18"
+  ),
+  stringsAsFactors = FALSE
+)
+
+get_effect_column <- function(marker_table) {
+
+  candidates <- intersect(
+    c(
+      "avg_log2FC",
+      "avg_log2_FC",
+      "avg_logFC"
+    ),
+    colnames(marker_table)
+  )
+
+  if (length(candidates) != 1L) {
+    stop(
+      "Could not identify one fold-change column.",
+      call. = FALSE
+    )
+  }
+
+  candidates
+}
+
+future::plan(
+  future::sequential
+)
+
+pairwise_rna_results <- vector(
+  "list",
+  nrow(pairwise_comparisons)
+)
+
+for (i in seq_len(nrow(pairwise_comparisons))) {
+
+  ident_1 <- pairwise_comparisons$ident_1[i]
+  ident_2 <- pairwise_comparisons$ident_2[i]
+
+  marker_result <- FindMarkers(
+    object = multiome,
+    ident.1 = ident_1,
+    ident.2 = ident_2,
+    assay = "RNA",
+    test.use = "wilcox",
+    only.pos = FALSE,
+    min.pct = 0.10,
+    logfc.threshold = 0,
+    return.thresh = 1,
+    verbose = TRUE
+  )
+
+  effect_column <- get_effect_column(
+    marker_result
+  )
+
+  marker_result$gene <- rownames(
+    marker_result
+  )
+
+  marker_result$effect_size <- marker_result[[
+    effect_column
+  ]]
+
+  marker_result$pct_delta <- (
+    marker_result$pct.1 -
+      marker_result$pct.2
+  )
+
+  marker_result$comparison <- paste0(
+    ident_1,
+    "_vs_",
+    ident_2
+  )
+
+  marker_result$ident_1 <- ident_1
+  marker_result$ident_2 <- ident_2
+
+  marker_result$higher_in <- dplyr::case_when(
+    marker_result$effect_size > 0 ~ ident_1,
+    marker_result$effect_size < 0 ~ ident_2,
+    TRUE ~ "equal"
+  )
+
+  rownames(marker_result) <- NULL
+
+  pairwise_rna_results[[i]] <- marker_result
+}
+
+configure_parallel_plan()
+
+pairwise_rna_results <- dplyr::bind_rows(
+  pairwise_rna_results
+)
+
+pairwise_review_candidates <- pairwise_rna_results |>
+  dplyr::filter(
+    abs(effect_size) >= 0.25,
+    abs(pct_delta) >= 0.10
+  ) |>
+  dplyr::group_by(
+    comparison,
+    higher_in
+  ) |>
+  dplyr::slice_max(
+    order_by = abs(effect_size),
+    n = 25,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  pairwise_rna_results,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_pairwise_clusters_4_7_18_all.csv"
+  )
+)
+
+readr::write_csv(
+  pairwise_review_candidates,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_pairwise_clusters_4_7_18_review_candidates.csv"
+  )
+)
+
+pairwise_review_candidates
+```
+
+## Per-cell RNA co-detection
+
+A cluster-level DotPlot can show two genes in the same cluster even when they
+occur in different nuclei. This audit therefore measures whether lineage and
+proliferation programs are detected within the same individual nuclei.
+
+Because single-nucleus RNA measurements are sparse, failure to detect a pair is
+not proof that the transcripts are biologically absent.
+
+```{r per-cell-crypt-program-codetection}
+cluster_vector <- as.character(
+  multiome[[]][[
+    CHOSEN_CLUSTER_COLUMN
+  ]]
+)
+
+names(cluster_vector) <- rownames(
+  multiome[[]]
+)
+
+crypt_cells <- names(
+  cluster_vector
+)[
+  cluster_vector %in% crypt_cluster_ids
+]
+
+detected_crypt_programs <- lapply(
+  crypt_marker_programs,
+  function(genes) {
+    genes[
+      genes %in% detected_crypt_genes
+    ]
+  }
+)
+
+crypt_counts <- rna_counts[
+  unique(
+    unlist(
+      detected_crypt_programs
+    )
+  ),
+  crypt_cells,
+  drop = FALSE
+]
+
+crypt_cell_evidence <- data.frame(
+  cell = crypt_cells,
+  cluster = unname(
+    cluster_vector[
+      crypt_cells
+    ]
+  ),
+  stringsAsFactors = FALSE
+)
+
+for (program_name in names(detected_crypt_programs)) {
+
+  program_genes <- detected_crypt_programs[[
+    program_name
+  ]]
+
+  output_column <- paste0(
+    program_name,
+    "_genes_detected"
+  )
+
+  if (length(program_genes) == 0L) {
+    crypt_cell_evidence[[
+      output_column
+    ]] <- 0L
+  } else {
+    crypt_cell_evidence[[
+      output_column
+    ]] <- as.integer(
+      Matrix::colSums(
+        crypt_counts[
+          program_genes,
+          ,
+          drop = FALSE
+        ] > 0
+      )
+    )
+  }
+}
+
+crypt_codetection_summary <- crypt_cell_evidence |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+
+    ISC_Wnt_any_pct =
+      100 * mean(ISC_Wnt_genes_detected > 0),
+
+    Proliferative_any_pct =
+      100 * mean(Proliferative_genes_detected > 0),
+
+    Secretory_commitment_any_pct =
+      100 * mean(Secretory_commitment_genes_detected > 0),
+
+    Goblet_DCS_any_pct =
+      100 * mean(Goblet_DCS_genes_detected > 0),
+
+    ISC_Wnt_and_Proliferative_pct =
+      100 * mean(
+        ISC_Wnt_genes_detected > 0 &
+          Proliferative_genes_detected > 0
+      ),
+
+    Secretory_commitment_and_Proliferative_pct =
+      100 * mean(
+        Secretory_commitment_genes_detected > 0 &
+          Proliferative_genes_detected > 0
+      ),
+
+    Goblet_DCS_and_Proliferative_pct =
+      100 * mean(
+        Goblet_DCS_genes_detected > 0 &
+          Proliferative_genes_detected > 0
+      ),
+
+    .groups = "drop"
+  )
+
+gene_pair_specification <- data.frame(
+  pair = c(
+    "Lgr5_and_Mki67",
+    "Smoc2_and_Mki67",
+    "Muc2_and_Mki67",
+    "Kit_and_Mki67",
+    "Reg4_and_Mki67"
+  ),
+  gene_1 = c(
+    "Lgr5",
+    "Smoc2",
+    "Muc2",
+    "Kit",
+    "Reg4"
+  ),
+  gene_2 = rep(
+    "Mki67",
+    5
+  ),
+  stringsAsFactors = FALSE
+)
+
+gene_pair_specification <- gene_pair_specification |>
+  dplyr::filter(
+    gene_1 %in% rownames(crypt_counts),
+    gene_2 %in% rownames(crypt_counts)
+  )
+
+gene_pair_codetection <- dplyr::bind_rows(
+  lapply(
+    crypt_cluster_ids,
+    function(cluster_id) {
+
+      cluster_cells <- crypt_cells[
+        cluster_vector[
+          crypt_cells
+        ] == cluster_id
+      ]
+
+      dplyr::bind_rows(
+        lapply(
+          seq_len(nrow(gene_pair_specification)),
+          function(i) {
+
+            gene_1 <- gene_pair_specification$gene_1[i]
+            gene_2 <- gene_pair_specification$gene_2[i]
+
+            gene_1_detected <- as.numeric(
+              crypt_counts[
+                gene_1,
+                cluster_cells,
+                drop = TRUE
+              ] > 0
+            )
+
+            gene_2_detected <- as.numeric(
+              crypt_counts[
+                gene_2,
+                cluster_cells,
+                drop = TRUE
+              ] > 0
+            )
+
+            data.frame(
+              cluster = cluster_id,
+              nuclei = length(cluster_cells),
+              pair = gene_pair_specification$pair[i],
+              gene_1 = gene_1,
+              gene_2 = gene_2,
+              percent_gene_1_detected =
+                100 * mean(gene_1_detected),
+              percent_gene_2_detected =
+                100 * mean(gene_2_detected),
+              percent_codetected =
+                100 * mean(
+                  gene_1_detected &
+                    gene_2_detected
+                )
+            )
+          }
+        )
+      )
+    }
+  )
+)
+
+readr::write_csv(
+  crypt_cell_evidence,
+  file.path(
+    STEP6_DIR,
+    "per_cell_crypt_program_detection.csv"
+  )
+)
+
+readr::write_csv(
+  crypt_codetection_summary,
+  file.path(
+    STEP6_DIR,
+    "crypt_program_codetection_summary.csv"
+  )
+)
+
+readr::write_csv(
+  gene_pair_codetection,
+  file.path(
+    STEP6_DIR,
+    "crypt_gene_pair_codetection_summary.csv"
+  )
+)
+
+crypt_codetection_summary
+gene_pair_codetection
+```
+
+## Refine per-nucleus crypt-program definitions
+
+The broad `any gene in program` rule is too permissive for per-nucleus classification. In particular, broadly expressed crypt genes can inflate an ISC/Wnt flag without showing that the same nucleus expresses a bona fide ISC marker.
+
+The following rules are deliberately explicit and conservative:
+
+- ISC core: `Lgr5` plus `Ascl2` or `Smoc2`;
+- proliferative: `Mki67` or `Top2a`;
+- secretory commitment: `Atoh1` and at least one of `Dll1`, `Gfi1`, or `Spdef`;
+- goblet-associated: `Muc2` detected;
+- DCS-associated: both `Reg4` and `Kit` detected.
+
+These are annotation-support flags, not final cell labels. `Olfm4` remains useful in descriptive marker plots but is excluded from the binary ISC rule because of its low detectability in this colon dataset.
+
+```{r refined-crypt-program-codetection, fig.width=14, fig.height=7}
+CRYPT_REVIEW_CLUSTERS <- c(
+  "4",
+  "7",
+  "18"
+)
+
+CRYPT_CLUSTER_COLORS <- c(
+  "4" = "green4",
+  "7" = "greenyellow",
+  "18" = "yellow"
+)
+
+missing_crypt_clusters <- setdiff(
+  CRYPT_REVIEW_CLUSTERS,
+  levels(Idents(multiome))
+)
+
+if (length(missing_crypt_clusters) > 0L) {
+  stop(
+    "Focused crypt cluster(s) are absent: ",
+    paste(missing_crypt_clusters, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+crypt_program_definitions <- data.frame(
+  program = c(
+    "ISC_core",
+    "Proliferative",
+    "Secretory_commitment",
+    "Goblet_Muc2",
+    "DCS_Reg4_Kit"
+  ),
+  display_name = c(
+    "ISC core",
+    "Proliferative",
+    "Secretory commitment",
+    "Goblet (Muc2+)",
+    "DCS (Reg4+ Kit+)"
+  ),
+  genes = c(
+    "Lgr5 AND (Ascl2 OR Smoc2)",
+    "Mki67 OR Top2a",
+    "Atoh1 OR Dll1 OR Gfi1 OR Spdef",
+    "Muc2",
+    "Reg4 AND Kit"
+  ),
+  rule = c(
+    "Lgr5 > 0 and at least one of Ascl2 or Smoc2 > 0",
+    "at least one of Mki67 or Top2a > 0",
+    "at least one of Atoh1, Dll1, Gfi1, or Spdef > 0",
+    "Muc2 > 0",
+    "Reg4 > 0 and Kit > 0"
+  ),
+  source_keys = c(
+    "AGING_MOUSE_COLON_2022;CELLTAG_LARGE_INTESTINE_2019",
+    "AGING_MOUSE_COLON_2022;INTESTINAL_MARKER_REVIEW_2022",
+    "ROTHENBERG_COLON_CRYPT;CELLTAG_LARGE_INTESTINE_2019",
+    "ROTHENBERG_COLON_CRYPT;CELLTAG_LARGE_INTESTINE_2019",
+    "SASAKI_DCS_2016;ROTHENBERG_COLON_CRYPT"
+  ),
+  interpretation = rep(
+    "Per-nucleus RNA co-detection flag for annotation support; not a final label",
+    5
+  ),
+  stringsAsFactors = FALSE
+)
+
+crypt_program_definitions
+
+readr::write_csv(
+  crypt_program_definitions,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_program_definitions.csv"
+  )
+)
+
+codetection_genes <- c(
+  "Lgr5",
+  "Ascl2",
+  "Smoc2",
+  "Mki67",
+  "Top2a",
+  "Atoh1",
+  "Dll1",
+  "Gfi1",
+  "Spdef",
+  "Muc2",
+  "Reg4",
+  "Kit"
+)
+
+DefaultAssay(multiome) <- "RNA"
+
+rna_counts <- SeuratObject::LayerData(
+  multiome,
+  assay = "RNA",
+  layer = "counts"
+)
+
+missing_codetection_genes <- setdiff(
+  codetection_genes,
+  rownames(rna_counts)
+)
+
+if (length(missing_codetection_genes) > 0L) {
+  stop(
+    "Required co-detection gene(s) are absent from the RNA feature set: ",
+    paste(missing_codetection_genes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+crypt_review_cells <- unlist(
+  lapply(
+    CRYPT_REVIEW_CLUSTERS,
+    function(cluster_id) {
+      WhichCells(
+        multiome,
+        idents = cluster_id
+      )
+    }
+  ),
+  use.names = FALSE
+)
+
+crypt_detection_matrix <- t(
+  as.matrix(
+    rna_counts[
+      codetection_genes,
+      crypt_review_cells,
+      drop = FALSE
+    ] > 0
+  )
+)
+
+crypt_detection_matrix <- as.data.frame(
+  crypt_detection_matrix,
+  check.names = FALSE
+)
+
+per_cell_crypt_program_detection <- data.frame(
+  nucleus = rownames(crypt_detection_matrix),
+  cluster = factor(
+    as.character(
+      multiome[[]][
+        rownames(crypt_detection_matrix),
+        CHOSEN_CLUSTER_COLUMN
+      ]
+    ),
+    levels = CRYPT_REVIEW_CLUSTERS
+  ),
+  sample_id = as.character(
+    multiome[[]][
+      rownames(crypt_detection_matrix),
+      "sample_id"
+    ]
+  ),
+  crypt_detection_matrix,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+per_cell_crypt_program_detection$ISC_core <- with(
+  per_cell_crypt_program_detection,
+  Lgr5 & (Ascl2 | Smoc2)
+)
+
+per_cell_crypt_program_detection$Proliferative <- with(
+  per_cell_crypt_program_detection,
+  Mki67 | Top2a
+)
+
+per_cell_crypt_program_detection$Secretory_commitment <- with(
+  per_cell_crypt_program_detection,
+  Atoh1 & (Dll1 | Gfi1 | Spdef)
+)
+
+per_cell_crypt_program_detection$Goblet_Muc2 <- (
+  per_cell_crypt_program_detection$Muc2
+)
+
+per_cell_crypt_program_detection$DCS_Reg4_Kit <- with(
+  per_cell_crypt_program_detection,
+  Reg4 & Kit
+)
+
+crypt_program_columns <- crypt_program_definitions$program
+
+crypt_program_detection_summary <-
+  per_cell_crypt_program_detection |>
+  dplyr::select(
+    nucleus,
+    cluster,
+    sample_id,
+    dplyr::all_of(crypt_program_columns)
+  ) |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(crypt_program_columns),
+    names_to = "program",
+    values_to = "detected"
+  ) |>
+  dplyr::group_by(
+    cluster,
+    program
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    detected_nuclei = sum(detected),
+    percent_detected = 100 * mean(detected),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    crypt_program_definitions[
+      ,
+      c(
+        "program",
+        "display_name"
+      )
+    ],
+    by = "program"
+  ) |>
+  dplyr::mutate(
+    display_name = factor(
+      display_name,
+      levels = crypt_program_definitions$display_name
+    )
+  )
+
+crypt_program_pair_values <- data.frame(
+  nucleus = per_cell_crypt_program_detection$nucleus,
+  cluster = per_cell_crypt_program_detection$cluster,
+  sample_id = per_cell_crypt_program_detection$sample_id,
+  ISC_core_and_proliferative = with(
+    per_cell_crypt_program_detection,
+    ISC_core & Proliferative
+  ),
+  Secretory_commitment_and_proliferative = with(
+    per_cell_crypt_program_detection,
+    Secretory_commitment & Proliferative
+  ),
+  Goblet_Muc2_and_proliferative = with(
+    per_cell_crypt_program_detection,
+    Goblet_Muc2 & Proliferative
+  ),
+  DCS_Reg4_Kit_and_proliferative = with(
+    per_cell_crypt_program_detection,
+    DCS_Reg4_Kit & Proliferative
+  ),
+  stringsAsFactors = FALSE
+)
+
+crypt_pair_labels <- c(
+  ISC_core_and_proliferative = "ISC core + proliferative",
+  Secretory_commitment_and_proliferative =
+    "Secretory commitment + proliferative",
+  Goblet_Muc2_and_proliferative = "Goblet (Muc2+) + proliferative",
+  DCS_Reg4_Kit_and_proliferative =
+    "DCS (Reg4+ Kit+) + proliferative"
+)
+
+crypt_program_codetection_summary <-
+  crypt_program_pair_values |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(names(crypt_pair_labels)),
+    names_to = "pair",
+    values_to = "codetected"
+  ) |>
+  dplyr::group_by(
+    cluster,
+    pair
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    codetected_nuclei = sum(codetected),
+    percent_codetected = 100 * mean(codetected),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    pair_label = factor(
+      unname(crypt_pair_labels[pair]),
+      levels = unname(crypt_pair_labels)
+    )
+  )
+
+crypt_program_detection_summary
+crypt_program_codetection_summary
+
+readr::write_csv(
+  per_cell_crypt_program_detection,
+  file.path(
+    STEP6_DIR,
+    "per_cell_crypt_program_detection.csv"
+  )
+)
+
+readr::write_csv(
+  crypt_program_detection_summary,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_program_detection_summary.csv"
+  )
+)
+
+readr::write_csv(
+  crypt_program_codetection_summary,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_program_codetection_summary.csv"
+  )
+)
+
+p_crypt_program_detection <- ggplot2::ggplot(
+  crypt_program_detection_summary,
+  ggplot2::aes(
+    x = display_name,
+    y = cluster,
+    fill = percent_detected
+  )
+) +
+  ggplot2::geom_tile(
+    color = "white",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = sprintf("%.1f%%", percent_detected)
+    ),
+    size = 3.2
+  ) +
+  ggplot2::scale_fill_gradientn(
+    colors = c(
+      "#F7FBFF",
+      "#6BAED6",
+      "#08306B"
+    ),
+    limits = c(
+      0,
+      100
+    )
+  ) +
+  ggplot2::labs(
+    title = "Per-nucleus program detection",
+    x = NULL,
+    y = "WNN cluster",
+    fill = "Nuclei (%)"
+  ) +
+  ggplot2::theme_minimal(
+    base_size = 11
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(
+      angle = 35,
+      hjust = 1
+    )
+  )
+
+p_crypt_program_pairs <- ggplot2::ggplot(
+  crypt_program_codetection_summary,
+  ggplot2::aes(
+    x = cluster,
+    y = percent_codetected,
+    fill = cluster
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.68
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = sprintf("%.1f%%", percent_codetected)
+    ),
+    vjust = -0.35,
+    size = 3
+  ) +
+  ggplot2::facet_wrap(
+    ~pair_label,
+    ncol = 2,
+    scales = "free_y"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = CRYPT_CLUSTER_COLORS,
+    guide = "none"
+  ) +
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(
+      mult = c(
+        0,
+        0.18
+      )
+    )
+  ) +
+  ggplot2::labs(
+    title = "Per-nucleus co-detection with proliferation",
+    x = "WNN cluster",
+    y = "Nuclei with co-detection (%)"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 11
+  ) +
+  ggplot2::theme(
+    strip.background = ggplot2::element_rect(
+      fill = "grey95",
+      color = "grey75"
+    ),
+    strip.text = ggplot2::element_text(
+      face = "bold"
+    )
+  )
+
+p_refined_codetection <- patchwork::wrap_plots(
+  p_crypt_program_detection,
+  p_crypt_program_pairs,
+  widths = c(
+    1,
+    1.25
+  )
+) +
+  patchwork::plot_annotation(
+    title = "Refined crypt-state detection and proliferation co-detection",
+    subtitle = paste(
+      "Counts-layer definitions; descriptive annotation support;",
+      "nuclei are not biological replicates"
+    )
+  )
+
+print(
+  p_refined_codetection
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "08_refined_crypt_program_codetection.pdf"
+  ),
+  plot = p_refined_codetection,
+  width = 14,
+  height = 7
+)
+```
+
+## Cross-library consistency of focused marker effects
+
+The two pooled libraries are not biological replicates. Nevertheless, a
+cluster-defining marker effect observed in both libraries is less likely to be
+caused entirely by one library's technical characteristics.
+
+This audit calculates within-library fold changes for the focused marker panel.
+No cross-library treatment P value is calculated.
+
+```{r focused-cross-library-marker-consistency}
+sample_ids <- sample_sheet$sample_id[
+  sample_sheet$sample_id %in%
+    unique(
+      as.character(
+        multiome$sample_id
+      )
+    )
+]
+
+combined_identity <- paste(
+  cluster_vector,
+  as.character(multiome$sample_id),
+  sep = "__"
+)
+
+crypt_identity_order <- unlist(
+  lapply(
+    crypt_cluster_ids,
+    function(cluster_id) {
+      paste(
+        cluster_id,
+        sample_ids,
+        sep = "__"
+      )
+    }
+  ),
+  use.names = FALSE
+)
+
+all_combined_identities <- unique(
+  combined_identity
+)
+
+multiome$crypt_cluster_library <- factor(
+  combined_identity,
+  levels = c(
+    crypt_identity_order,
+    setdiff(
+      all_combined_identities,
+      crypt_identity_order
+    )
+  )
+)
+
+original_identities <- Idents(
+  multiome
+)
+
+cross_library_fc_list <- list()
+result_index <- 1L
+
+tryCatch(
+  {
+    Idents(multiome) <- "crypt_cluster_library"
+
+    identity_counts <- table(
+      Idents(multiome)
+    )
+
+    for (sample_id in sample_ids) {
+
+      for (comparison_index in seq_len(
+        nrow(pairwise_comparisons)
+      )) {
+
+        ident_1 <- pairwise_comparisons$ident_1[
+          comparison_index
+        ]
+
+        ident_2 <- pairwise_comparisons$ident_2[
+          comparison_index
+        ]
+
+        group_1 <- paste(
+          ident_1,
+          sample_id,
+          sep = "__"
+        )
+
+        group_2 <- paste(
+          ident_2,
+          sample_id,
+          sep = "__"
+        )
+
+        groups_present <- (
+          group_1 %in% names(identity_counts) &&
+            group_2 %in% names(identity_counts)
+        )
+
+        groups_large_enough <- (
+          groups_present &&
+            identity_counts[[group_1]] >= 3L &&
+            identity_counts[[group_2]] >= 3L
+        )
+
+        if (!groups_large_enough) {
+          warning(
+            "Skipping ",
+            group_1,
+            " versus ",
+            group_2,
+            ": fewer than three nuclei in at least one group."
+          )
+
+          next
+        }
+
+        fold_change_result <- FoldChange(
+          object = multiome,
+          ident.1 = group_1,
+          ident.2 = group_2,
+          assay = "RNA",
+          features = detected_crypt_genes
+        )
+
+        effect_column <- get_effect_column(
+          fold_change_result
+        )
+
+        fold_change_result$gene <- rownames(
+          fold_change_result
+        )
+
+        fold_change_result$effect_size <-
+          fold_change_result[[
+            effect_column
+          ]]
+
+        fold_change_result$pct_delta <- (
+          fold_change_result$pct.1 -
+            fold_change_result$pct.2
+        )
+
+        fold_change_result$sample_id <- sample_id
+        fold_change_result$comparison <- paste0(
+          ident_1,
+          "_vs_",
+          ident_2
+        )
+        fold_change_result$ident_1 <- ident_1
+        fold_change_result$ident_2 <- ident_2
+
+        rownames(fold_change_result) <- NULL
+
+        cross_library_fc_list[[
+          result_index
+        ]] <- fold_change_result
+
+        result_index <- result_index + 1L
+      }
+    }
+  },
+  finally = {
+    Idents(multiome) <- original_identities
+  }
+)
+
+cross_library_fold_changes <- dplyr::bind_rows(
+  cross_library_fc_list
+)
+
+cross_library_concordance <- cross_library_fold_changes |>
+  dplyr::group_by(
+    comparison,
+    gene
+  ) |>
+  dplyr::summarise(
+    libraries_compared =
+      dplyr::n_distinct(sample_id),
+
+    direction_concordant = (
+      dplyr::n_distinct(sample_id) ==
+        length(sample_ids) &&
+        (
+          all(effect_size > 0) ||
+            all(effect_size < 0)
+        )
+    ),
+
+    minimum_absolute_effect =
+      min(
+        abs(effect_size),
+        na.rm = TRUE
+      ),
+
+    sample_effects = paste(
+      paste0(
+        sample_id,
+        "=",
+        round(effect_size, 3)
+      ),
+      collapse = ";"
+    ),
+
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  cross_library_fold_changes,
+  file.path(
+    STEP6_MARKER_DIR,
+    "focused_crypt_marker_effects_by_library.csv"
+  )
+)
+
+readr::write_csv(
+  cross_library_concordance,
+  file.path(
+    STEP6_MARKER_DIR,
+    "focused_crypt_marker_cross_library_concordance.csv"
+  )
+)
+
+cross_library_concordance |>
+  dplyr::filter(
+    direction_concordant
+  )
+```
+
+```{r focused-crypt-programs-by-library, fig.width=14, fig.height=7}
+p_crypt_by_library <- DotPlot(
+  multiome,
+  features = crypt_plot_programs,
+  assay = "RNA",
+  idents = crypt_cluster_ids,
+  group.by = "crypt_cluster_library"
+) +
+  RotatedAxis() +
+  ggplot2::labs(
+    title =
+      "Focused crypt-state programs by WNN cluster and pooled library",
+    subtitle =
+      "Descriptive annotation support; libraries are not biological replicates",
+    y = "Cluster__library"
+  ) +
+  ggplot2::theme(
+    strip.text.x = ggplot2::element_text(
+      size = 9,
+      face = "bold"
+    )
+  )
+
+print(
+  p_crypt_by_library
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "08_focused_crypt_programs_by_library.pdf"
+  ),
+  plot = p_crypt_by_library,
+  width = 14,
+  height = 7
+)
+
+readr::write_csv(
+  p_crypt_by_library$data,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_programs_by_library_DotPlot_data.csv"
+  )
+)
+```
+
+## QC and residual-doublet audit for the focused clusters
+
+All nuclei entering Step 6 passed the reviewed joint QC and scDblFinder
+decisions in Step 2. This is not a second round of filtering.
+
+The purpose is to determine whether cluster 18's mixed proliferative and
+secretory program coincides with unusually high RNA/ATAC complexity or residual
+doublet evidence relative to clusters 4 and 7.
+
+```{r focused-crypt-qc-doublet-audit}
+focused_qc_metadata <- multiome[[]] |>
+  dplyr::mutate(
+    cluster = as.character(
+      .data[[CHOSEN_CLUSTER_COLUMN]]
+    )
+  ) |>
+  dplyr::filter(
+    cluster %in% crypt_cluster_ids
+  )
+
+qc_numeric_candidates <- c(
+  "nCount_RNA",
+  "nFeature_RNA",
+  "percent.mt",
+  "nCount_ATAC",
+  "nCount_ATAC_common",
+  "TSS.enrichment",
+  "nucleosome_signal",
+  "frip_cr",
+  "scDblFinder.score",
+  "RNA.weight",
+  "ATAC.weight"
+)
+
+qc_numeric_metrics <- intersect(
+  qc_numeric_candidates,
+  colnames(focused_qc_metadata)
+)
+
+qc_numeric_metrics <- qc_numeric_metrics[
+  vapply(
+    focused_qc_metadata[
+      qc_numeric_metrics
+    ],
+    is.numeric,
+    logical(1)
+  )
+]
+
+focused_qc_summary <- focused_qc_metadata |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    dplyr::across(
+      dplyr::all_of(
+        qc_numeric_metrics
+      ),
+      list(
+        q25 = ~ stats::quantile(
+          .x,
+          0.25,
+          na.rm = TRUE
+        ),
+        median = ~ stats::median(
+          .x,
+          na.rm = TRUE
+        ),
+        q75 = ~ stats::quantile(
+          .x,
+          0.75,
+          na.rm = TRUE
+        )
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+if (
+  "scDblFinder.class" %in%
+    colnames(focused_qc_metadata)
+) {
+  focused_doublet_summary <- focused_qc_metadata |>
+    dplyr::count(
+      cluster,
+      scDblFinder.class,
+      name = "nuclei"
+    ) |>
+    dplyr::group_by(
+      cluster
+    ) |>
+    dplyr::mutate(
+      percent_of_cluster =
+        100 * nuclei / sum(nuclei)
+    ) |>
+    dplyr::ungroup()
+} else {
+  focused_doublet_summary <- data.frame(
+    note =
+      "scDblFinder.class was absent from the Step 5 object."
+  )
+}
+
+readr::write_csv(
+  focused_qc_summary,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_cluster_QC_summary.csv"
+  )
+)
+
+readr::write_csv(
+  focused_doublet_summary,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_cluster_doublet_summary.csv"
+  )
+)
+
+focused_qc_summary
+focused_doublet_summary
+```
+
+```{r plot-focused-crypt-qc, fig.width=12, fig.height=9}
+focused_qc_long <- focused_qc_metadata |>
+  dplyr::select(
+    cluster,
+    dplyr::all_of(
+      qc_numeric_metrics
+    )
+  ) |>
+  tidyr::pivot_longer(
+    cols = -cluster,
+    names_to = "metric",
+    values_to = "value"
+  )
+
+p_focused_qc <- ggplot2::ggplot(
+  focused_qc_long,
+  ggplot2::aes(
+    x = cluster,
+    y = value,
+    fill = cluster
+  )
+) +
+  ggplot2::geom_violin(
+    scale = "width",
+    trim = TRUE
+  ) +
+  ggplot2::geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA
+  ) +
+  ggplot2::facet_wrap(
+    ~ metric,
+    scales = "free_y",
+    ncol = 3
+  ) +
+  ggplot2::labs(
+    title =
+      "QC and modality characteristics of clusters 4, 7, and 18",
+    x = "WNN cluster",
+    y = NULL
+  ) +
+  ggplot2::theme_classic(
+    base_size = 10
+  ) +
+  ggplot2::theme(
+    legend.position = "none"
+  )
+
+print(
+  p_focused_qc
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "09_focused_crypt_cluster_QC_audit.pdf"
+  ),
+  plot = p_focused_qc,
+  width = 12,
+  height = 9
+)
+```
+
+
+# 12. Multimodal review of focused crypt states
+
+RNA marker programs define the initial biological hypotheses, but the paired
+ATAC assay should contribute before final labels are assigned. The following
+plots compare the same nuclei across the saved RNA-only, ATAC-only, and WNN
+embeddings; map selected RNA markers onto the WNN geometry; score cell-cycle
+phase without regressing it out; display the strongest focused RNA
+discriminants; and inspect accessibility at selected ISC and secretory loci.
+
+These analyses remain descriptive. The two pooled libraries are not biological
+replicates, and neither nuclei nor peaks are treated as replicated treatment
+units.
+
+## Compare focused clusters across RNA, ATAC, and WNN embeddings
+
+Step 4 saved modality-specific UMAPs as `umap.rna` and `umap.atac`; Step 5
+saved the reviewed multimodal embedding as `wnn.umap`. Reusing those coordinates
+avoids recomputing neighborhoods or changing the reviewed cluster solution.
+
+```{r focused-crypt-multimodal-embeddings, fig.width=16, fig.height=5.5}
+required_review_reductions <- c(
+  "umap.rna",
+  "umap.atac",
+  "wnn.umap"
+)
+
+missing_review_reductions <- setdiff(
+  required_review_reductions,
+  names(multiome@reductions)
+)
+
+if (length(missing_review_reductions) > 0L) {
+  stop(
+    "The finalized Step 5 object is missing review reduction(s): ",
+    paste(missing_review_reductions, collapse = ", "),
+    ". Revisit the Step 4 checkpoint rather than silently recomputing them here.",
+    call. = FALSE
+  )
+}
+
+crypt_cells_by_cluster <- lapply(
+  CRYPT_REVIEW_CLUSTERS,
+  function(cluster_id) {
+    WhichCells(
+      multiome,
+      idents = cluster_id
+    )
+  }
+)
+
+names(crypt_cells_by_cluster) <- paste(
+  "Cluster",
+  CRYPT_REVIEW_CLUSTERS
+)
+
+plot_focused_reduction <- function(
+  reduction_name,
+  plot_title
+) {
+  DimPlot(
+    multiome,
+    reduction = reduction_name,
+    cells.highlight = crypt_cells_by_cluster,
+    cols.highlight = unname(
+      CRYPT_CLUSTER_COLORS[
+        CRYPT_REVIEW_CLUSTERS
+      ]
+    ),
+    sizes.highlight = 0.55,
+    pt.size = 0.12,
+    raster = TRUE,
+    shuffle = FALSE,
+    na.value = "grey88"
+  ) +
+    ggplot2::ggtitle(
+      plot_title
+    ) +
+    Seurat::NoAxes() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        hjust = 0.5
+      )
+    )
+}
+
+p_crypt_rna_umap <- plot_focused_reduction(
+  "umap.rna",
+  "RNA-only UMAP"
+)
+
+p_crypt_atac_umap <- plot_focused_reduction(
+  "umap.atac",
+  "ATAC-only UMAP"
+)
+
+p_crypt_wnn_umap <- plot_focused_reduction(
+  "wnn.umap",
+  "WNN UMAP"
+)
+
+p_crypt_multimodal <- patchwork::wrap_plots(
+  p_crypt_rna_umap,
+  p_crypt_atac_umap,
+  p_crypt_wnn_umap,
+  ncol = 3,
+  guides = "collect"
+) +
+  patchwork::plot_annotation(
+    title = "Clusters 4, 7, and 18 across modality-specific and joint embeddings",
+    subtitle = "All other nuclei are shown in grey; coordinates are inherited from Steps 4 and 5"
+  ) &
+  ggplot2::theme(
+    legend.position = "bottom"
+  )
+
+print(
+  p_crypt_multimodal
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "10_focused_crypt_RNA_ATAC_WNN_embeddings.pdf"
+  ),
+  plot = p_crypt_multimodal,
+  width = 16,
+  height = 5.5
+)
+
+focused_embedding_data <- dplyr::bind_rows(
+  lapply(
+    required_review_reductions,
+    function(reduction_name) {
+      embedding <- Embeddings(
+        multiome,
+        reduction = reduction_name
+      )[
+        crypt_review_cells,
+        1:2,
+        drop = FALSE
+      ]
+
+      data.frame(
+        nucleus = rownames(embedding),
+        reduction = reduction_name,
+        dimension_1 = embedding[
+          ,
+          1
+        ],
+        dimension_2 = embedding[
+          ,
+          2
+        ],
+        cluster = as.character(
+          multiome[[]][
+            rownames(embedding),
+            CHOSEN_CLUSTER_COLUMN
+          ]
+        ),
+        sample_id = as.character(
+          multiome[[]][
+            rownames(embedding),
+            "sample_id"
+          ]
+        ),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+)
+
+readr::write_csv(
+  focused_embedding_data,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_multimodal_embedding_coordinates.csv"
+  )
+)
+```
+
+## Map focused crypt markers onto the WNN embedding
+
+The WNN feature maps ask whether the marker signals occupy coherent portions of
+the multimodal geometry. Each gene uses its own color scale so that sparse but
+spatially coherent markers are not hidden by highly expressed genes.
+
+```{r focused-crypt-wnn-featureplots, fig.width=14, fig.height=8}
+crypt_featureplot_genes <- c(
+  "Lgr5",
+  "Smoc2",
+  "Mki67",
+  "Top2a",
+  "Atoh1",
+  "Muc2",
+  "Reg4",
+  "Kit"
+)
+
+missing_featureplot_genes <- setdiff(
+  crypt_featureplot_genes,
+  rownames(multiome[["RNA"]])
+)
+
+if (length(missing_featureplot_genes) > 0L) {
+  stop(
+    "WNN FeaturePlot gene(s) are absent from the RNA feature set: ",
+    paste(missing_featureplot_genes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+DefaultAssay(multiome) <- "RNA"
+
+p_crypt_features_wnn <- FeaturePlot(
+  multiome,
+  features = crypt_featureplot_genes,
+  reduction = "wnn.umap",
+  slot = "data",
+  order = TRUE,
+  min.cutoff = "q05",
+  max.cutoff = "q95",
+  keep.scale = "feature",
+  cols = c(
+    "grey94",
+    "#2C7FB8",
+    "#D7301F"
+  ),
+  pt.size = 0.18,
+  raster = FALSE,
+  ncol = 4
+) +
+  patchwork::plot_annotation(
+    title = "Focused crypt-state RNA markers on the WNN embedding",
+    subtitle = paste(
+      "Feature-specific scales;",
+      "spatial pattern is emphasized over cross-gene magnitude"
+    )
+  )
+
+print(
+  p_crypt_features_wnn
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "11_focused_crypt_markers_on_WNN_UMAP.pdf"
+  ),
+  plot = p_crypt_features_wnn,
+  width = 14,
+  height = 8
+)
+
+rna_data <- SeuratObject::LayerData(
+  multiome,
+  assay = "RNA",
+  layer = "data"
+)
+
+focused_wnn_embedding <- Embeddings(
+  multiome,
+  reduction = "wnn.umap"
+)[
+  crypt_review_cells,
+  1:2,
+  drop = FALSE
+]
+
+focused_featureplot_data <- data.frame(
+  nucleus = crypt_review_cells,
+  WNN_1 = focused_wnn_embedding[
+    crypt_review_cells,
+    1
+  ],
+  WNN_2 = focused_wnn_embedding[
+    crypt_review_cells,
+    2
+  ],
+  cluster = as.character(
+    multiome[[]][
+      crypt_review_cells,
+      CHOSEN_CLUSTER_COLUMN
+    ]
+  ),
+  sample_id = as.character(
+    multiome[[]][
+      crypt_review_cells,
+      "sample_id"
+    ]
+  ),
+  t(
+    as.matrix(
+      rna_data[
+        crypt_featureplot_genes,
+        crypt_review_cells,
+        drop = FALSE
+      ]
+    )
+  ),
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  focused_featureplot_data,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_WNN_FeaturePlot_data.csv"
+  )
+)
+```
+
+## Score cell-cycle phase without regressing it out
+
+Cell-cycle scoring is used here to describe whether proliferative nuclei are
+more S-like or G2M-like. The scores are not regressed from the data because
+proliferation is a biological state that helps distinguish these crypt
+populations. A phase assignment for a non-proliferative nucleus should not be
+interpreted as proof that the nucleus was actively cycling.
+
+```{r focused-crypt-cell-cycle-scoring, fig.width=12, fig.height=9}
+DefaultAssay(multiome) <- "RNA"
+
+mouse_s_features <- unique(
+  unname(
+    Seurat::CaseMatch(
+      search = cc.genes.updated.2019$s.genes,
+      match = rownames(multiome[["RNA"]])
+    )
+  )
+)
+
+mouse_g2m_features <- unique(
+  unname(
+    Seurat::CaseMatch(
+      search = cc.genes.updated.2019$g2m.genes,
+      match = rownames(multiome[["RNA"]])
+    )
+  )
+)
+
+if (
+  length(mouse_s_features) < 10L ||
+    length(mouse_g2m_features) < 10L
+) {
+  stop(
+    "Too few cell-cycle genes matched the mouse RNA feature symbols: ",
+    length(mouse_s_features),
+    " S-phase and ",
+    length(mouse_g2m_features),
+    " G2M-phase genes.",
+    call. = FALSE
+  )
+}
+
+cell_cycle_feature_audit <- dplyr::bind_rows(
+  data.frame(
+    phase_program = "S",
+    gene = mouse_s_features,
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    phase_program = "G2M",
+    gene = mouse_g2m_features,
+    stringsAsFactors = FALSE
+  )
+)
+
+readr::write_csv(
+  cell_cycle_feature_audit,
+  file.path(
+    STEP6_DIR,
+    "cell_cycle_features_matched_to_mouse_RNA.csv"
+  )
+)
+
+cycle_scored <- Seurat::CellCycleScoring(
+  object = multiome,
+  s.features = mouse_s_features,
+  g2m.features = mouse_g2m_features,
+  set.ident = FALSE,
+  assay = "RNA"
+)
+
+multiome <- AddMetaData(
+  object = multiome,
+  metadata = cycle_scored[[]][
+    ,
+    c(
+      "S.Score",
+      "G2M.Score",
+      "Phase"
+    ),
+    drop = FALSE
+  ]
+)
+
+rm(cycle_scored)
+invisible(gc())
+
+focused_cycle_data <- data.frame(
+  nucleus = crypt_review_cells,
+  cluster = factor(
+    as.character(
+      multiome[[]][
+        crypt_review_cells,
+        CHOSEN_CLUSTER_COLUMN
+      ]
+    ),
+    levels = CRYPT_REVIEW_CLUSTERS
+  ),
+  sample_id = as.character(
+    multiome[[]][
+      crypt_review_cells,
+      "sample_id"
+    ]
+  ),
+  S.Score = multiome[[]][
+    crypt_review_cells,
+    "S.Score"
+  ],
+  G2M.Score = multiome[[]][
+    crypt_review_cells,
+    "G2M.Score"
+  ],
+  Phase = factor(
+    multiome[[]][
+      crypt_review_cells,
+      "Phase"
+    ],
+    levels = c(
+      "G1",
+      "S",
+      "G2M"
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+proliferative_index <- match(
+  focused_cycle_data$nucleus,
+  per_cell_crypt_program_detection$nucleus
+)
+
+if (anyNA(proliferative_index)) {
+  stop(
+    "Cell-cycle nuclei could not all be matched to the refined co-detection table.",
+    call. = FALSE
+  )
+}
+
+focused_cycle_data$Proliferative <-
+  per_cell_crypt_program_detection$Proliferative[
+    proliferative_index
+  ]
+
+focused_cycle_scope <- dplyr::bind_rows(
+  focused_cycle_data |>
+    dplyr::mutate(
+      review_scope = "All focused crypt nuclei"
+    ),
+  focused_cycle_data |>
+    dplyr::filter(
+      Proliferative
+    ) |>
+    dplyr::mutate(
+      review_scope = "Mki67 or Top2a detected"
+    )
+)
+
+focused_cycle_phase_summary <-
+  focused_cycle_scope |>
+  dplyr::count(
+    review_scope,
+    cluster,
+    Phase,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(
+    review_scope,
+    cluster
+  ) |>
+  dplyr::mutate(
+    total_nuclei = sum(nuclei),
+    percent_of_scope = 100 * nuclei / total_nuclei
+  ) |>
+  dplyr::ungroup()
+
+focused_cycle_phase_summary
+
+readr::write_csv(
+  focused_cycle_data,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_cell_cycle_scores.csv"
+  )
+)
+
+readr::write_csv(
+  focused_cycle_phase_summary,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_cell_cycle_phase_summary.csv"
+  )
+)
+
+cell_cycle_colors <- c(
+  "G1" = "grey70",
+  "S" = "#56B4E9",
+  "G2M" = "#D55E00"
+)
+
+p_cycle_scores <- ggplot2::ggplot(
+  focused_cycle_data,
+  ggplot2::aes(
+    x = S.Score,
+    y = G2M.Score
+  )
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    color = "grey85",
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey85",
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_point(
+    color = "grey88",
+    size = 0.65,
+    alpha = 0.45
+  ) +
+  ggplot2::geom_point(
+    data = dplyr::filter(
+      focused_cycle_data,
+      Proliferative
+    ),
+    ggplot2::aes(
+      color = Phase
+    ),
+    size = 0.9,
+    alpha = 0.75
+  ) +
+  ggplot2::facet_wrap(
+    ~cluster,
+    nrow = 1
+  ) +
+  ggplot2::scale_color_manual(
+    values = cell_cycle_colors,
+    drop = FALSE
+  ) +
+  ggplot2::labs(
+    title = "Cell-cycle scores",
+    subtitle = "Colored nuclei have Mki67 or Top2a counts; grey nuclei provide cluster context",
+    x = "S-phase score",
+    y = "G2M-phase score",
+    color = "Assigned phase"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 11
+  )
+
+p_cycle_phase <- ggplot2::ggplot(
+  focused_cycle_phase_summary,
+  ggplot2::aes(
+    x = cluster,
+    y = percent_of_scope,
+    fill = Phase
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.72
+  ) +
+  ggplot2::facet_wrap(
+    ~review_scope,
+    nrow = 1
+  ) +
+  ggplot2::scale_fill_manual(
+    values = cell_cycle_colors,
+    drop = FALSE
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(
+      0,
+      100
+    ),
+    expand = ggplot2::expansion(
+      mult = c(
+        0,
+        0.02
+      )
+    )
+  ) +
+  ggplot2::labs(
+    title = "Phase composition",
+    x = "WNN cluster",
+    y = "Nuclei in review scope (%)",
+    fill = "Assigned phase"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 11
+  )
+
+p_cell_cycle_audit <- patchwork::wrap_plots(
+  p_cycle_scores,
+  p_cycle_phase,
+  ncol = 1,
+  heights = c(
+    1.15,
+    1
+  ),
+  guides = "collect"
+) +
+  patchwork::plot_annotation(
+    title = "Cell-cycle phase audit of clusters 4, 7, and 18",
+    subtitle = "Scores are descriptive and are not regressed from the annotation object"
+  ) &
+  ggplot2::theme(
+    legend.position = "bottom"
+  )
+
+print(
+  p_cell_cycle_audit
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "12_focused_crypt_cell_cycle_phase_audit.pdf"
+  ),
+  plot = p_cell_cycle_audit,
+  width = 12,
+  height = 9
+)
+```
+
+## Display the strongest focused RNA discriminants
+
+The heatmap uses a new one-versus-rest marker calculation restricted to
+clusters 4, 7, and 18. Marker discovery uses every focused nucleus; only the
+display is downsampled. The cell selection is deterministic and exported so
+the visual can be reproduced exactly.
+
+This is an annotation visualization, not a treatment differential-expression
+analysis.
+
+```{r focused-crypt-discriminant-heatmap, fig.width=11, fig.height=8, cache=FALSE}
+focused_crypt_object <- subset(
+  multiome,
+  idents = CRYPT_REVIEW_CLUSTERS
+)
+
+DefaultAssay(focused_crypt_object) <- "RNA"
+
+Idents(focused_crypt_object) <- factor(
+  as.character(
+    focused_crypt_object[[]][[
+      CHOSEN_CLUSTER_COLUMN
+    ]]
+  ),
+  levels = CRYPT_REVIEW_CLUSTERS
+)
+
+future::plan(
+  future::sequential
+)
+
+set.seed(20260820)
+
+focused_crypt_markers <- FindAllMarkers(
+  object = focused_crypt_object,
+  assay = "RNA",
+  only.pos = TRUE,
+  min.pct = 0.10,
+  logfc.threshold = 0.50,
+  test.use = "wilcox",
+  return.thresh = 1,
+  verbose = TRUE
+)
+
+configure_parallel_plan()
+
+if (nrow(focused_crypt_markers) == 0L) {
+  stop(
+    "Focused FindAllMarkers returned no RNA markers.",
+    call. = FALSE
+  )
+}
+
+focused_fc_column <- intersect(
+  c(
+    "avg_log2FC",
+    "avg_logFC"
+  ),
+  colnames(focused_crypt_markers)
+)
+
+if (length(focused_fc_column) != 1L) {
+  stop(
+    "Could not identify exactly one average log-fold-change column in focused markers.",
+    call. = FALSE
+  )
+}
+
+focused_crypt_markers$effect_size <-
+  focused_crypt_markers[[
+    focused_fc_column
+  ]]
+
+focused_crypt_markers$pct_delta <- with(
+  focused_crypt_markers,
+  pct.1 - pct.2
+)
+
+presentation_exclusion_pattern <- paste0(
+  "^(mt-|Rpl|Rps|Gm[0-9]+|Mir[0-9]+|Snor)",
+  "|Rik$"
+)
+
+focused_heatmap_gene_table <-
+  focused_crypt_markers |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    effect_size >= 0.50,
+    pct_delta >= 0.10,
+    !grepl(
+      presentation_exclusion_pattern,
+      gene
+    ),
+    !gene %in% c(
+      "Malat1",
+      "Xist",
+      "Tsix"
+    )
+  ) |>
+  dplyr::group_by(
+    cluster
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(pct_delta),
+    dplyr::desc(effect_size),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(
+    n = 8
+  ) |>
+  dplyr::ungroup()
+
+selected_genes_per_cluster <- table(
+  focused_heatmap_gene_table$cluster
+)
+
+if (
+  length(selected_genes_per_cluster) != length(CRYPT_REVIEW_CLUSTERS) ||
+    any(selected_genes_per_cluster < 4L)
+) {
+  stop(
+    "Fewer than four presentation-quality discriminants were selected for one or more focused clusters.",
+    call. = FALSE
+  )
+}
+
+heatmap_genes <- unique(
+  focused_heatmap_gene_table$gene
+)
+
+readr::write_csv(
+  focused_crypt_markers,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_focused_crypt_clusters_4_7_18_one_vs_rest.csv"
+  )
+)
+
+readr::write_csv(
+  focused_heatmap_gene_table,
+  file.path(
+    STEP6_MARKER_DIR,
+    "RNA_focused_crypt_heatmap_genes.csv"
+  )
+)
+
+set.seed(20260820)
+
+heatmap_cells <- unlist(
+  lapply(
+    CRYPT_REVIEW_CLUSTERS,
+    function(cluster_id) {
+      cluster_cells <- WhichCells(
+        focused_crypt_object,
+        idents = cluster_id
+      )
+
+      sample(
+        cluster_cells,
+        size = min(
+          100L,
+          length(cluster_cells)
+        ),
+        replace = FALSE
+      )
+    }
+  ),
+  use.names = FALSE
+)
+
+heatmap_cell_table <- data.frame(
+  display_order = seq_along(heatmap_cells),
+  nucleus = heatmap_cells,
+  cluster = as.character(
+    Idents(focused_crypt_object)[
+      heatmap_cells
+    ]
+  ),
+  sample_id = as.character(
+    focused_crypt_object[[]][
+      heatmap_cells,
+      "sample_id"
+    ]
+  ),
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  heatmap_cell_table,
+  file.path(
+    STEP6_DIR,
+    "focused_crypt_heatmap_displayed_nuclei.csv"
+  )
+)
+
+focused_crypt_object <- ScaleData(
+  object = focused_crypt_object,
+  assay = "RNA",
+  features = heatmap_genes,
+  verbose = FALSE
+)
+
+p_focused_crypt_heatmap <- suppressMessages(
+  DoHeatmap(
+    object = focused_crypt_object,
+    features = heatmap_genes,
+    cells = heatmap_cells,
+    assay = "RNA",
+    slot = "scale.data",
+    group.by = CHOSEN_CLUSTER_COLUMN,
+    group.colors = unname(
+      CRYPT_CLUSTER_COLORS[
+        CRYPT_REVIEW_CLUSTERS
+      ]
+    ),
+    disp.min = -2,
+    disp.max = 2,
+    raster = FALSE,
+    draw.lines = TRUE,
+    angle = 0,
+    hjust = 0.5,
+    size = 4.5
+  ) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "#2166AC",
+        "#F7F7F7",
+        "#B2182B"
+      ),
+      limits = c(
+        -2,
+        2
+      ),
+      oob = scales::squish
+    ) +
+    ggplot2::labs(
+      title = "Strongest focused RNA discriminants",
+      subtitle = paste(
+        "Top eight genes per cluster; scaled across all focused nuclei;",
+        "up to 100 nuclei per cluster displayed"
+      )
+    ) +
+    ggplot2::theme(
+      axis.text.y = ggplot2::element_text(
+        face = "italic",
+        size = 8
+      )
+    )
+)
+
+print(
+  p_focused_crypt_heatmap
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP6_PLOT_DIR,
+    "13_focused_crypt_discriminant_heatmap.pdf"
+  ),
+  plot = p_focused_crypt_heatmap,
+  width = 11,
+  height = 8
+)
+```
+
+## Add targeted ATAC support at ISC and secretory loci
+
+Coverage tracks aggregate Tn5 insertions within each cluster-library group.
+They are used to ask whether accessibility at selected loci is compatible with
+the RNA-supported state assignments. Accessibility is not treated as a proxy
+for expression, and a locus track alone is not sufficient for a final label.
+
+The library split is retained because the two pooled libraries are descriptive
+annotation-support strata, not biological replicates. Cluster 18 has only 39
+HFD nuclei, so sparse differences in that track should be interpreted
+cautiously.
+
+```{r targeted-crypt-atac-coverage, fig.width=13, fig.height=9, cache=FALSE}
+targeted_crypt_loci <- c(
+  "Lgr5",
+  "Ascl2",
+  "Atoh1",
+  "Muc2",
+  "Reg4",
+  "Kit"
+)
+
+if (
+  length(
+    Signac::Fragments(
+      multiome[["ATAC"]]
+    )
+  ) == 0L
+) {
+  stop(
+    "The ATAC assay has no Fragment objects for CoveragePlot().",
+    call. = FALSE
+  )
+}
+
+atac_annotation <- Signac::Annotation(
+  multiome[["ATAC"]]
+)
+
+if (length(atac_annotation) == 0L) {
+  stop(
+    "The ATAC assay has no gene annotation for gene-name coverage plots.",
+    call. = FALSE
+  )
+}
+
+annotation_columns <- colnames(
+  S4Vectors::mcols(
+    atac_annotation
+  )
+)
+
+if (!"gene_name" %in% annotation_columns) {
+  stop(
+    "The ATAC annotation does not contain a gene_name metadata column.",
+    call. = FALSE
+  )
+}
+
+missing_annotation_loci <- setdiff(
+  targeted_crypt_loci,
+  unique(
+    as.character(
+      S4Vectors::mcols(
+        atac_annotation
+      )$gene_name
+    )
+  )
+)
+
+if (length(missing_annotation_loci) > 0L) {
+  stop(
+    "Targeted locus/loci are absent from the ATAC gene annotation: ",
+    paste(missing_annotation_loci, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+coverage_object <- subset(
+  multiome,
+  idents = CRYPT_REVIEW_CLUSTERS
+)
+
+coverage_object$focused_crypt_cluster <- factor(
+  as.character(
+    coverage_object[[]][[
+      CHOSEN_CLUSTER_COLUMN
+    ]]
+  ),
+  levels = CRYPT_REVIEW_CLUSTERS
+)
+
+coverage_group_sizes <-
+  coverage_object[[]] |>
+  dplyr::mutate(
+    nucleus = rownames(coverage_object[[]]),
+    cluster = as.character(focused_crypt_cluster),
+    sample_id = as.character(sample_id)
+  ) |>
+  dplyr::count(
+    cluster,
+    sample_id,
+    name = "nuclei"
+  ) |>
+  dplyr::arrange(
+    factor(
+      cluster,
+      levels = CRYPT_REVIEW_CLUSTERS
+    ),
+    sample_id
+  ) |>
+  dplyr::mutate(
+    coverage_group = paste0(
+      "Cluster ",
+      cluster,
+      " | ",
+      sample_id,
+      " (n=",
+      nuclei,
+      ")"
+    )
+  )
+
+coverage_group_key <- paste(
+  as.character(
+    coverage_object$focused_crypt_cluster
+  ),
+  as.character(
+    coverage_object$sample_id
+  ),
+  sep = "__"
+)
+
+coverage_group_lookup <- stats::setNames(
+  coverage_group_sizes$coverage_group,
+  paste(
+    coverage_group_sizes$cluster,
+    coverage_group_sizes$sample_id,
+    sep = "__"
+  )
+)
+
+coverage_object$coverage_group <- factor(
+  unname(
+    coverage_group_lookup[
+      coverage_group_key
+    ]
+  ),
+  levels = coverage_group_sizes$coverage_group
+)
+
+if (anyNA(coverage_object$coverage_group)) {
+  stop(
+    "One or more nuclei could not be assigned to an ATAC coverage group.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  coverage_group_sizes,
+  file.path(
+    STEP6_DIR,
+    "targeted_crypt_ATAC_coverage_group_sizes.csv"
+  )
+)
+
+DefaultAssay(coverage_object) <- "ATAC"
+
+targeted_crypt_coverage_plots <- lapply(
+  targeted_crypt_loci,
+  function(locus) {
+    Signac::CoveragePlot(
+      object = coverage_object,
+      region = locus,
+      features = locus,
+      assay = "ATAC",
+      expression.assay = "RNA",
+      expression.slot = "data",
+      annotation = "gene",
+      peaks = TRUE,
+      links = FALSE,
+      tile = FALSE,
+      group.by = "coverage_group",
+      extend.upstream = 5000,
+      extend.downstream = 5000,
+      ymax = "q95"
+    ) +
+      patchwork::plot_annotation(
+        title = paste0(
+          locus,
+          " locus: ATAC coverage with RNA expression"
+        ),
+        subtitle = paste(
+          "Clusters 4, 7, and 18 split by pooled library;",
+          "coverage tracks are normalized by group depth and cell number"
+        )
+      )
+  }
+)
+
+names(targeted_crypt_coverage_plots) <- targeted_crypt_loci
+
+coverage_pdf_path <- file.path(
+  STEP6_PLOT_DIR,
+  "14_targeted_crypt_ATAC_coverage.pdf"
+)
+
+grDevices::pdf(
+  file = coverage_pdf_path,
+  width = 13,
+  height = 9,
+  onefile = TRUE
+)
+
+for (locus in targeted_crypt_loci) {
+  print(
+    targeted_crypt_coverage_plots[[
+      locus
+    ]]
+  )
+}
+
+grDevices::dev.off()
+
+for (locus in targeted_crypt_loci) {
+  print(
+    targeted_crypt_coverage_plots[[
+      locus
+    ]]
+  )
+}
+
+DefaultAssay(multiome) <- "RNA"
+```
+
+## Focused crypt-state interpretation checkpoint
+
+Before assigning final labels to clusters 4, 7, and 18, review whether:
+
+1. the clusters remain coherent or separable in RNA-only, ATAC-only, and WNN
+   embeddings;
+2. selected RNA markers occupy coherent portions of the WNN geometry;
+3. cluster 4 and cluster 18 differ in cell-cycle phase composition rather than
+   merely in overall proliferation prevalence;
+4. the downsampled heatmap separates each cluster with interpretable
+   discriminants;
+5. ISC-associated loci support clusters 4/7 and secretory-associated loci
+   support cluster 18 in both pooled-library strata;
+6. any conclusion remains descriptive rather than a CON-versus-HFD treatment
+   claim.
