@@ -564,9 +564,12 @@ populate_qc_decision_draft <- function(suggestions, decision_path = QC_DECISION_
   extra_samples <- setdiff(decisions$sample_id, suggestions$sample_id)
   if (length(missing_samples) > 0L || length(extra_samples) > 0L) {
     stop(
-      "Sample IDs differ between suggestions and config/qc_thresholds.csv. ",
-      "Missing in decision file: ", paste(missing_samples, collapse = ", "),
-      "; extra in decision file: ", paste(extra_samples, collapse = ", "),
+      "Sample IDs differ between suggestions and the active QC decision table: ",
+      decision_path,
+      ". Missing in decision file: ",
+      paste(missing_samples, collapse = ", "),
+      "; extra in decision file: ",
+      paste(extra_samples, collapse = ", "),
       call. = FALSE
     )
   }
@@ -601,8 +604,10 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   missing_columns <- setdiff(required, colnames(decisions))
   if (length(missing_columns) > 0L) {
     stop(
-      "config/qc_thresholds.csv is missing: ",
+      "QC decision table is missing required columns: ",
       paste(missing_columns, collapse = ", "),
+      ". File: ",
+      QC_DECISION_PATH,
       call. = FALSE
     )
   }
@@ -611,7 +616,8 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   extra_samples <- setdiff(decisions$sample_id, sample_sheet$sample_id)
   if (length(missing_samples) > 0L || length(extra_samples) > 0L) {
     stop(
-      "Sample IDs in the QC decision table do not match config/samples.csv.",
+      "Sample IDs in the QC decision table do not match the active sample sheet: ",
+      SAMPLE_SHEET_PATH,
       call. = FALSE
     )
   }

@@ -431,7 +431,7 @@ atac_bin_pass_summary
 ```
 # 4. Record the decision
 
-Open `config/qc_thresholds.csv` in RStudio. Step 1 populated blank numeric cells with starting suggestions. For every sample:
+Open the active dataset-specific QC decision table in RStudio. Its path is stored in `QC_DECISION_PATH`. Step 1 populated blank numeric cells with starting suggestions. For every sample:
 
 1. compare the threshold to its full distribution;
 2. change values when biology or a clear quality mode supports the change;

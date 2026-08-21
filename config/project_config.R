@@ -1,21 +1,65 @@
 # Project-specific settings for the first Mana Lab PPAR iKO Multiome dataset.
 #
-# Keep data paths here rather than scattering them across notebooks. A future
-# universal branch can replace these explicit values with command-line or YAML
-# configuration without changing the analysis logic.
+# Dataset versions are kept explicit so that the original sequencing-depth
+# analysis remains reproducible while later sequencing can be analyzed with
+# the same pipeline.
 
 set.seed(20260727)
 
 PROJECT_DIR <- "/scratch/dsaiz/Yesenia_scData2026"
+
+# -------------------------------------------------------------------------
+# Dataset version
+# -------------------------------------------------------------------------
+
+# v1_initial_depth:
+#   Original Cell Ranger ARC analysis before additional ATAC sequencing.
+#
+# v2_resequenced:
+#   Cell Ranger ARC rerun using deeper ATAC sequencing and the original
+#   GEX/GEM sequencing. This is the current authoritative dataset.
+
+DATASET_VERSION <- Sys.getenv(
+  "MULTIOME_DATASET_VERSION",
+  unset = "v2_resequenced"
+)
+
+VALID_DATASET_VERSIONS <- c(
+  "v1_initial_depth",
+  "v2_resequenced"
+)
+
+if (!DATASET_VERSION %in% VALID_DATASET_VERSIONS) {
+  stop(
+    "Unknown DATASET_VERSION: ", DATASET_VERSION,
+    "\nValid versions: ",
+    paste(VALID_DATASET_VERSIONS, collapse = ", ")
+  )
+}
+
+DATASET_CONFIG_DIR <- file.path(
+  REPO_ROOT,
+  "config",
+  "datasets",
+  DATASET_VERSION
+)
+
+SAMPLE_SHEET_PATH <- file.path(
+  DATASET_CONFIG_DIR,
+  "samples.csv"
+)
+
+QC_DECISION_PATH <- file.path(
+  DATASET_CONFIG_DIR,
+  "qc_thresholds.csv"
+)
+
 OUTPUT_DIR <- file.path(
   PROJECT_DIR,
   "results",
+  DATASET_VERSION,
   "Ppar_iKO_multiome_stepwise"
 )
-
-SAMPLE_SHEET_PATH <- file.path(REPO_ROOT, "config", "samples.csv")
-QC_DECISION_PATH <- file.path(REPO_ROOT, "config", "qc_thresholds.csv")
-
 # Expected R version on the ASU SOL Open OnDemand RStudio Server.
 EXPECTED_R_VERSION <- "4.4.2"
 
@@ -70,4 +114,3 @@ RESULT_DIRS <- c(
   "07_composition",
   "07_pseudobulk"
 )
-
