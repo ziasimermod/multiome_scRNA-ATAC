@@ -86,7 +86,7 @@ decisions <- suppressMessages(readr::read_csv(
 ))
 
 suggestions
-decisions
+decisions_preview
 ```
 # Load the proposed QC thresholds for diagnostic preview plots.
 #
@@ -108,6 +108,11 @@ decisions_preview <- suppressMessages(
   )
 )
 
+suggestions
+decisions_preview
+```
+
+```{r}
 required_preview_columns <- c(
   "sample_id",
   "nCount_RNA_min",
@@ -301,7 +306,6 @@ lower_tail_summary <- lapply(sample_sheet$sample_id, function(sample_id) {
       median_features = median(nFeature_RNA, na.rm = TRUE),
       median_mt = median(percent.mt, na.rm = TRUE),
       singlet_pct = 100 * mean(scDblFinder.class == "singlet", na.rm = TRUE),
-      singlet_pct = 100 * mean(scDblFinder.class == "singlet"),
       .groups = "drop"
     )
 }) |>
