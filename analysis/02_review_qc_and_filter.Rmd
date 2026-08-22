@@ -80,36 +80,18 @@ suggestions <- suppressMessages(readr::read_csv(
   file.path(OUTPUT_DIR, "01_qc", "qc_thresholds_suggested.csv"),
   show_col_types = FALSE
 ))
-decisions <- suppressMessages(readr::read_csv(
+decisions_preview <- suppressMessages(readr::read_csv(
   QC_DECISION_PATH,
   show_col_types = FALSE
 ))
 
 suggestions
 decisions_preview
-```
+
 # Load the proposed QC thresholds for diagnostic preview plots.
 #
 # This deliberately reads the table without enforcing approval yet.
 # The approval check occurs later, immediately before final filtering.
-
-```{r}
-if (!file.exists(QC_DECISION_PATH)) {
-  stop(
-    "QC decision table was not found:\n",
-    QC_DECISION_PATH
-  )
-}
-
-decisions_preview <- suppressMessages(
-  readr::read_csv(
-    QC_DECISION_PATH,
-    show_col_types = FALSE
-  )
-)
-
-suggestions
-decisions_preview
 ```
 
 ```{r}
@@ -424,7 +406,9 @@ rna_bin_pass_summary <- lapply(
   dplyr::bind_rows()
 
 rna_bin_pass_summary
+```
 
+```{r}
 # Percentage passing independent QC metrics within ATAC-count bins
 
 atac_bin_pass_summary <- lapply(
