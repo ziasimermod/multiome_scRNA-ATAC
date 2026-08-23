@@ -296,7 +296,7 @@ common_peak_summary <- data.frame(
 common_peak_summary
 ```
 
-For the current Ppar-CON-1 and Ppar-HFD-1 libraries, the validated common feature space contains **130,476 peaks**. The code above remains data-driven so future datasets are not forced to reproduce that exact number.
+For the current resequenced Ppar-CON-1 and Ppar-HFD-1 libraries, the validated common feature space contains **172,869 peaks**. The code above remains data-driven so future datasets are not forced to reproduce that exact number.
 
 ## Validate the common peak chromosomes
 
@@ -594,7 +594,7 @@ requantification_summary <-
 requantification_summary
 ```
 
-For the validated Ppar dataset, the successful requantification produced approximately 11.6 million CON fragment counts and 9.1 million HFD fragment counts across the 130,476 common features. These values are recorded here as a known successful run, not as hard-coded acceptance thresholds for future data.
+For the current resequenced Ppar dataset, successful requantification produced approximately 27.8 million CON fragment counts and 14.4 million HFD fragment counts across 172,869 common features. Of those features, 172,791 were detected in CON and 172,412 were detected in HFD. These values are recorded here as a known successful run, not as hard-coded acceptance thresholds for future datasets.
 
 # 5. Verify identical ATAC feature spaces
 
