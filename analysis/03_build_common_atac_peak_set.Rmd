@@ -9,11 +9,9 @@ output:
 
 # The goal of this notebook
 
-The CON and HFD libraries were processed independently by Cell Ranger ARC,
-so their original ATAC peak coordinates are not guaranteed to be identical.
+The CON and HFD libraries were processed independently by Cell Ranger ARC, so their original ATAC peak coordinates are not guaranteed to be identical.
 
-Before joint ATAC analysis, both samples must therefore be represented using
-the same genomic features.
+Before joint ATAC analysis, both samples must therefore be represented using the same genomic features.
 
 This notebook will:
 
@@ -21,16 +19,13 @@ This notebook will:
 2. combine overlapping peaks into one common GRCm39 peak set;
 3. quantify fragments from each sample over exactly those common regions;
 4. replace the original sample-specific ATAC assay with the common ATAC assay;
-5. preserve the RNA assay, cell metadata, gene annotation, fragment links, and
-   original ATAC QC values;
+5. preserve the RNA assay, cell metadata, gene annotation, fragment links, and original ATAC QC values;
 6. verify that every sample contains the same ATAC features in the same order;
 7. save new common-feature post-QC objects for downstream dimensional reduction.
 
 The common peak set defines the ATAC feature space used by all later analyses.
 
-A practical SOL allocation for this step is **4–8 CPU cores, 96 GiB memory,
-12 hours, R 4.4.2, no GPU**. The helper configuration respects the CPU count
-available in the active SLURM/RStudio session.
+A practical SOL allocation for this step is **4–8 CPU cores, 96 GiB memory, 12 hours, R 4.4.2, no GPU**. The helper configuration respects the CPU count available in the active SLURM/RStudio session.
 
 # 1. Setup
 
@@ -73,8 +68,7 @@ cat("Configured future workers:", future::nbrOfWorkers(), "\n")
 
 Step 3 must never fall back to the unfiltered objects. The Step 2 completion
 marker and both post-QC objects are therefore required. The Cell Ranger peak
-and fragment files must also still be available because Step 3 returns to the
-fragment files for requantification.
+and fragment files must also still be available because Step 3 returns to the fragment files for requantification.
 
 ```{r confirm-step-two}
 step_two_marker <- file.path(
@@ -121,27 +115,18 @@ input_object_summary
 
 # 3. Build one common GRCm39 ATAC peak set
 
-Each Cell Ranger ARC library has its own independently called peak set. The
-coordinates therefore do not necessarily match between samples.
+Each Cell Ranger ARC library has its own independently called peak set. The coordinates therefore do not necessarily match between samples.
 
-We read each `atac_peaks.bed`, convert the first three columns into `GRanges`,
-combine all samples, and merge overlapping or directly adjacent intervals with
-`GenomicRanges::reduce()`.
+We read each `atac_peaks.bed`, convert the first three columns into `GRanges`, combine all samples, and merge overlapping or directly adjacent intervals with `GenomicRanges::reduce()`.
 
 ## Coordinate convention used in this pipeline
 
-Cell Ranger writes `atac_peaks.bed` as a BED-style file. However, the ATAC
-features already stored in the imported Signac `ChromatinAssay` use the same
-numeric start coordinates that appear in the Cell Ranger peak file. During
-pipeline validation, adding an additional +1 conversion shifted every peak
-relative to the existing assay.
+Cell Ranger writes `atac_peaks.bed` as a BED-style file. However, the ATAC features already stored in the imported Signac `ChromatinAssay` use the same numeric start coordinates that appear in the Cell Ranger peak file. During pipeline validation, adding an additional +1 conversion shifted every peak relative to the existing assay.
 
-Therefore, this notebook deliberately **preserves the numeric peak coordinates
-exactly as represented by Cell Ranger/Signac** when creating the common feature
+Therefore, this notebook deliberately **preserves the numeric peak coordinates exactly as represented by Cell Ranger/Signac** when creating the common feature
 space. No additional start-coordinate offset is applied here.
 
-This keeps the common peaks consistent with the original ATAC assay features
-that were used during QC.
+This keeps the common peaks consistent with the original ATAC assay features that were used during QC.
 
 ```{r build-common-peaks}
 COMMON_PEAK_DIR <- file.path(
@@ -252,13 +237,9 @@ input_peak_counts
 
 ## Merge overlapping peaks
 
-`reduce()` combines overlapping or directly adjacent intervals into one
-non-overlapping region. This means every sample can subsequently be quantified
-over exactly the same genomic feature definitions.
+`reduce()` combines overlapping or directly adjacent intervals into one non-overlapping region. This means every sample can subsequently be quantified over exactly the same genomic feature definitions.
 
-Very short or extremely broad merged intervals are removed using broad
-technical bounds. These bounds are intended to exclude pathological regions,
-not to select peaks based on biological condition.
+Very short or extremely broad merged intervals are removed using broad technical bounds. These bounds are intended to exclude pathological regions, not to select peaks based on biological condition.
 
 ```{r reduce-common-peaks}
 all_input_peaks <- do.call(
@@ -315,14 +296,11 @@ common_peak_summary <- data.frame(
 common_peak_summary
 ```
 
-For the current Ppar-CON-1 and Ppar-HFD-1 libraries, the validated common
-feature space contains **130,476 peaks**. The code above remains data-driven so
-future datasets are not forced to reproduce that exact number.
+For the current Ppar-CON-1 and Ppar-HFD-1 libraries, the validated common feature space contains **130,476 peaks**. The code above remains data-driven so future datasets are not forced to reproduce that exact number.
 
 ## Validate the common peak chromosomes
 
-Every chromosome represented by the common peak set must also be represented
-in the saved GRCm39 annotation.
+Every chromosome represented by the common peak set must also be represented in the saved GRCm39 annotation.
 
 ```{r validate-common-peaks}
 peak_chromosomes <- GenomeInfoDb::seqlevelsInUse(
@@ -355,6 +333,7 @@ if (length(unexpected_peak_chromosomes) > 0L) {
 ## Save the canonical common peak set
 
 The RDS file is the canonical peak definition used by downstream R notebooks.
+
 The TSV file preserves the same numeric coordinates used by the Signac/GRanges feature space for inspection and auditing. It is intentionally not exported as a standard BED file because BED uses 0-based start coordinates.
 
 ```{r save-common-peaks}
@@ -409,113 +388,67 @@ readr::write_csv(
 
 # 4. Requantify post-QC cells over the common peaks
 
-The original ATAC count matrices are based on sample-specific peak sets. They
-cannot simply be row-bound or merged because their genomic features differ.
+The original ATAC count matrices are based on sample-specific peak sets. They cannot simply be row-bound or merged because their genomic features differ.
 
-For each post-QC object, `FeatureMatrix()` returns to the indexed fragment file
-and counts fragments overlapping every common peak for the retained cells.
+For each post-QC object, `FeatureMatrix()` returns to the indexed fragment file and counts fragments overlapping every common peak for the retained cells.
 
 ## Important: `keep_all_features = FALSE`
 
 This pipeline deliberately uses `keep_all_features = FALSE`.
 
-During validation with Signac 1.17.1 on SOL, setting
-`keep_all_features = TRUE` produced a severely undercounted matrix: only about
-2,000 of ~130,000 peaks carried signal and median per-cell counts fell to less
-than 1% of the original ATAC matrix. Repeating the test sequentially produced
-the same result, ruling out the `future` parallel backend as the cause.
+During validation with Signac 1.17.1 on SOL, setting `keep_all_features = TRUE` produced a severely undercounted matrix: only about 2,000 of ~130,000 peaks carried signal and median per-cell counts fell to less than 1% of the original ATAC matrix. Repeating the test sequentially produced the same result, ruling out the `future` parallel backend as the cause.
 
-With `keep_all_features = FALSE`, requantification recovered the expected
-fragment-scale signal. For a 100-cell validation subset, the median
-requantified count was approximately 53% of the original Cell Ranger ATAC
-count. That systematic difference is expected because the fragment-derived
-matrix and the original Cell Ranger peak matrix do not use exactly the same
-counting unit.
+With `keep_all_features = FALSE`, requantification recovered the expected fragment-scale signal. For a 100-cell validation subset, the median requantified count was approximately 53% of the original Cell Ranger ATAC count. That systematic difference is expected because the fragment-derived matrix and the original Cell Ranger peak matrix do not use exactly the same counting unit.
 
-To keep this behavior safe and reproducible, the code below uses
-`keep_all_features = FALSE` **and then requires `FeatureMatrix()` to return
-exactly the full common feature set**. If a future dataset genuinely drops a
-feature, the notebook stops rather than silently continuing with unequal ATAC
-matrices.
+To keep this behavior safe and reproducible, the code below uses `keep_all_features = FALSE` **and then requires `FeatureMatrix()` to return exactly the full common feature set**. If a future dataset genuinely drops a feature, the notebook stops rather than silently continuing with unequal ATAC matrices.
 
 ```{r requantify-common-peaks, cache=FALSE}
-requantification_summary <- vector(
-  "list",
-  nrow(sample_sheet)
-)
+requantification_summary <- vector("list", nrow(sample_sheet))
 
 names(requantification_summary) <-
   sample_sheet$sample_id
 
 common_feature_names <- paste0(
   as.character(GenomeInfoDb::seqnames(common_peaks)),
-  ":",
+  "-",
   GenomicRanges::start(common_peaks),
   "-",
   GenomicRanges::end(common_peaks)
 )
 
 if (anyDuplicated(common_feature_names) > 0L) {
-  stop(
-    "Common peak feature names are not unique.",
-    call. = FALSE
-  )
+  stop("Common peak feature names are not unique.", call. = FALSE)
 }
 
 for (row_index in seq_len(nrow(sample_sheet))) {
-
   sample_id <- sample_sheet$sample_id[row_index]
 
-  message_step(
-    "Step 3 requantification: ",
-    sample_id
-  )
+  message_step("Step 3 requantification: ", sample_id)
 
   input_object_path <- post_qc_paths[row_index]
 
-  output_object_path <- file.path(
-    COMMON_OBJECT_DIR,
-    paste0(
-      sample_id,
-      "_post_QC_common_ATAC.rds"
-    )
-  )
+  output_object_path <- file.path(COMMON_OBJECT_DIR,
+                                  paste0(sample_id, "_post_QC_common_ATAC.rds"))
 
-  object <- readRDS(
-    input_object_path
-  )
+  object <- readRDS(input_object_path)
 
   if (!"ATAC" %in% names(object)) {
-    stop(
-      sample_id,
-      " does not contain an ATAC assay.",
-      call. = FALSE
-    )
+    stop(sample_id, " does not contain an ATAC assay.", call. = FALSE)
   }
 
-  old_annotation <- Signac::Annotation(
-    object[["ATAC"]]
-  )
+  old_annotation <- Signac::Annotation(object[["ATAC"]])
 
-  old_genome <- unique(
-    GenomeInfoDb::genome(
-      old_annotation
-    )
-  )
+  old_genome <- unique(GenomeInfoDb::genome(old_annotation))
 
-  if (!identical(
-    old_genome,
-    GRCM39_GENOME_LABEL
-  )) {
-    stop(
-      sample_id,
-      " post-QC object is not using ",
-      GRCM39_GENOME_LABEL,
-      ".",
-      call. = FALSE
-    )
+  if (!identical(old_genome, GRCM39_GENOME_LABEL)) {
+    stop(sample_id,
+         " post-QC object is not using ",
+         GRCM39_GENOME_LABEL,
+         ".",
+         call. = FALSE)
   }
 
+  old_atac_feature_count <- nrow(object[["ATAC"]])
   # Preserve the ATAC values used during QC before replacing the assay.
   object$nCount_ATAC_original_peaks <-
     object$nCount_ATAC
@@ -523,17 +456,10 @@ for (row_index in seq_len(nrow(sample_sheet))) {
   object$nFeature_ATAC_original_peaks <-
     object$nFeature_ATAC
 
-  fragment_objects <- Signac::Fragments(
-    object[["ATAC"]]
-  )
+  fragment_objects <- Signac::Fragments(object[["ATAC"]])
 
   if (length(fragment_objects) == 0L) {
-    stop(
-      "No Fragment object is stored in ",
-      sample_id,
-      ".",
-      call. = FALSE
-    )
+    stop("No Fragment object is stored in ", sample_id, ".", call. = FALSE)
   }
 
   common_counts <- Signac::FeatureMatrix(
@@ -557,23 +483,14 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     )
   }
 
-  if (!setequal(
-    colnames(common_counts),
-    colnames(object)
-  )) {
-    stop(
-      sample_id,
-      ": requantified ATAC cells do not match the post-QC object.",
-      call. = FALSE
-    )
+  if (!setequal(colnames(common_counts), colnames(object))) {
+    stop(sample_id,
+         ": requantified ATAC cells do not match the post-QC object.",
+         call. = FALSE)
   }
 
   # Enforce the same cell order as the Seurat object.
-  common_counts <- common_counts[
-    ,
-    colnames(object),
-    drop = FALSE
-  ]
+  common_counts <- common_counts[, colnames(object), drop = FALSE]
 
   rownames(common_counts) <-
     common_feature_names
@@ -588,7 +505,50 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     validate.fragments = TRUE
   )
 
+  message(
+    sample_id,
+    ": replacing ",
+    old_atac_feature_count,
+    " sample-specific ATAC features with ",
+    nrow(new_atac_assay),
+    " common-peak features. ",
+    "SeuratObject may report an expected assay-dimension warning."
+  )
+
   object[["ATAC"]] <- new_atac_assay
+
+  assigned_atac_cells <- as.character(colnames(object[["ATAC"]]))
+
+  expected_cells <- as.character(colnames(object))
+
+  if (length(assigned_atac_cells) != length(expected_cells) ||
+      !all(assigned_atac_cells == expected_cells)) {
+    stop(
+      sample_id,
+      ": cell identities or order changed while replacing the ATAC assay.",
+      call. = FALSE
+    )
+  }
+
+  assigned_ranges <- Signac::granges(object[["ATAC"]])
+
+  same_common_peak_coordinates <-
+    length(assigned_ranges) == length(common_peaks) &&
+    all(as.character(GenomeInfoDb::seqnames(assigned_ranges)) ==
+          as.character(GenomeInfoDb::seqnames(common_peaks))) &&
+    all(GenomicRanges::start(assigned_ranges) ==
+          GenomicRanges::start(common_peaks)) &&
+    all(GenomicRanges::end(assigned_ranges) ==
+          GenomicRanges::end(common_peaks))
+
+  if (!same_common_peak_coordinates) {
+    stop(
+      sample_id,
+      ": the replacement ATAC assay does not contain the expected ",
+      "common peak coordinates in the expected order.",
+      call. = FALSE
+    )
+  }
 
   # Store common-feature depth explicitly rather than confusing it
   # with the original QC peak-space measurements.
@@ -604,11 +564,10 @@ for (row_index in seq_len(nrow(sample_sheet))) {
     data.frame(
       sample_id = sample_id,
       retained_cells = ncol(object),
+      original_peaks = old_atac_feature_count,
       common_peaks = nrow(common_counts),
       peaks_detected_in_sample =
-        sum(
-          Matrix::rowSums(common_counts) > 0
-        ),
+        sum(Matrix::rowSums(common_counts) > 0),
       median_original_ATAC_counts =
         stats::median(object$nCount_ATAC_original_peaks),
       median_common_fragment_counts =
@@ -618,40 +577,28 @@ for (row_index in seq_len(nrow(sample_sheet))) {
       output_object = output_object_path
     )
 
-  saveRDS(
-    object,
-    output_object_path,
-    compress = FALSE
-  )
+  saveRDS(object, output_object_path, compress = FALSE)
 
-  rm(
-    object,
-    common_counts,
-    new_atac_assay,
-    fragment_objects,
-    old_annotation
-  )
+  rm(object,
+     common_counts,
+     new_atac_assay,
+     fragment_objects,
+     old_annotation)
 
   invisible(gc())
 }
 
 requantification_summary <-
-  dplyr::bind_rows(
-    requantification_summary
-  )
+  dplyr::bind_rows(requantification_summary)
 
 requantification_summary
 ```
 
-For the validated Ppar dataset, the successful requantification produced
-approximately 11.6 million CON fragment counts and 9.1 million HFD fragment
-counts across the 130,476 common features. These values are recorded here as a
-known successful run, not as hard-coded acceptance thresholds for future data.
+For the validated Ppar dataset, the successful requantification produced approximately 11.6 million CON fragment counts and 9.1 million HFD fragment counts across the 130,476 common features. These values are recorded here as a known successful run, not as hard-coded acceptance thresholds for future data.
 
 # 5. Verify identical ATAC feature spaces
 
-Before downstream dimensional reduction, every common-feature ATAC assay must
-contain:
+Before downstream dimensional reduction, every common-feature ATAC assay must contain:
 
 - the same number of peaks;
 - exactly the same peak coordinates;
@@ -659,9 +606,7 @@ contain:
 - the GRCm39 gene annotation;
 - the expected post-QC cells.
 
-The coordinate comparison is performed using a simple `chr:start-end` key so
-that harmless differences in `Seqinfo` metadata cannot obscure a genuine
-feature mismatch.
+The coordinate comparison is performed using a simple `chr:start-end` key so that harmless differences in `Seqinfo` metadata cannot obscure a genuine feature mismatch.
 
 ```{r verify-common-feature-objects}
 common_object_paths <- file.path(
@@ -827,8 +772,7 @@ if (!all(feature_checks$coordinates_match_canonical)) {
 
 # 6. Save the Step 3 audit trail
 
-The audit files record both how the common feature space was constructed and
-how each post-QC sample was requantified against it.
+The audit files record both how the common feature space was constructed and how each post-QC sample was requantified against it.
 
 ```{r save-step-three}
 readr::write_csv(
@@ -890,15 +834,9 @@ Before proceeding, be able to answer:
 2. What does `reduce()` do to overlapping or adjacent peaks?
 3. Why do we return to the fragment files after defining the common peaks?
 4. What does one row of the new ATAC matrix represent?
-5. Why must every sample use exactly the same common peak coordinates and row
-   order?
-6. Why were the original QC ATAC counts preserved separately from the new
-   common-feature ATAC counts?
-7. Why does this pipeline use `keep_all_features = FALSE` with a strict
-   post-quantification feature-count check?
-8. Why should the fragment-derived common-peak counts not be expected to match
-   the original Cell Ranger ATAC counts exactly?
+5. Why must every sample use exactly the same common peak coordinates and row order?
+6. Why were the original QC ATAC counts preserved separately from the new common-feature ATAC counts?
+7. Why does this pipeline use `keep_all_features = FALSE` with a strict post-quantification feature-count check?
+8. Why should the fragment-derived common-peak counts not be expected to match the original Cell Ranger ATAC counts exactly?
 
-Once all validation checks pass and `STEP_03_COMPLETE.txt` exists, Step 3 is
-complete. The next notebook can safely use the common-feature objects for RNA
-normalization/PCA and ATAC TF-IDF/SVD/LSI.
+Once all validation checks pass and `STEP_03_COMPLETE.txt` exists, Step 3 is complete. The next notebook can safely use the common-feature objects for RNA normalization/PCA and ATAC TF-IDF/SVD/LSI.
