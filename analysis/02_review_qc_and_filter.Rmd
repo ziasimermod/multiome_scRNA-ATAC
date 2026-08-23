@@ -269,7 +269,7 @@ ggplot2::ggplot(
 ```{r plot-rna-bin-pass, fig.width=10, fig.height=7}
 lower_tail_summary <- lapply(sample_sheet$sample_id, function(sample_id) {
   metadata <- metadata_tables[[sample_id]]
-  
+
   metadata |>
     dplyr::mutate(
       RNA_bin = cut(
@@ -308,7 +308,7 @@ lower_tail_summary <- lapply(sample_sheet$sample_id, function(sample_id) {
       median_features = median(nFeature_RNA, na.rm = TRUE),
       median_mt = median(percent.mt, na.rm = TRUE),
       singlet_pct = 100 * mean(
-        scDblFinder.class == "singlet", 
+        scDblFinder.class == "singlet",
         na.rm = TRUE),
       .groups = "drop"
     )

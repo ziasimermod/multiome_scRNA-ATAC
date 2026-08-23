@@ -743,7 +743,7 @@ theme_multiome <- function(
     base_size = 11,
     base_family = "sans"
 ) {
-  
+
   cowplot::theme_cowplot(
     font_size = base_size,
     font_family = base_family,
