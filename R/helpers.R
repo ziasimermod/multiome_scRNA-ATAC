@@ -26,7 +26,9 @@ required_packages <- c(
   "biovizBase",
   "SingleCellExperiment",
   "SummarizedExperiment",
-  "scDblFinder"
+  "scDblFinder",
+  "cowplot",
+  "scales"
 )
 
 minimum_package_versions <- c(
@@ -737,6 +739,44 @@ summarize_qc_decision <- function(object, sample_id) {
   )
 }
 
+theme_multiome <- function(
+    base_size = 11,
+    base_family = "sans"
+) {
+  
+  cowplot::theme_cowplot(
+    font_size = base_size,
+    font_family = base_family,
+    line_size = 0.45
+  ) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        size = ggplot2::rel(1.15),
+        margin = ggplot2::margin(b = 4)
+      ),
+      plot.subtitle = ggplot2::element_text(
+        color = "grey30",
+        margin = ggplot2::margin(b = 8)
+      ),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text = ggplot2::element_text(color = "grey20"),
+      strip.background = ggplot2::element_rect(
+        fill = "#F2F2F2",
+        color = NA
+      ),
+      strip.text = ggplot2::element_text(face = "bold"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      legend.position = "top",
+      plot.caption.position = "plot",
+      plot.caption = ggplot2::element_text(
+        color = "grey40",
+        hjust = 0
+      )
+    )
+}
+
 save_sample_qc_plots <- function(
     metadata,
     sample_id,
@@ -769,7 +809,7 @@ save_sample_qc_plots <- function(
       x = NULL,
       y = NULL
     ) +
-    ggplot2::theme_classic(base_size = 11) +
+    theme_multiome() +
     ggplot2::theme(axis.text.x = ggplot2::element_blank())
 
   rna <- ggplot2::ggplot(
@@ -784,7 +824,7 @@ save_sample_qc_plots <- function(
       title = paste(sample_id, "RNA complexity"),
       color = "% mitochondrial"
     ) +
-    ggplot2::theme_classic(base_size = 11)
+    theme_multiome()
 
   atac <- ggplot2::ggplot(
     metadata,
@@ -801,7 +841,7 @@ save_sample_qc_plots <- function(
       title = paste(sample_id, "ATAC quality"),
       color = "nucleosome signal"
     ) +
-    ggplot2::theme_classic(base_size = 11)
+    theme_multiome()
 
   if (!is.null(thresholds)) {
     rna <- rna +
@@ -850,3 +890,18 @@ save_sample_qc_plots <- function(
   )
   invisible(list(violin = violin, rna = rna, atac = atac))
 }
+
+DIET_COLORS <- c(
+  CON = "#E69F00",
+  HFD = "#56B4E9"
+)
+
+QC_STATUS_COLORS <- c(
+  Pass = "#009E73",
+  Fail = "#B8B8B8"
+)
+
+DOUBLET_CLASS_COLORS <- c(
+  singlet = "#666666",
+  doublet = "red3"
+)
