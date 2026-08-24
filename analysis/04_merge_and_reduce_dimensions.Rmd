@@ -163,6 +163,26 @@ set, and one common-feature post-QC object for every row in `samples.csv`.
 ```{r confirm-step-three}
 sample_sheet <- read_sample_sheet()
 
+ggplot2::theme_set(theme_multiome())
+
+unknown_diets <- setdiff(
+  unique(sample_sheet$diet),
+  names(DIET_COLORS)
+)
+
+if (length(unknown_diets) > 0L) {
+  stop(
+    "No plotting colors defined for: ",
+    paste(unknown_diets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_colors <- stats::setNames(
+  unname(DIET_COLORS[sample_sheet$diet]),
+  sample_sheet$sample_id
+)
+
 step_three_marker <- file.path(
   OUTPUT_DIR,
   "03_objects",
@@ -387,6 +407,11 @@ print(
     merged$sample_id,
     useNA = "ifany"
   )
+)
+
+merged$sample_id <- factor(
+  merged$sample_id,
+  levels = sample_sheet$sample_id
 )
 ```
 
@@ -623,7 +648,23 @@ p_rna_elbow <- ElbowPlot(
   reduction = "pca",
   ndims = N_RNA_PCS
 ) +
-  ggtitle("RNA PCA elbow plot")
+  ggplot2::geom_vline(
+    xintercept = max(RNA_DIMS_EXPLORATORY),
+    linetype = "dashed",
+    linewidth = 0.6,
+    color = "#D55E00"
+  ) +
+  ggplot2::labs(
+    title = "RNA principal-component selection",
+    subtitle = paste0(
+  "The dashed line marks the ",
+  max(RNA_DIMS_EXPLORATORY),
+  " PCs used for exploratory reduction."
+),
+    x = "Principal component",
+    y = "Standard deviation"
+  ) +
+  theme_multiome()
 
 print(p_rna_elbow)
 
@@ -685,9 +726,20 @@ p_rna_sample <- DimPlot(
   merged,
   reduction = "umap.rna",
   group.by = "sample_id",
+  cols = sample_colors,
+  pt.size = 0.25,
+  seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("RNA UMAP — colored by sample")
+  ggplot2::labs(
+    title = "RNA structure before multimodal neighbor construction",
+    subtitle = paste(
+      "Colors indicate pooled libraries;",
+      "diet and sample identity are confounded in this two-library dataset."
+    ),
+    color = NULL
+  ) +
+  theme_multiome()
 
 print(p_rna_sample)
 
@@ -887,27 +939,46 @@ head(
   15
 )
 
-p_lsi_depth <- ggplot(
-  subset(
-    lsi_depth_summary,
-    dimension <= 20
-  ),
-  aes(
+lsi_plot_data <- subset(
+  lsi_depth_summary,
+  dimension <= 20
+) |>
+  dplyr::mutate(
+    dimension_status = ifelse(
+      dimension %in% ATAC_DIMS_EXPLORATORY,
+      "Used",
+      "Excluded"
+    )
+  )
+
+p_lsi_depth <- ggplot2::ggplot(
+  lsi_plot_data,
+  ggplot2::aes(
     x = factor(dimension),
-    y = spearman_depth_correlation
+    y = spearman_depth_correlation,
+    fill = dimension_status
   )
 ) +
-  geom_col() +
-  geom_hline(
+  ggplot2::geom_col(width = 0.8) +
+  ggplot2::geom_hline(
     yintercept = 0,
-    linetype = "dashed"
+    linetype = "dashed",
+    color = "grey35"
   ) +
-  labs(
-    title = "ATAC LSI correlation with sequencing depth",
+  ggplot2::scale_fill_manual(
+    values = c(
+      Used = "#756BB1",
+      Excluded = "#B8B8B8"
+    )
+  ) +
+  ggplot2::labs(
+    title = "ATAC LSI association with sequencing depth",
+    subtitle = "LSI 1 is excluded because it is dominated by ATAC depth.",
     x = "LSI dimension",
-    y = "Spearman correlation with log10 ATAC depth"
+    y = "Spearman correlation with log10 ATAC depth",
+    fill = NULL
   ) +
-  theme_minimal(base_size = 12)
+  theme_multiome()
 
 print(p_lsi_depth)
 
@@ -947,9 +1018,20 @@ p_atac_sample <- DimPlot(
   merged,
   reduction = "umap.atac",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("ATAC UMAP — colored by sample")
+  ggplot2::labs(
+  title = "ATAC structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 print(p_atac_sample)
 
@@ -959,6 +1041,36 @@ ggsave(
     "04_ATAC_UMAP_by_sample.pdf"
   ),
   plot = p_atac_sample,
+  width = 8,
+  height = 6
+)
+
+merged$log10_nCount_ATAC_common <- log10(
+  merged$nCount_ATAC_common + 1
+)
+
+p_atac_depth <- FeaturePlot(
+  merged,
+  features = "log10_nCount_ATAC_common",
+  reduction = "umap.atac",
+  order = TRUE,
+  pt.size = 0.25
+) +
+  ggplot2::labs(
+    title = "ATAC depth across the accessibility embedding",
+    subtitle = "Depth is shown for diagnostic review, not as a biological state.",
+    color = expression(log[10]~"ATAC counts")
+  ) +
+  theme_multiome()
+
+print(p_atac_depth)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP4_PLOT_DIR,
+    "04B_ATAC_UMAP_by_depth.pdf"
+  ),
+  plot = p_atac_depth,
   width = 8,
   height = 6
 )
@@ -1038,7 +1150,6 @@ cat(
 )
 
 if (length(present_markers) > 0L) {
-
   p_marker_preview <- FeaturePlot(
     merged,
     features = present_markers,
@@ -1049,13 +1160,13 @@ if (length(present_markers) > 0L) {
     ncol = 4
   )
 
+  p_marker_preview <- p_marker_preview &
+  theme_multiome(base_size = 9)
+
   print(p_marker_preview)
 
   ggsave(
-    filename = file.path(
-      STEP4_PLOT_DIR,
-      "05_RNA_mouse_colon_marker_preview.pdf"
-    ),
+    filename = file.path(STEP4_PLOT_DIR, "05_RNA_mouse_colon_marker_preview.pdf"),
     plot = p_marker_preview,
     width = 12,
     height = 12
@@ -1078,17 +1189,39 @@ p_rna_compare <- DimPlot(
   merged,
   reduction = "umap.rna",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("RNA")
+  ggplot2::labs(
+  title = "RNA structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 p_atac_compare <- DimPlot(
   merged,
   reduction = "umap.atac",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("ATAC")
+  ggplot2::labs(
+  title = "ATAC structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 if (requireNamespace(
   "patchwork",
