@@ -675,6 +675,8 @@ merged <- RunUMAP(
   dims = RNA_DIMS_EXPLORATORY,
   reduction.name = "umap.rna",
   reduction.key = "rnaUMAP_",
+  umap.method = "uwot",
+  metric = "cosine",
   seed.use = 20260727,
   verbose = TRUE
 )
@@ -720,6 +722,91 @@ The ATAC workflow is:
 ```{r preprocess-atac}
 DefaultAssay(merged) <- "ATAC"
 
+# Identify common peaks that contain no counts across any retained cell.
+atac_counts <- SeuratObject::GetAssayData(
+  merged,
+  assay = "ATAC",
+  layer = "counts"
+)
+
+atac_feature_totals <- Matrix::rowSums(atac_counts)
+
+zero_count_atac_features <- rownames(atac_counts)[
+  atac_feature_totals == 0
+]
+
+retained_atac_features <- rownames(atac_counts)[
+  atac_feature_totals > 0
+]
+
+atac_feature_filter_summary <- data.frame(
+  canonical_common_ATAC_features = nrow(atac_counts),
+  zero_count_ATAC_features_removed =
+    length(zero_count_atac_features),
+  ATAC_features_retained_for_TFIDF =
+    length(retained_atac_features)
+)
+
+atac_feature_filter_summary
+
+if (length(zero_count_atac_features) > 0L) {
+  message(
+    "Removing ",
+    length(zero_count_atac_features),
+    " common ATAC features with zero counts across all retained cells."
+  )
+
+  merged[["ATAC"]] <- subset(
+    x = merged[["ATAC"]],
+    features = retained_atac_features
+  )
+}
+
+# Confirm that the analysis-ready ATAC assay contains no all-zero rows.
+filtered_atac_counts <- SeuratObject::GetAssayData(
+  merged,
+  assay = "ATAC",
+  layer = "counts"
+)
+
+remaining_zero_count_features <- sum(
+  Matrix::rowSums(filtered_atac_counts) == 0
+)
+
+if (remaining_zero_count_features != 0L) {
+  stop(
+    "Zero-count ATAC features remain after filtering.",
+    call. = FALSE
+  )
+}
+
+if (
+  nrow(merged[["ATAC"]]) !=
+    atac_feature_filter_summary$ATAC_features_retained_for_TFIDF
+) {
+  stop(
+    "The filtered ATAC assay does not contain the expected number of features.",
+    call. = FALSE
+  )
+}
+
+cat(
+  "ATAC features retained for TF-IDF:",
+  nrow(merged[["ATAC"]]),
+  "\n"
+)
+
+rm(
+  atac_counts,
+  atac_feature_totals,
+  zero_count_atac_features,
+  retained_atac_features,
+  filtered_atac_counts,
+  remaining_zero_count_features
+)
+
+invisible(gc())
+
 merged <- RunTFIDF(
   merged,
   method = 1,
@@ -729,7 +816,7 @@ merged <- RunTFIDF(
 
 merged <- FindTopFeatures(
   merged,
-  min.cutoff = "q0",
+  min.cutoff = 0,
   verbose = TRUE
 )
 
@@ -850,6 +937,8 @@ merged <- RunUMAP(
   dims = ATAC_DIMS_EXPLORATORY,
   reduction.name = "umap.atac",
   reduction.key = "atacUMAP_",
+  umap.method = "uwot",
+  metric = "cosine",
   seed.use = 20260727,
   verbose = TRUE
 )
@@ -1047,13 +1136,23 @@ step4_summary <- data.frame(
   RNA_features = nrow(merged[["RNA"]]),
   RNA_variable_features = length(rna_variable_features),
   PCA_dimensions = ncol(Embeddings(merged, "pca")),
+
+  canonical_common_ATAC_features =
+    atac_feature_filter_summary$canonical_common_ATAC_features[[1]],
+
+  zero_count_ATAC_features_removed =
+    atac_feature_filter_summary$zero_count_ATAC_features_removed[[1]],
+
   ATAC_features = nrow(merged[["ATAC"]]),
+
   ATAC_features_used_for_LSI = length(
     VariableFeatures(
       merged[["ATAC"]]
     )
   ),
+
   LSI_dimensions = ncol(Embeddings(merged, "lsi")),
+
   fragment_objects = length(
     Signac::Fragments(
       merged[["ATAC"]]
@@ -1118,6 +1217,14 @@ readr::write_csv(
     "step4_summary.csv"
   )
 )
+
+readr::write_csv(
+  atac_feature_filter_summary,
+  file.path(
+    STEP4_DIR,
+    "ATAC_feature_filter_summary.csv"
+  )
+)
 ```
 
 # 15. Save the reduced merged object
@@ -1131,16 +1238,9 @@ Step 5 will load this object and build the weighted nearest-neighbor graph.
 ```{r save-reduced-object}
 DefaultAssay(merged) <- "RNA"
 
-step4_object_path <- file.path(
-  STEP4_DIR,
-  "Ppar_iKO_multiome_merged_reduced.rds"
-)
+step4_object_path <- file.path(STEP4_DIR, "Ppar_iKO_multiome_merged_reduced.rds")
 
-saveRDS(
-  merged,
-  step4_object_path,
-  compress = FALSE
-)
+saveRDS(merged, step4_object_path, compress = FALSE)
 
 saved_object_info <- data.frame(
   path = step4_object_path,
@@ -1151,34 +1251,24 @@ saved_object_info <- data.frame(
 saved_object_info
 
 if (!isTRUE(saved_object_info$exists)) {
-  stop(
-    "The Step 4 merged object was not saved successfully.",
-    call. = FALSE
-  )
+  stop("The Step 4 merged object was not saved successfully.", call. = FALSE)
 }
 
 writeLines(
   c(
+    paste("Step 4 completed:", format(Sys.time())),
+    paste("Merged cells:", ncol(merged)),
+    paste("RNA PCA dimensions:", ncol(Embeddings(merged, "pca"))),
+    paste("ATAC LSI dimensions:", ncol(Embeddings(merged, "lsi"))),
     paste(
-      "Step 4 completed:",
-      format(Sys.time())
+      "Canonical common ATAC features:",
+      atac_feature_filter_summary$canonical_common_ATAC_features[[1]]
     ),
     paste(
-      "Merged cells:",
-      ncol(merged)
+      "Zero-count ATAC features removed:",
+      atac_feature_filter_summary$zero_count_ATAC_features_removed[[1]]
     ),
-    paste(
-      "RNA PCA dimensions:",
-      ncol(Embeddings(merged, "pca"))
-    ),
-    paste(
-      "ATAC LSI dimensions:",
-      ncol(Embeddings(merged, "lsi"))
-    ),
-    paste(
-      "Common ATAC features:",
-      nrow(merged[["ATAC"]])
-    ),
+    paste("ATAC features retained for TF-IDF:", nrow(merged[["ATAC"]])),
     "Batch integration performed: FALSE",
     paste(
       "RNA exploratory dimensions:",
@@ -1189,10 +1279,7 @@ writeLines(
       paste(ATAC_DIMS_EXPLORATORY, collapse = ",")
     )
   ),
-  file.path(
-    STEP4_DIR,
-    "STEP_04_COMPLETE.txt"
-  )
+  file.path(STEP4_DIR, "STEP_04_COMPLETE.txt")
 )
 ```
 
