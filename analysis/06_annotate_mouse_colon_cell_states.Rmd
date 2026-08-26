@@ -9,12 +9,16 @@ output:
 
 <!--
 Revision checkpoint: this copy includes cluster-level QC/modality summaries,
-numeric DotPlot exports, and the expanded cluster 2 crypt-state review.
+numeric DotPlot exports, the expanded cluster 2 crypt-state review, grouped
+marker-program DotPlots, and primary-study annotation references. In this v3
+copy, Rspo1 belongs only to Crypt_niche_stromal and is explicitly excluded from
+the Mesothelial marker vector.
 -->
 
 # The goal of this notebook
 
-Step 5 converted the RNA and ATAC representations into a weighted nearest-neighbor graph and selected resolution 0.8 after manual review. That resolution produced 27 computational clusters. Step 6 asks a different question:
+Step 5 converted the RNA and ATAC representations into a weighted nearest-neighbor graph and selected resolution 0.8 after manual review. That resolution produced 27 computational clusters. Step 6 asks a different
+question:
 **what biological compartment or cell state is supported for each cluster?**
 
 This notebook deliberately separates evidence generation from label approval. It will:
@@ -884,19 +888,34 @@ The marker panels are intentionally redundant at the biological-program level, b
 ```{r define-marker-programs}
 broad_lineage_programs <- list(
   Epithelial = c("Epcam", "Krt8", "Krt18", "Krt19", "Cdh1"),
-  T_NK = c("Ptprc", "Cd3d", "Cd3e", "Trbc1", "Nkg7", "Klrd1"),
-  B_cell = c("Cd79a", "Cd79b", "Ms4a1", "Cd74", "Cd37"),
+  Pan_immune = c("Ptprc"),
+  T_NK = c("Cd3d", "Cd3e", "Trbc1", "Nkg7", "Klrd1"),
+  B_cell = c("Cd79a", "Cd79b", "Ms4a1", "Cd37"),
   Plasma_cell = c("Jchain", "Mzb1", "Sdc1", "Igkc"),
-  Myeloid = c("Lyz2", "Adgre1", "Csf1r", "C1qa", "C1qb", "C1qc"),
-  Dendritic = c("Itgax", "Flt3", "H2-Ab1", "Ccr7"),
-  Plasmacytoid_DC = c("Siglech", "Flt3", "Ccr9", "Pld4", "Gzmb"),
+  MHCII_macrophage = c(
+    "Lyz2",
+    "Adgre1",
+    "Csf1r",
+    "C1qa",
+    "C1qb",
+    "C1qc",
+    "Apoe",
+    "Ms4a7",
+    "H2-Ab1",
+    "H2-Eb1",
+    "H2-Aa",
+    "Cd74"
+  ),
+  Conventional_DC = c("Itgax", "Flt3", "Ccr7", "Clec10a", "Xcr1"),
+  Plasmacytoid_DC = c("Siglech", "Ccr9", "Pld4", "Gzmb", "Tcf4", "Bcl11a"),
   Neutrophil = c("S100a8", "S100a9", "Ly6g", "Csf3r"),
   Mast = c("Kit", "Ms4a2", "Cpa3", "Mcpt1", "Mcpt2"),
   Vascular_endothelial = c("Cdh5", "Pecam1", "Kdr", "Esam", "Emcn"),
   Lymphatic_endothelial = c("Flt4", "Prox1", "Lyve1", "Ccl21a", "Pdpn"),
-  Fibroblast = c("Col1a1", "Col1a2", "Col3a1", "Dcn", "Pdgfra"),
+  Fibroblast_stromal = c("Col1a1", "Col1a2", "Col3a1", "Dcn", "Pdgfra"),
+  Crypt_niche_stromal = c("Cd34", "Rspo1", "Rspo3", "Wnt2b", "Grem1", "Wif1"),
   Smooth_muscle = c("Carmn", "Acta2", "Tagln", "Myh11", "Mylk"),
-  Mesothelial = c("Lrrn4", "Upk3b", "Msln", "Wt1", "Rspo1"),
+  Mesothelial = c("Lrrn4", "Upk3b", "Msln", "Muc16", "Wt1"),
   Enteric_glia = c("S100b", "Sox10", "Plp1", "Sox2", "Fabp7"),
   Enteric_neuron = c("Snap25", "Tubb3", "Elavl4", "Syp", "Uchl1")
 )
@@ -906,9 +925,9 @@ epithelial_state_programs <- list(
   Crypt_progenitor = c("Cftr", "Htr4", "Slc12a2", "Fut9", "Pde3a"),
   Cell_cycle = c("Mki67", "Pcna", "Top2a", "Cdk1", "Ccnb1", "Ube2c", "Birc5"),
   Secretory_commitment = c("Atoh1", "Dll1", "Gfi1", "Spdef"),
-  Absorptive_progenitor = c("Selenbp1", "Cyp2c55", "Car1"),
+  Absorptive_progenitor = c("Selenbp1", "Cyp2c55", "Fabp1"),
   Mature_colonocyte = c("Krt20", "Slc26a3", "Aqp8", "Car1", "Car2", "Otop2"),
-  Goblet = c("Muc2", "Tff3", "Clca1", "Fcgbp", "Agr2", "Spdef"),
+  Goblet = c("Muc2", "Tff3", "Clca1", "Fcgbp", "Agr2"),
   Deep_crypt_secretory = c("Reg4", "Mptx1", "Spink4", "Kit"),
   EEC_general = c("Chga", "Chgb", "Neurod1", "Pax6", "Isl1"),
   Enterochromaffin = c("Tph1", "Lmx1a", "Fev", "Tac1"),
@@ -973,11 +992,50 @@ make_scaled_dotplot <- function(
     title,
     subtitle,
     base_size = 9) {
-  detected_features <- features[
-    features %in% rownames(object[["RNA"]])
-  ]
+  RNA_features <- rownames(object[["RNA"]])
 
-  if (length(detected_features) == 0L) {
+  if (is.list(features)) {
+    if (is.null(names(features)) || any(!nzchar(names(features)))) {
+      stop(
+        "Grouped DotPlot features must be supplied as a named list.",
+        call. = FALSE
+      )
+    }
+
+    detected_features <- lapply(
+      features,
+      function(program_features) {
+        unique(program_features[program_features %in% RNA_features])
+      }
+    )
+
+    detected_features <- detected_features[
+      lengths(detected_features) > 0L
+    ]
+
+    duplicated_features <- unique(
+      unlist(detected_features, use.names = FALSE)[
+        duplicated(unlist(detected_features, use.names = FALSE))
+      ]
+    )
+
+    if (length(duplicated_features) > 0L) {
+      stop(
+        "DotPlot genes must be assigned to only one displayed program: ",
+        paste(duplicated_features, collapse = ", "),
+        call. = FALSE
+      )
+    }
+  } else {
+    detected_features <- unique(
+      features[features %in% RNA_features]
+    )
+  }
+
+  if (
+    length(detected_features) == 0L ||
+      (is.list(detected_features) && sum(lengths(detected_features)) == 0L)
+  ) {
     stop("No requested DotPlot features are present in RNA.", call. = FALSE)
   }
 
@@ -1008,7 +1066,15 @@ make_scaled_dotplot <- function(
           x = NULL,
           y = "WNN cluster"
         ) +
-        theme_multiome(base_size = base_size)
+        theme_multiome(base_size = base_size) +
+        ggplot2::theme(
+          panel.spacing.x = grid::unit(0.12, "lines"),
+          strip.text.x = ggplot2::element_text(
+            face = "bold",
+            size = ggplot2::rel(0.82),
+            margin = ggplot2::margin(t = 4, r = 3, b = 4, l = 3)
+          )
+        )
     )
   )
 }
@@ -1016,16 +1082,12 @@ make_scaled_dotplot <- function(
 
 # 7. Broad lineage adjudication
 
-This panel tests whether the computational clusters contain coherent epithelial or non-epithelial lineage programs. `Kit` is intentionally interpreted in context: `Kit` with `Reg4`/`Spink4` supports a deep crypt secretory program, whereas `Kit` with `Ms4a2`/`Cpa3` supports mast-cell identity.
+This panel tests whether the computational clusters contain coherent epithelial or non-epithelial lineage programs. The labeled strips preserve the marker-program assignments defined above, so genes from related biological hypotheses can be reviewed as blocks. `Rspo1` is shown with crypt-niche stromal genes rather than as a mesothelial marker. `Kit` is intentionally interpreted in context: `Kit` with `Reg4`/`Spink4` supports a deep crypt secretory program, whereas `Kit` with `Ms4a2`/`Cpa3` supports mast-cell identity.
 
-```{r broad-lineage-dotplot, fig.width=22, fig.height=9}
-broad_lineage_features <- unique(
-  unlist(broad_lineage_programs, use.names = FALSE)
-)
-
+```{r broad-lineage-dotplot, fig.width=28, fig.height=9}
 p_broad_lineage <- make_scaled_dotplot(
   object = multiome,
-  features = broad_lineage_features,
+  features = broad_lineage_programs,
   group_by = "wnn_cluster",
   title = "Broad lineage programs across WNN clusters",
   subtitle = paste(
@@ -1040,23 +1102,19 @@ print(p_broad_lineage)
 ggplot2::ggsave(
   filename = file.path(STEP6_PLOT_DIR, "04_broad_lineage_DotPlot.pdf"),
   plot = p_broad_lineage,
-  width = 22,
+  width = 28,
   height = 9
 )
 ```
 
 # 8. Focused epithelial-state adjudication
 
-This panel keeps all clusters visible. Restricting the plot to clusters already believed to be epithelial would make it too easy to miss a rare epithelial population or a mixed cluster.
+This panel keeps all clusters visible and separates the genes into labeled epithelial-state programs. Restricting the plot to clusters already believed to be epithelial would make it too easy to miss a rare epithelial population or a mixed cluster.
 
-```{r epithelial-state-dotplot, fig.width=23, fig.height=9}
-epithelial_state_features <- unique(
-  unlist(epithelial_state_programs, use.names = FALSE)
-)
-
+```{r epithelial-state-dotplot, fig.width=26, fig.height=9}
 p_epithelial_states <- make_scaled_dotplot(
   object = multiome,
-  features = epithelial_state_features,
+  features = epithelial_state_programs,
   group_by = "wnn_cluster",
   title = "Mouse-colon epithelial programs across WNN clusters",
   subtitle = paste(
@@ -1071,7 +1129,7 @@ print(p_epithelial_states)
 ggplot2::ggsave(
   filename = file.path(STEP6_PLOT_DIR, "05_epithelial_state_DotPlot.pdf"),
   plot = p_epithelial_states,
-  width = 23,
+  width = 26,
   height = 9
 )
 
@@ -2524,6 +2582,61 @@ ggplot2::ggsave(
 )
 ```
 
+## Primary-study anchors for the non-epithelial annotations
+
+The studies below are biological reference points for manual annotation, not
+automated label-transfer resources. Final calls still require concordant marker
+programs in the present dataset.
+
+- **Mesothelial cells:** Kanamori-Katayama et al. identified `LRRN4` and
+  `UPK3B` as primary mesothelial markers and evaluated their expression across
+  mouse tissues ([PLoS ONE, 2011](https://doi.org/10.1371/journal.pone.0025391)).
+  The joint `Wt1`, `Upk3b`, `Msln`, `Muc16`, and `Lrrn4` program is therefore
+  the principal support for the cluster 24 mesothelial hypothesis.
+- **Plasmacytoid dendritic cells:** Mizuno et al. directly studied intestinal
+  `CCR9`-positive plasmacytoid dendritic cells in mice
+  ([Immunology Letters, 2012](https://doi.org/10.1016/j.imlet.2012.05.001)).
+  This provides intestinal context for the cluster 22 pDC program, whose
+  identity in this dataset should remain anchored by multiple pDC genes rather
+  than `Ccr9` alone.
+- **MHC-II-high macrophages:** Guillaume et al. showed that monocyte-derived
+  intestinal macrophages are MHC-II-high and that colonic macrophage MHC-II
+  expression rises around weaning and is shaped by microbiota and ontogeny
+  ([Scientific Reports, 2023](https://doi.org/10.1038/s41598-023-28554-8)).
+  This is directly relevant to the d21 cluster 16 `H2-Ab1`, `H2-Eb1`, `Cd74`,
+  `C1qa`, `C1qb`, `C1qc`, `Apoe`, `Ms4a7`, `Adgre1`, and `Csf1r` program.
+- **Lymphatic endothelial cells:** Kim et al. characterized mouse intestinal
+  lymphatic endothelium with `Lyve1`, `Flt4`/VEGFR3, `Prox1`, and podoplanin
+  ([Developmental Dynamics, 2007](https://doi.org/10.1002/dvdy.21200)).
+  These markers should be evaluated as a coordinated endothelial program when
+  adjudicating cluster 25.
+
+### `Rspo1` and the cluster 24 mesothelial hypothesis
+
+`Rspo1` is **not** being treated as a mesothelial lineage marker. Primary work
+has isolated `Rspo1`-positive `CD34`-positive, `CD81`-positive stromal cells
+from adult mouse colon
+([Li et al., 2025](https://doi.org/10.3969/j.issn.1674-8115.2025.08.001)),
+whereas much of the established colonic crypt-niche literature emphasizes
+stromal `Rspo3`, including its role in epithelial recovery after injury
+([Harnack et al., 2019](https://doi.org/10.1038/s41467-019-12349-5)). Thus,
+`Rspo1` in cluster 24 is compatible with an ECM/niche-associated stromal
+program but does not distinguish fibroblasts from mesothelial cells.
+
+Mesothelial-to-mesenchymal transition is biologically possible after serosal
+injury or inflammation, but it should not be assigned from ECM expression
+alone. Lineage tracing in healthy postnatal and adult mice found that
+`Wt1`-expressing peritoneal mesothelium remained largely restricted to the
+serosal compartment rather than contributing broadly to the intestinal wall
+([Wilm et al., 2021](https://doi.org/10.1038/s41598-021-95380-1)). Cluster 24
+retains a strong mesothelial surface program and does not show a dominant
+`Acta2`, `Tagln`, or `Myh11` program. The defensible provisional label is
+therefore **ECM-rich mesothelial cell** with **moderate confidence**, not a
+confirmed mesothelial-to-mesenchymal transition. A transition claim would
+require a within-cell continuum showing loss of the mesothelial program and
+gain of fibroblast/myofibroblast markers, ideally supported by ATAC dynamics
+and spatial or lineage-tracing evidence.
+
 # 13. Write the manual annotation proposal
 
 The `review_hint` column preserves the hypotheses developed during Step 5. The
@@ -2566,7 +2679,7 @@ review_hint_lookup <- c(
   `13` = "Reg4-positive deep crypt secretory candidate",
   `14` = "enterochromaffin-like EEC candidate",
   `15` = "absorptive progenitor candidate; strongly library-skewed",
-  `16` = "MHC-II antigen-presenting myeloid/dendritic candidate",
+  `16` = "MHC-II-high macrophage candidate; confirm C1q/Apoe/Ms4a7/Adgre1/Csf1r program",
   `17` = "Pyy/Gcg-positive L-cell candidate",
   `18` = "B-cell candidate",
   `19` = "cycling secretory progenitor candidate",
@@ -2574,7 +2687,7 @@ review_hint_lookup <- c(
   `21` = "stress/inflammatory colonocyte candidate; strongly library-skewed",
   `22` = "plasmacytoid dendritic-cell candidate",
   `23` = "mast-cell candidate supported by Mcpt1/Mcpt2/Cpa3/Ms4a2/Kit",
-  `24` = "fibroblast candidate",
+  `24` = "ECM-rich mesothelial candidate; Rspo1 is not lineage-specific and MMT is not established",
   `25` = "lymphatic endothelial candidate",
   `26` = "tuft candidate"
 )
@@ -3078,6 +3191,13 @@ With an approved annotated object, subsequent notebooks can perform:
 
 - Sasaki et al. Reg4-positive deep crypt secretory cells support colonic stem cells: https://pmc.ncbi.nlm.nih.gov/articles/PMC5027439/
 - Billing et al. Molecular and cellular diversity of large-intestinal enteroendocrine cells: https://pmc.ncbi.nlm.nih.gov/articles/PMC6812004/
+- Kanamori-Katayama et al. LRRN4 and UPK3B are markers of primary mesothelial cells: https://doi.org/10.1371/journal.pone.0025391
+- Mizuno et al. CCR9-positive plasmacytoid dendritic cells in the small intestine suppress intestinal inflammation: https://doi.org/10.1016/j.imlet.2012.05.001
+- Guillaume et al. MHC-II expression on gut macrophages is regulated by microbiota and ontogeny: https://doi.org/10.1038/s41598-023-28554-8
+- Kim et al. Lymphatic development in mouse small intestine: https://doi.org/10.1002/dvdy.21200
+- Li et al. R-spondin 1 expression in adult mouse colonic CD34-positive, CD81-positive stromal cells: https://doi.org/10.3969/j.issn.1674-8115.2025.08.001
+- Harnack et al. Stromal R-spondin 3 promotes colonic epithelial regeneration: https://doi.org/10.1038/s41467-019-12349-5
+- Wilm et al. Restricted differentiative capacity of Wt1-expressing peritoneal mesothelium in postnatal and adult mice: https://doi.org/10.1038/s41598-021-95380-1
 - Seurat differential-expression testing: https://satijalab.org/seurat/reference/findallmarkers
 - Signac coverage visualization: https://stuartlab.org/signac/reference/coverageplot
 - Historical d21 maternal-diet scRNA-seq cluster-marker workbook supplied by the collaborating analysis team; its filtered positive-marker signatures are versioned with the dataset configuration.
