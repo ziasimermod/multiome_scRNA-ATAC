@@ -639,7 +639,7 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   if (!all(approved)) {
     stop(
       "QC is paused intentionally. Review the plots, then set approved=TRUE ",
-      "for every sample in config/qc_thresholds.csv and rerun this chunk.",
+      "for every sample in the active dataset's qc_thresholds.csv and rerun this chunk.",
       call. = FALSE
     )
   }

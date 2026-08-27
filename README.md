@@ -66,7 +66,7 @@ The current project-specific data location is configured in `config/project_conf
 /scratch/dsaiz/Yesenia_scData2026
 ```
 
-Input sample metadata live in `config/samples.csv`. Sample-specific paths should not be hard-coded inside individual analysis notebooks.
+Input sample metadata live in `config/datasets/<dataset_version>/samples.csv`. Sample-specific paths should not be hard-coded inside individual analysis notebooks.
 
 ## What belongs in GitHub
 

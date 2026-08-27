@@ -13,8 +13,8 @@ The goal is a readable analysis history that a lab member can follow in RStudio.
 ## What to commit
 
 - R/R Markdown code and documentation;
-- `config/samples.csv` for the current analysis;
-- reviewed `config/qc_thresholds.csv` and its decision notes;
+- `config/datasets/<dataset_version>/samples.csv` for the current analysis;
+- reviewed `config/datasets/<dataset_version>/qc_thresholds.csv` and its decision notes;
 - future manual annotation worksheets;
 - small summary tables when they are intentionally part of the analysis record.
 

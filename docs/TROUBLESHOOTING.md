@@ -56,7 +56,7 @@ Do not delete the whole R library.
 
 ## The notebook stops because `approved=FALSE`
 
-That is an analysis gate, not a code error. Step 2 refuses to filter cells until every sample has complete numeric thresholds and `approved=TRUE` in `config/qc_thresholds.csv`. Review the plots, document the decision, save the CSV, and rerun the approval chunk.
+That is an analysis gate, not a code error. Step 2 refuses to filter cells until every sample has complete numeric thresholds and `approved=TRUE` in `config/datasets/<dataset_version>/qc_thresholds.csv`. Review the plots, document the decision, save the CSV, and rerun the approval chunk.
 
 ## An RStudio session runs out of memory
 

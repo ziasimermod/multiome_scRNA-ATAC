@@ -30,7 +30,7 @@ flowchart TD
 ### Inputs
 
 - `config/project_config.R`
-- `config/samples.csv`
+- `config/datasets/<dataset_version>/samples.csv`
 - Cell Ranger ARC `outs/` directories
 - GRCm39 / GENCODE vM33 reference annotation
 
@@ -82,7 +82,7 @@ The nuclei within a library are not independent biological replicates for diet-l
 - ATAC fragment file and tabix index
 - per-barcode Cell Ranger metrics
 - saved GRCm39 / GENCODE vM33 annotation
-- `config/samples.csv`
+- `config/datasets/<dataset_version>/samples.csv`
 
 ### Main operations
 
@@ -132,7 +132,7 @@ Step 1 calculates QC metrics and provides starting threshold suggestions. Those 
 - Step 1 QC checkpoints
 - Step 1 QC tables
 - Step 1 QC plots
-- reviewed `config/qc_thresholds.csv`
+- reviewed `config/datasets/<dataset_version>/qc_thresholds.csv`
 
 ### Main operations
 
@@ -175,7 +175,7 @@ Completion marker:
 
 ### Decision point
 
-Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/qc_thresholds.csv`.
+Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/datasets/<dataset_version>/qc_thresholds.csv`.
 
 ---
 

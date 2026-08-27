@@ -52,7 +52,7 @@ A practical current location is:
 /scratch/dsaiz/Yesenia_scData2026/multiome_scRNA-ATAC
 ```
 
-The analysis does not depend on that exact repository location. The data paths are currently explicit in `config/project_config.R` and `config/samples.csv`.
+The analysis does not depend on that exact repository location. The data paths are currently explicit in `config/project_config.R` and `config/datasets/<dataset_version>/samples.csv`.
 
 ## RStudio is not the storage location
 

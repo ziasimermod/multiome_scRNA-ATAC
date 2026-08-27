@@ -27,5 +27,5 @@ These are the main official or primary method sources used to structure the work
 - Crowell HL et al. [muscat detects subpopulation-specific state transitions from multi-sample multi-condition single-cell transcriptomics data](https://doi.org/10.1038/s41467-020-19894-4). *Nature Communications* (2020) — supports replicate-aware differential-state reasoning rather than treating cells as independent experimental replicates.
 - Squair JW et al. [Confronting false discoveries in single-cell differential expression](https://doi.org/10.1038/s41467-021-25960-2). *Nature Communications* (2021) — demonstrates inflated false discoveries from cell-level methods that ignore biological replication and supports pseudobulk approaches.
 
-References do not provide universal cutoff values. QC cutoffs remain experiment-specific decisions documented in `config/qc_thresholds.csv`.
+References do not provide universal cutoff values. QC cutoffs remain experiment-specific decisions documented in `config/datasets/<dataset_version>/qc_thresholds.csv`.
 
