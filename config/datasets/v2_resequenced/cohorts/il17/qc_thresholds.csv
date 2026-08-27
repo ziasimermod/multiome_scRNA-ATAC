@@ -1,0 +1,3 @@
+sample_id,nCount_RNA_min,nCount_RNA_max,nFeature_RNA_min,nFeature_RNA_max,nCount_ATAC_min,nCount_ATAC_max,percent_mt_max,TSS_enrichment_min,nucleosome_signal_max,frip_min,approved,reviewer,review_date,decision_notes
+IL17-CON-1,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,FALSE,NA,NA,NA
+IL17-HFD-1,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,FALSE,NA,NA,NA

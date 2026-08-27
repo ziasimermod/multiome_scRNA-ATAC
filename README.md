@@ -2,12 +2,14 @@
 
 This repository is a stepwise, teaching-oriented workflow for paired single-cell RNA and ATAC data generated with 10x Genomics Multiome and `cellranger-arc count`.
 
-The first project-specific implementation analyzes two mouse-colon PPARalpha/PPARdelta iKO libraries:
+The project includes three mouse-colon cohorts, each with one pooled CON
+library and one pooled HFD library:
 
-| Sample | Diet | Mice pooled | Sex composition |
-|---|---|---:|---|
-| `Ppar-CON-1` | control diet (CON) | 6 | 2 female / 4 male |
-| `Ppar-HFD-1` | high-fat diet (HFD) | 10 | 2 female / 8 male |
+| Cohort ID | Group | CON sample | HFD sample | Pool metadata |
+|---|---|---|---|---|
+| `ppar` | PPAR | `Ppar-CON-1` | `Ppar-HFD-1` | CON: 6 mice (2F/4M); HFD: 10 mice (2F/8M) |
+| `wt` | WT | `VilB-CON-1` | `VilB-HFD-1` | pending wet-lab confirmation |
+| `il17` | IL17 | `IL17-CON-1` | `IL17-HFD-1` | pending wet-lab confirmation |
 
 Each Cell Ranger library contains colon epithelial cells pooled from multiple mice. Individual mouse identities are not recoverable after pooling. Therefore, pooled-library identity and diet condition are completely confounded.
 
@@ -25,10 +27,12 @@ Each numbered notebook has one job, reads documented inputs or completed checkpo
 | 3 | `analysis/03_build_common_atac_peak_set.Rmd` | Build a common GRCm39 ATAC peak space and requantify post-QC nuclei | Ready |
 | 4 | `analysis/04_merge_and_reduce_dimensions.Rmd` | Merge libraries, perform RNA log-normalization/PCA and ATAC TF-IDF/LSI, and inspect modality-specific structure | Ready |
 | 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready |
-| 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | Next |
+| 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | PPAR complete; WT/IL17 require cohort-specific review |
 | 7 | composition/pseudobulk workflow | Descriptive composition summaries and preparation of pseudobulk-ready downstream matrices | Planned |
 
-The current implementation is complete through Step 5. The reviewed working WNN clustering resolution is `0.8`. Final biological cell-state labels are intentionally deferred to Step 6.
+The PPAR development run is complete through Step 6. Steps 00-05 are shared
+across cohorts; Step 06 remains guarded against reusing PPAR cluster numbers
+for WT or IL17 before their annotations are independently reviewed.
 
 ## The short answer to "Is Multiome QC separate or together?"
 
@@ -42,7 +46,9 @@ This is encoded in Step 2 as separate `qc_pass_rna`, `qc_pass_atac`, and `qc_pas
 
 ## Current analysis strategy
 
-After QC, the two libraries are placed into a shared feature space without batch integration because library identity and diet are completely confounded.
+After QC, the two libraries within the selected cohort are placed into a shared
+feature space without batch integration because library identity and diet are
+completely confounded.
 
 RNA is analyzed using log normalization, highly variable genes, PCA, and an RNA-only exploratory UMAP.
 
@@ -57,8 +63,9 @@ RNA PCs and ATAC LSI dimensions are then combined using Seurat weighted nearest 
 3. Open `multiome_scRNA-ATAC.Rproj` in RStudio.
 4. Read `docs/SOL_RSTUDIO_SETUP.md` before selecting CPU, memory, and wall time.
 5. If this is the first setup of the R 4.4 library, run `setup/install_packages.R` once.
-6. Open the numbered notebooks under `analysis/` and run them in order, one chunk at a time.
-7. Restart R between major notebooks when appropriate to release memory.
+6. Set `MULTIOME_DATASET_VERSION` and `MULTIOME_COHORT_ID` before sourcing the project configuration. The defaults are `v2_resequenced` and `ppar`.
+7. Open the numbered notebooks under `analysis/` and run them in order, one chunk at a time.
+8. Restart R between major notebooks when appropriate to release memory.
 
 The current project-specific data location is configured in `config/project_config.R`:
 
@@ -67,6 +74,12 @@ The current project-specific data location is configured in `config/project_conf
 ```
 
 Input sample metadata live in `config/datasets/<dataset_version>/samples.csv`. Sample-specific paths should not be hard-coded inside individual analysis notebooks.
+
+Reviewed QC decisions are cohort-specific:
+
+```text
+config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv
+```
 
 ## What belongs in GitHub
 
@@ -81,7 +94,7 @@ The `.gitignore` file provides guardrails, but always inspect `git status` befor
 Large generated files are written outside this repository to:
 
 ```text
-/scratch/dsaiz/Yesenia_scData2026/results/Ppar_iKO_multiome_stepwise
+/scratch/dsaiz/Yesenia_scData2026/results/<dataset_version>/independent/<cohort_id>
 ```
 
 Current major checkpoint directories include:

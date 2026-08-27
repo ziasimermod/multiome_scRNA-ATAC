@@ -1,15 +1,15 @@
-# Project-specific settings for the first Mana Lab PPAR iKO Multiome dataset.
+# Project-specific settings for the Mana Lab colon Multiome datasets.
 #
-# Dataset versions are kept explicit so that the original sequencing-depth
-# analysis remains reproducible while later sequencing can be analyzed with
-# the same pipeline.
+# Dataset versions and biological cohorts are kept explicit so that the
+# original sequencing-depth analysis remains reproducible while PPAR, WT,
+# and IL17 cohorts can be analyzed with the same pipeline.
 
 set.seed(20260727)
 
 PROJECT_DIR <- "/scratch/dsaiz/Yesenia_scData2026"
 
 # -------------------------------------------------------------------------
-# Dataset version
+# Dataset version and biological cohort
 # -------------------------------------------------------------------------
 
 # v1_initial_depth:
@@ -37,6 +37,34 @@ if (!DATASET_VERSION %in% VALID_DATASET_VERSIONS) {
   )
 }
 
+COHORT_GROUPS <- c(
+  ppar = "PPAR",
+  wt = "WT",
+  il17 = "IL17"
+)
+
+VALID_COHORTS_BY_DATASET <- list(
+  v1_initial_depth = "ppar",
+  v2_resequenced = names(COHORT_GROUPS)
+)
+
+COHORT_ID <- tolower(trimws(Sys.getenv(
+  "MULTIOME_COHORT_ID",
+  unset = "ppar"
+)))
+
+VALID_COHORT_IDS <- VALID_COHORTS_BY_DATASET[[DATASET_VERSION]]
+
+if (!COHORT_ID %in% VALID_COHORT_IDS) {
+  stop(
+    "Unknown COHORT_ID for ", DATASET_VERSION, ": ", COHORT_ID,
+    "\nValid cohorts: ",
+    paste(VALID_COHORT_IDS, collapse = ", ")
+  )
+}
+
+COHORT_GROUP <- unname(COHORT_GROUPS[[COHORT_ID]])
+
 DATASET_CONFIG_DIR <- file.path(
   REPO_ROOT,
   "config",
@@ -49,8 +77,14 @@ SAMPLE_SHEET_PATH <- file.path(
   "samples.csv"
 )
 
-QC_DECISION_PATH <- file.path(
+COHORT_CONFIG_DIR <- file.path(
   DATASET_CONFIG_DIR,
+  "cohorts",
+  COHORT_ID
+)
+
+QC_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
   "qc_thresholds.csv"
 )
 
@@ -58,8 +92,17 @@ OUTPUT_DIR <- file.path(
   PROJECT_DIR,
   "results",
   DATASET_VERSION,
-  "Ppar_iKO_multiome_stepwise"
+  "independent",
+  COHORT_ID
 )
+
+message(
+  "Active Multiome run: dataset=", DATASET_VERSION,
+  "; cohort=", COHORT_ID,
+  " (", COHORT_GROUP, ")",
+  "\nOutput directory: ", OUTPUT_DIR
+)
+
 # Expected R version on the ASU SOL Open OnDemand RStudio Server.
 EXPECTED_R_VERSION <- "4.4.2"
 

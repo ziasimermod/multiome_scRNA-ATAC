@@ -14,7 +14,7 @@ The goal is a readable analysis history that a lab member can follow in RStudio.
 
 - R/R Markdown code and documentation;
 - `config/datasets/<dataset_version>/samples.csv` for the current analysis;
-- reviewed `config/datasets/<dataset_version>/qc_thresholds.csv` and its decision notes;
+- reviewed `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv` and its decision notes;
 - future manual annotation worksheets;
 - small summary tables when they are intentionally part of the analysis record.
 
@@ -42,4 +42,3 @@ An analysis-changing decision should leave three records:
 1. the configuration or annotation file that stores the chosen value;
 2. a notebook or plot that supports the decision;
 3. a commit/PR message that explains why it changed.
-

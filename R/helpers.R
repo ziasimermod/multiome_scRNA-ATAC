@@ -233,7 +233,11 @@ save_run_information <- function(package_status = NULL) {
   invisible(allocation)
 }
 
-read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
+read_sample_sheet <- function(
+  path = SAMPLE_SHEET_PATH,
+  cohort_id = COHORT_ID,
+  expected_group = COHORT_GROUP
+) {
   assert_file(path, "sample sheet")
   sample_sheet <- suppressMessages(readr::read_csv(
     path,
@@ -243,10 +247,18 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
 
   required_columns <- c(
     "sample_id",
+    "cohort_id",
+    "group",
+    "run_id",
     "pool_id",
     "genotype",
+    "model_detail",
     "diet",
-    "outs_dir"
+    "outs_dir",
+    "mice_pooled",
+    "female_mice",
+    "male_mice",
+    "pooling_design"
   )
   missing_columns <- setdiff(required_columns, colnames(sample_sheet))
   if (length(missing_columns) > 0L) {
@@ -258,9 +270,87 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
   }
 
   sample_sheet <- as.data.frame(sample_sheet, stringsAsFactors = FALSE)
+
+  required_values <- c(
+    "sample_id",
+    "cohort_id",
+    "group",
+    "pool_id",
+    "genotype",
+    "model_detail",
+    "diet",
+    "outs_dir",
+    "pooling_design"
+  )
+  blank_required <- vapply(
+    required_values,
+    function(column_name) {
+      values <- trimws(as.character(sample_sheet[[column_name]]))
+      any(is.na(values) | values == "")
+    },
+    logical(1)
+  )
+  if (any(blank_required)) {
+    stop(
+      "The sample sheet contains missing required values in: ",
+      paste(required_values[blank_required], collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet$cohort_id <- tolower(trimws(sample_sheet$cohort_id))
+  sample_sheet$group <- toupper(trimws(sample_sheet$group))
+  sample_sheet$diet <- toupper(trimws(sample_sheet$diet))
+
   if (anyDuplicated(sample_sheet$sample_id)) {
     stop("Every sample_id must be unique.", call. = FALSE)
   }
+
+  available_cohorts <- sort(unique(sample_sheet$cohort_id))
+  if (!cohort_id %in% available_cohorts) {
+    stop(
+      "The selected cohort is absent from the sample sheet: ", cohort_id,
+      "\nAvailable cohorts: ",
+      paste(available_cohorts, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet <- sample_sheet[
+    sample_sheet$cohort_id == cohort_id,
+    ,
+    drop = FALSE
+  ]
+
+  expected_diets <- c("CON", "HFD")
+  diet_counts <- table(factor(sample_sheet$diet, levels = expected_diets))
+  if (nrow(sample_sheet) != 2L || any(diet_counts != 1L)) {
+    stop(
+      "Cohort ", cohort_id,
+      " must contain exactly one CON library and one HFD library.",
+      call. = FALSE
+    )
+  }
+
+  observed_groups <- unique(sample_sheet$group)
+  if (
+    length(observed_groups) != 1L ||
+    !identical(observed_groups, expected_group)
+  ) {
+    stop(
+      "Cohort ", cohort_id, " must use group label ", expected_group,
+      ". Observed: ", paste(observed_groups, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet <- sample_sheet[
+    match(expected_diets, sample_sheet$diet),
+    ,
+    drop = FALSE
+  ]
+  rownames(sample_sheet) <- NULL
+
   if (anyDuplicated(sample_sheet$pool_id)) {
     warning(
       "Repeated pool_id values indicate multiple libraries derived from ",
@@ -639,7 +729,7 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   if (!all(approved)) {
     stop(
       "QC is paused intentionally. Review the plots, then set approved=TRUE ",
-      "for every sample in the active dataset's qc_thresholds.csv and rerun this chunk.",
+      "for every sample in the active cohort's qc_thresholds.csv and rerun this chunk.",
       call. = FALSE
     )
   }

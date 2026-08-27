@@ -72,6 +72,16 @@ REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
 source(file.path(REPO_ROOT, "config", "project_config.R"))
 source(file.path(REPO_ROOT, "R", "helpers.R"))
 
+if (!identical(COHORT_ID, "ppar")) {
+  stop(
+    "Step 06 currently contains PPAR-specific cluster review scopes and ",
+    "annotation decisions. Complete Steps 00-05 for cohort '", COHORT_ID,
+    "', then establish and review cohort-specific Step 06 annotations ",
+    "before running this notebook.",
+    call. = FALSE
+  )
+}
+
 check_r_version()
 package_preflight()
 initialize_output_dirs()
@@ -112,7 +122,12 @@ cat("Configured future workers:", future::nbrOfWorkers(), "\n")
 
 # 2. Define Step 6 outputs and review parameters
 
-The annotation decision table is dataset-version specific. The notebook writes a proposal into the results directory, but the manually reviewed table belongs under `config/datasets/<dataset version>/` so that the decision is versioned with the analysis code.
+The current annotation decision table is dataset-version specific and has been
+reviewed only for the PPAR cohort. The notebook writes a proposal into the
+results directory, but the manually reviewed table belongs under
+`config/datasets/<dataset version>/` so that the decision is versioned with the
+analysis code. WT and IL17 annotations must be established from their own
+Step 05 cluster evidence rather than inheriting PPAR cluster numbers.
 
 The focused cluster sets below are **review scopes, not final labels**. They encode the hypotheses raised during Step 5 review and make those hypotheses easy to challenge with additional evidence.
 

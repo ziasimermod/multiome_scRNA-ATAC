@@ -31,6 +31,7 @@ flowchart TD
 
 - `config/project_config.R`
 - `config/datasets/<dataset_version>/samples.csv`
+- `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`
 - Cell Ranger ARC `outs/` directories
 - GRCm39 / GENCODE vM33 reference annotation
 
@@ -48,6 +49,7 @@ Expected records include:
 - `compute_environment.csv`
 - `sessionInfo.txt`
 - `sample_sheet_used.csv`
+- `run_configuration.csv`
 - `cellranger_input_report.csv`
 - `GRCm39_GENCODE_vM33_gene_annotation.rds`
 - `STEP_00_COMPLETE.txt`
@@ -58,15 +60,10 @@ Are the expected files, software environment, sample metadata, genome build, and
 
 ### Experimental-design limitation
 
-The CON library contains colon epithelial cells pooled from 6 mice:
-
-- 2 female
-- 4 male
-
-The HFD library contains colon epithelial cells pooled from 10 mice:
-
-- 2 female
-- 8 male
+Every current cohort contains one pooled CON library and one pooled HFD
+library. The PPAR manifest records 6 mice (2 female, 4 male) in CON and 10 mice
+(2 female, 8 male) in HFD. WT and IL17 pooling counts remain `NA` pending
+wet-lab confirmation.
 
 Individual mouse identities are not recoverable after pooling. Therefore, pooled-library identity and diet condition are completely confounded.
 
@@ -132,7 +129,7 @@ Step 1 calculates QC metrics and provides starting threshold suggestions. Those 
 - Step 1 QC checkpoints
 - Step 1 QC tables
 - Step 1 QC plots
-- reviewed `config/datasets/<dataset_version>/qc_thresholds.csv`
+- reviewed `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`
 
 ### Main operations
 
@@ -175,7 +172,7 @@ Completion marker:
 
 ### Decision point
 
-Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/datasets/<dataset_version>/qc_thresholds.csv`.
+Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`.
 
 ---
 

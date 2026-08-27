@@ -56,7 +56,7 @@ Do not delete the whole R library.
 
 ## The notebook stops because `approved=FALSE`
 
-That is an analysis gate, not a code error. Step 2 refuses to filter cells until every sample has complete numeric thresholds and `approved=TRUE` in `config/datasets/<dataset_version>/qc_thresholds.csv`. Review the plots, document the decision, save the CSV, and rerun the approval chunk.
+That is an analysis gate, not a code error. Step 2 refuses to filter cells until every sample in the active cohort has complete numeric thresholds and `approved=TRUE` in `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`. Review the plots, document the decision, save the CSV, and rerun the approval chunk.
 
 ## An RStudio session runs out of memory
 
@@ -74,4 +74,3 @@ Find the first earlier error. For example, if common-peak parsing fails before `
 ## A checkpoint exists but lacks required metadata
 
 The code checks expected assays and metadata before reuse. If it reports that an old checkpoint lacks a newer field, set the notebook's reuse flag to `FALSE` for that stage and rebuild from the previous documented checkpoint. Do not manually add blank metadata merely to bypass the check.
-
