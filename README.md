@@ -30,9 +30,10 @@ Each numbered notebook has one job, reads documented inputs or completed checkpo
 | 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | PPAR complete; WT/IL17 require cohort-specific review |
 | 7 | composition/pseudobulk workflow | Descriptive composition summaries and preparation of pseudobulk-ready downstream matrices | Planned |
 
-The PPAR development run is complete through Step 6. Steps 00-05 are shared
-across cohorts; Step 06 remains guarded against reusing PPAR cluster numbers
-for WT or IL17 before their annotations are independently reviewed.
+The PPAR development run is complete through Step 6. Steps 00-06 use shared
+code, but clustering and annotation decisions are stored separately for every
+dataset/cohort combination. WT and IL17 therefore generate their own Step 6
+proposals and cannot inherit PPAR cluster-number labels.
 
 ## The short answer to "Is Multiome QC separate or together?"
 
@@ -67,6 +68,24 @@ RNA PCs and ATAC LSI dimensions are then combined using Seurat weighted nearest 
 7. Open the numbered notebooks under `analysis/` and run them in order, one chunk at a time.
 8. Restart R between major notebooks when appropriate to release memory.
 
+For example, select the WT resequenced cohort in a fresh R session with:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+
+Sys.getenv(c(
+  "MULTIOME_DATASET_VERSION",
+  "MULTIOME_COHORT_ID"
+))
+```
+
+Valid v2 cohort IDs are `ppar`, `wt`, and `il17`; v1 contains only `ppar`.
+Environment selections are session-specific, so set and confirm them again
+after restarting R.
+
 The current project-specific data location is configured in `config/project_config.R`:
 
 ```text
@@ -79,6 +98,13 @@ Reviewed QC decisions are cohort-specific:
 
 ```text
 config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv
+```
+
+Reviewed clustering and annotation decisions use the same cohort directory:
+
+```text
+config/datasets/<dataset_version>/cohorts/<cohort_id>/clustering_decision.csv
+config/datasets/<dataset_version>/cohorts/<cohort_id>/cell_state_annotations.csv
 ```
 
 ## What belongs in GitHub

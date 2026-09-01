@@ -120,6 +120,21 @@ STEP5_DIR <- file.path(OUTPUT_DIR, "05_wnn")
 
 STEP5_PLOT_DIR <- file.path(STEP5_DIR, "plots")
 
+step5_review_object_path <- file.path(
+  STEP5_DIR,
+  "multiome_WNN_resolution_grid.rds"
+)
+
+legacy_step5_review_object_path <- file.path(
+  STEP5_DIR,
+  "Ppar_iKO_multiome_WNN_resolution_grid.rds"
+)
+
+step5_final_object_path <- file.path(
+  STEP5_DIR,
+  "multiome_WNN_clustered.rds"
+)
+
 dir.create(STEP5_DIR, recursive = TRUE, showWarnings = FALSE)
 
 dir.create(STEP5_PLOT_DIR,
@@ -132,15 +147,7 @@ WNN_K <- 20L
 
 CLUSTER_RESOLUTIONS <- c(0.2, 0.4, 0.6, 0.8, 1.0)
 
-resolution_column <- function(resolution) {
-  paste0("wnn_res_",
-         format(
-           resolution,
-           trim = TRUE,
-           scientific = FALSE,
-           nsmall = 1
-         ))
-}
+resolution_column <- wnn_resolution_column
 
 step5_parameters <- data.frame(
   parameter = c(
@@ -780,11 +787,6 @@ readr::write_csv(
   )
 )
 
-step5_review_object_path <- file.path(
-  STEP5_DIR,
-  "Ppar_iKO_multiome_WNN_resolution_grid.rds"
-)
-
 saveRDS(
   merged,
   step5_review_object_path,
@@ -821,6 +823,10 @@ writeLines(
       "Resolution grid:",
       paste(CLUSTER_RESOLUTIONS, collapse = ",")
     ),
+    paste(
+      "Clustering decision table:",
+      CLUSTERING_DECISION_PATH
+    ),
     "Final clustering resolution approved: FALSE"
   ),
   file.path(
@@ -828,6 +834,15 @@ writeLines(
     "STEP_05_READY_FOR_CLUSTER_REVIEW.txt"
   )
 )
+
+clustering_template_created <- write_clustering_decision_template()
+
+if (isTRUE(clustering_template_created)) {
+  message(
+    "Created an unapproved clustering decision template: ",
+    CLUSTERING_DECISION_PATH
+  )
+}
 ```
 
 # STOP HERE FOR THE MANUAL RESOLUTION REVIEW
@@ -842,17 +857,56 @@ Before continuing, inspect:
 6. whether increasing resolution is separating visibly coherent states or only
    fragmenting continuous structures.
 
-Then discuss the candidate resolutions before setting `CHOSEN_RESOLUTION` below.
+Then record the reviewed resolution in the active cohort's
+`clustering_decision.csv`. The decision table is the auditable checkpoint;
+the notebook does not contain a cohort-independent default resolution.
 
 ---
 
 # 9. Choose one clustering resolution after review
 
-Do **not** edit this value until the resolution-grid checkpoint has been
-reviewed. Leaving it as `NA_real_` intentionally stops the notebook here.
+This chunk validates the versioned cohort decision before applying it. In a
+fresh R session, it reloads the saved resolution-grid object automatically;
+there is no need to rebuild WNN simply to finalize a reviewed resolution.
 
 ```{r choose-resolution}
-CHOSEN_RESOLUTION <- 0.8
+if (!exists("merged", inherits = FALSE)) {
+  review_checkpoint_candidates <- c(
+    step5_review_object_path,
+    legacy_step5_review_object_path
+  )
+
+  available_review_checkpoints <- review_checkpoint_candidates[
+    file.exists(review_checkpoint_candidates)
+  ]
+
+  if (length(available_review_checkpoints) == 0L) {
+    stop(
+      "No Step 5 resolution-grid checkpoint was found. Run through Step 8 ",
+      "before validating the clustering decision.",
+      call. = FALSE
+    )
+  }
+
+  checkpoint_to_load <- available_review_checkpoints[[1]]
+
+  if (identical(checkpoint_to_load, legacy_step5_review_object_path)) {
+    message(
+      "Loading legacy-named resolution-grid checkpoint: ",
+      checkpoint_to_load
+    )
+  }
+
+  merged <- readRDS(checkpoint_to_load)
+}
+
+clustering_decision <- read_and_validate_clustering_decision(
+  available_resolutions = CLUSTER_RESOLUTIONS,
+  metadata_columns = colnames(merged[[]])
+)
+
+CHOSEN_RESOLUTION <- clustering_decision$resolution[[1]]
+CHOSEN_CLUSTER_COLUMN <- clustering_decision$cluster_column[[1]]
 
 if (
   length(CHOSEN_RESOLUTION) != 1L ||
@@ -861,16 +915,12 @@ if (
 ) {
   stop(
     paste0(
-      "Manual checkpoint: choose one reviewed value from CLUSTER_RESOLUTIONS ",
-      "and assign it to CHOSEN_RESOLUTION before continuing."
+      "The approved clustering resolution must match one value in ",
+      "CLUSTER_RESOLUTIONS."
     ),
     call. = FALSE
   )
 }
-
-CHOSEN_CLUSTER_COLUMN <- resolution_column(
-  CHOSEN_RESOLUTION
-)
 
 Idents(merged) <- merged[[]][[
   CHOSEN_CLUSTER_COLUMN
@@ -1191,11 +1241,6 @@ readr::write_csv(
   )
 )
 
-step5_final_object_path <- file.path(
-  STEP5_DIR,
-  "Ppar_iKO_multiome_WNN_clustered.rds"
-)
-
 DefaultAssay(merged) <- "RNA"
 
 saveRDS(
@@ -1247,6 +1292,18 @@ writeLines(
     paste(
       "Chosen cluster column:",
       CHOSEN_CLUSTER_COLUMN
+    ),
+    paste(
+      "Clustering decision table:",
+      CLUSTERING_DECISION_PATH
+    ),
+    paste(
+      "Clustering decision reviewer:",
+      clustering_decision$reviewer[[1]]
+    ),
+    paste(
+      "Clustering decision review date:",
+      clustering_decision$review_date[[1]]
     ),
     paste(
       "Clusters:",

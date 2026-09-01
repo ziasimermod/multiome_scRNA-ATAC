@@ -88,6 +88,16 @@ QC_DECISION_PATH <- file.path(
   "qc_thresholds.csv"
 )
 
+CLUSTERING_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
+  "clustering_decision.csv"
+)
+
+ANNOTATION_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
+  "cell_state_annotations.csv"
+)
+
 OUTPUT_DIR <- file.path(
   PROJECT_DIR,
   "results",

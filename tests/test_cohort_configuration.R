@@ -68,6 +68,15 @@ load_case <- function(dataset_version, cohort_id) {
     stringsAsFactors = FALSE
   )
 
+  expected_cohort_config_dir <- file.path(
+    REPO_ROOT,
+    "config",
+    "datasets",
+    dataset_version,
+    "cohorts",
+    cohort_id
+  )
+
   stopifnot(
     nrow(sample_sheet) == 2L,
     identical(sample_sheet$diet, c("CON", "HFD")),
@@ -76,7 +85,20 @@ load_case <- function(dataset_version, cohort_id) {
       sort(sample_sheet$sample_id),
       sort(qc_decisions$sample_id)
     ),
-    file.exists(test_environment$QC_DECISION_PATH)
+    file.exists(test_environment$QC_DECISION_PATH),
+    file.exists(test_environment$CLUSTERING_DECISION_PATH),
+    identical(
+      test_environment$COHORT_CONFIG_DIR,
+      expected_cohort_config_dir
+    ),
+    identical(
+      test_environment$CLUSTERING_DECISION_PATH,
+      file.path(expected_cohort_config_dir, "clustering_decision.csv")
+    ),
+    identical(
+      test_environment$ANNOTATION_DECISION_PATH,
+      file.path(expected_cohort_config_dir, "cell_state_annotations.csv")
+    )
   )
 
   c(
@@ -100,6 +122,35 @@ results <- lapply(valid_cases, function(case) {
 
 output_directories <- vapply(results, `[[`, character(1), "output_dir")
 stopifnot(anyDuplicated(output_directories) == 0L)
+
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+
+wt_environment <- new.env(parent = globalenv())
+wt_environment$REPO_ROOT <- REPO_ROOT
+sys.source(
+  file.path(REPO_ROOT, "config", "project_config.R"),
+  envir = wt_environment
+)
+sys.source(
+  file.path(REPO_ROOT, "R", "helpers.R"),
+  envir = wt_environment
+)
+
+wt_clustering_decision <-
+  wt_environment$read_and_validate_clustering_decision(
+    available_resolutions = c(0.2, 0.4, 0.6, 0.8, 1.0),
+    metadata_columns = c("wnn_res_0.8")
+  )
+
+stopifnot(
+  identical(wt_clustering_decision$cohort_id, "wt"),
+  identical(wt_clustering_decision$resolution, 0.8),
+  identical(wt_clustering_decision$cluster_column, "wnn_res_0.8"),
+  isTRUE(wt_clustering_decision$approved)
+)
 
 expect_configuration_error <- function(dataset_version, cohort_id) {
   error_seen <- FALSE

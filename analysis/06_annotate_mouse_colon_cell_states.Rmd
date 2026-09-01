@@ -17,14 +17,15 @@ the Mesothelial marker vector.
 
 # The goal of this notebook
 
-Step 5 converted the RNA and ATAC representations into a weighted nearest-neighbor graph and selected resolution 0.8 after manual review. That resolution produced 27 computational clusters. Step 6 asks a different
-question:
+Step 5 converted the RNA and ATAC representations into a weighted
+nearest-neighbor graph and recorded a manually reviewed, cohort-specific
+clustering resolution. Step 6 asks a different question:
 **what biological compartment or cell state is supported for each cluster?**
 
 This notebook deliberately separates evidence generation from label approval. It will:
 
 1. load and validate the finalized Step 5 object and its recorded clustering decision;
-2. inventory all 27 WNN clusters and their descriptive library composition;
+2. inventory all WNN clusters and their descriptive library composition;
 3. discover positive RNA markers without treating a single gene as sufficient evidence;
 4. audit broad epithelial, immune, vascular, stromal, and neural programs;
 5. resolve epithelial states, including absorptive, goblet, Reg4-positive deep crypt secretory, enteroendocrine, and tuft programs;
@@ -72,16 +73,6 @@ REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
 source(file.path(REPO_ROOT, "config", "project_config.R"))
 source(file.path(REPO_ROOT, "R", "helpers.R"))
 
-if (!identical(COHORT_ID, "ppar")) {
-  stop(
-    "Step 06 currently contains PPAR-specific cluster review scopes and ",
-    "annotation decisions. Complete Steps 00-05 for cohort '", COHORT_ID,
-    "', then establish and review cohort-specific Step 06 annotations ",
-    "before running this notebook.",
-    call. = FALSE
-  )
-}
-
 check_r_version()
 package_preflight()
 initialize_output_dirs()
@@ -122,14 +113,15 @@ cat("Configured future workers:", future::nbrOfWorkers(), "\n")
 
 # 2. Define Step 6 outputs and review parameters
 
-The current annotation decision table is dataset-version specific and has been
-reviewed only for the PPAR cohort. The notebook writes a proposal into the
-results directory, but the manually reviewed table belongs under
-`config/datasets/<dataset version>/` so that the decision is versioned with the
-analysis code. WT and IL17 annotations must be established from their own
-Step 05 cluster evidence rather than inheriting PPAR cluster numbers.
+The notebook writes a proposal into the results directory, but each manually
+reviewed annotation table belongs under
+`config/datasets/<dataset version>/cohorts/<cohort>/` so that biological labels
+are versioned without being transferred between cohorts.
 
-The focused cluster sets below are **review scopes, not final labels**. They encode the hypotheses raised during Step 5 review and make those hypotheses easy to challenge with additional evidence.
+The original PPAR analysis includes focused cluster-review scopes developed
+during its Step 5 review. Those scopes are **not final labels** and are used
+only for PPAR. WT and IL17 begin with cohort-neutral marker discovery and no
+inherited cluster-number hypotheses.
 
 ```{r step-six-parameters}
 STEP5_DIR <- file.path(OUTPUT_DIR, "05_wnn")
@@ -137,14 +129,24 @@ STEP6_DIR <- file.path(OUTPUT_DIR, "06_annotation")
 STEP6_PLOT_DIR <- file.path(STEP6_DIR, "plots")
 STEP6_MARKER_DIR <- file.path(STEP6_DIR, "markers")
 
+step5_object_path <- file.path(
+  STEP5_DIR,
+  "multiome_WNN_clustered.rds"
+)
+
+legacy_step5_object_path <- file.path(
+  STEP5_DIR,
+  "Ppar_iKO_multiome_WNN_clustered.rds"
+)
+
+step6_object_path <- file.path(
+  STEP6_DIR,
+  "multiome_annotated.rds"
+)
+
 dir.create(STEP6_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(STEP6_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(STEP6_MARKER_DIR, recursive = TRUE, showWarnings = FALSE)
-
-ANNOTATION_DECISION_PATH <- file.path(
-  DATASET_CONFIG_DIR,
-  "cell_state_annotations.csv"
-)
 
 ANNOTATION_PROPOSAL_PATH <- file.path(
   STEP6_DIR,
@@ -163,22 +165,62 @@ MIN_MARKER_PCT <- 0.10
 MIN_MARKER_LOG2FC <- 0.25
 TOP_MARKERS_PER_CLUSTER <- 15L
 
-CRYPT_REVIEW_CLUSTERS <- c("2", "3", "6", "19")
+if (
+  identical(DATASET_VERSION, "v2_resequenced") &&
+    identical(COHORT_ID, "ppar")
+) {
+  CRYPT_REVIEW_CLUSTERS <- c("2", "3", "6", "19")
 
-EPITHELIAL_REVIEW_CLUSTERS <- c(
-  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-  "11", "13", "14", "15", "17", "19", "20", "21", "26"
-)
+  EPITHELIAL_REVIEW_CLUSTERS <- c(
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "11", "13", "14", "15", "17", "19", "20", "21", "26"
+  )
 
-NON_EPITHELIAL_REVIEW_CLUSTERS <- c(
-  "10", "12", "16", "18", "22", "23", "24", "25"
-)
+  NON_EPITHELIAL_REVIEW_CLUSTERS <- c(
+    "10", "12", "16", "18", "22", "23", "24", "25"
+  )
 
-LOW_CONFIDENCE_REVIEW_CLUSTERS <- c(
-  "0", "20", "21"
-)
+  LOW_CONFIDENCE_REVIEW_CLUSTERS <- c("0", "20", "21")
 
-RUN_TARGETED_ATAC_COVERAGE <- TRUE
+  REVIEW_HINT_LOOKUP <- c(
+    `0` = "low-complexity crypt epithelial candidate; review QC before labeling",
+    `1` = "immature goblet/secretory candidate",
+    `2` = "crypt progenitor/ISC-adjacent candidate",
+    `3` = "cycling ISC/early progenitor candidate",
+    `4` = "mature colonocyte candidate; strongly library-skewed",
+    `5` = "goblet candidate",
+    `6` = "ISC-like candidate with minimal canonical cycling-marker detection",
+    `7` = "absorptive/colonocyte candidate",
+    `8` = "mature colonocyte candidate; strongly library-skewed",
+    `9` = "absorptive/colonocyte candidate",
+    `10` = "T/NK lymphoid candidate",
+    `11` = "absorptive epithelial candidate",
+    `12` = "smooth-muscle candidate",
+    `13` = "Reg4-positive deep crypt secretory candidate",
+    `14` = "enterochromaffin-like EEC candidate",
+    `15` = "absorptive progenitor candidate; strongly library-skewed",
+    `16` = "MHC-II-high macrophage candidate; confirm C1q/Apoe/Ms4a7/Adgre1/Csf1r program",
+    `17` = "Pyy/Gcg-positive L-cell candidate",
+    `18` = "B-cell candidate",
+    `19` = "cycling secretory progenitor candidate",
+    `20` = "small goblet/secretory candidate; review low-complexity evidence",
+    `21` = "stress/inflammatory colonocyte candidate; strongly library-skewed",
+    `22` = "plasmacytoid dendritic-cell candidate",
+    `23` = "mast-cell candidate supported by Mcpt1/Mcpt2/Cpa3/Ms4a2/Kit",
+    `24` = "ECM-rich mesothelial candidate; Rspo1 is not lineage-specific and MMT is not established",
+    `25` = "lymphatic endothelial candidate",
+    `26` = "tuft candidate"
+  )
+} else {
+  CRYPT_REVIEW_CLUSTERS <- character()
+  EPITHELIAL_REVIEW_CLUSTERS <- character()
+  NON_EPITHELIAL_REVIEW_CLUSTERS <- character()
+  LOW_CONFIDENCE_REVIEW_CLUSTERS <- character()
+  REVIEW_HINT_LOOKUP <- stats::setNames(character(), character())
+}
+
+RUN_FOCUSED_CRYPT_REVIEW <- length(CRYPT_REVIEW_CLUSTERS) >= 2L
+RUN_TARGETED_ATAC_COVERAGE <- RUN_FOCUSED_CRYPT_REVIEW
 
 step6_parameters <- data.frame(
   parameter = c(
@@ -187,6 +229,7 @@ step6_parameters <- data.frame(
     "top markers retained per cluster",
     "historical d21 marker reference",
     "historical reference ranked-list cutoffs",
+    "v2 PPAR-focused crypt review enabled",
     "targeted ATAC coverage enabled"
   ),
   value = c(
@@ -195,6 +238,7 @@ step6_parameters <- data.frame(
     TOP_MARKERS_PER_CLUSTER,
     HISTORICAL_D21_REFERENCE_PATH,
     paste(HISTORICAL_REFERENCE_TOP_N, collapse = ","),
+    RUN_FOCUSED_CRYPT_REVIEW,
     RUN_TARGETED_ATAC_COVERAGE
   )
 )
@@ -212,13 +256,30 @@ step5_complete_marker <- file.path(
   "STEP_05_COMPLETE.txt"
 )
 
-step5_object_path <- file.path(
-  STEP5_DIR,
-  "Ppar_iKO_multiome_WNN_clustered.rds"
+assert_file(step5_complete_marker, "Step 5 completion marker")
+
+step5_object_candidates <- c(
+  step5_object_path,
+  legacy_step5_object_path
 )
 
-assert_file(step5_complete_marker, "Step 5 completion marker")
-assert_file(step5_object_path, "Step 5 finalized WNN object")
+available_step5_objects <- step5_object_candidates[
+  file.exists(step5_object_candidates)
+]
+
+if (length(available_step5_objects) == 0L) {
+  stop(
+    "No finalized Step 5 WNN object was found. Expected: ",
+    paste(step5_object_candidates, collapse = " or "),
+    call. = FALSE
+  )
+}
+
+step5_object_path <- available_step5_objects[[1]]
+
+if (identical(step5_object_path, legacy_step5_object_path)) {
+  message("Loading legacy-named Step 5 object: ", step5_object_path)
+}
 
 step5_marker_lines <- readLines(step5_complete_marker)
 
@@ -312,6 +373,26 @@ if (length(missing_metadata_columns) > 0L) {
   stop(
     "Step 5 object is missing metadata column(s): ",
     paste(missing_metadata_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+clustering_decision <- read_and_validate_clustering_decision(
+  metadata_columns = colnames(multiome[[]])
+)
+
+if (
+  !isTRUE(all.equal(
+    CHOSEN_RESOLUTION,
+    clustering_decision$resolution[[1]]
+  )) ||
+    !identical(
+      CHOSEN_CLUSTER_COLUMN,
+      clustering_decision$cluster_column[[1]]
+    )
+) {
+  stop(
+    "The Step 5 completion marker and cohort clustering decision disagree.",
     call. = FALSE
   )
 }
@@ -1265,7 +1346,14 @@ if (length(detected_sex_markers) > 0L) {
 
 # 10. Focused crypt-cluster adjudication
 
-Step 5 and the first Step 6 evidence pass suggested four related but distinct hypotheses:
+This optional section preserves the focused review performed for the PPAR
+cohort. It is skipped for WT and IL17 so that their cluster numbers are not
+assigned PPAR-derived hypotheses. Their general marker, lineage-program, and
+historical-reference evidence still runs and produces a cohort-specific
+annotation proposal.
+
+For PPAR, Step 5 and the first Step 6 evidence pass suggested four related but
+distinct hypotheses:
 
 - cluster 2: crypt progenitor or ISC-adjacent state;
 - cluster 3: cycling ISC or early transit-amplifying state;
@@ -1276,7 +1364,8 @@ Those names remain hypotheses. The following analyses test whether the four clus
 
 ## Focused RNA marker programs
 
-```{r focused-crypt-dotplot, fig.width=16, fig.height=7}
+```{r focused-crypt-dotplot, fig.width=16, fig.height=7, eval=RUN_FOCUSED_CRYPT_REVIEW}
+if (isTRUE(RUN_FOCUSED_CRYPT_REVIEW)) {
 crypt_programs <- list(
   Crypt_progenitor = c("Cftr", "Htr4", "Slc12a2", "Fut9", "Pde3a"),
   Stem_Wnt = c("Lgr5", "Ascl2", "Smoc2", "Axin2", "Lrig1", "Ephb2"),
@@ -1325,13 +1414,17 @@ ggplot2::ggsave(
   width = 16,
   height = 7
 )
+} else {
+  message("Skipping the PPAR-specific focused crypt DotPlot for ", COHORT_ID, ".")
+}
 ```
 
 ## Per-nucleus marker co-detection
 
 Unlike scaled cluster averages, this table asks whether marker programs are co-detected in the same nucleus. These thresholds are transparent descriptive rules; they are not trained classifiers.
 
-```{r crypt-codetection}
+```{r crypt-codetection, eval=RUN_FOCUSED_CRYPT_REVIEW}
+if (isTRUE(RUN_FOCUSED_CRYPT_REVIEW)) {
 crypt_counts <- SeuratObject::GetAssayData(
   crypt_review_object,
   assay = "RNA",
@@ -1549,11 +1642,15 @@ ggplot2::ggsave(
   width = 13,
   height = 8
 )
+} else {
+  message("Skipping PPAR-specific crypt co-detection for ", COHORT_ID, ".")
+}
 ```
 
 ## Pairwise RNA contrasts
 
-```{r pairwise-crypt-markers, cache=FALSE}
+```{r pairwise-crypt-markers, cache=FALSE, eval=RUN_FOCUSED_CRYPT_REVIEW}
+if (isTRUE(RUN_FOCUSED_CRYPT_REVIEW)) {
 future::plan(future::sequential)
 
 crypt_cluster_pairs <- combn(
@@ -1621,11 +1718,15 @@ pairwise_crypt_markers |>
   ) |>
   dplyr::slice_head(n = 15) |>
   dplyr::ungroup()
+} else {
+  message("Skipping PPAR-specific pairwise crypt markers for ", COHORT_ID, ".")
+}
 ```
 
 ## Cell-cycle context without regression
 
-```{r crypt-cell-cycle}
+```{r crypt-cell-cycle, eval=RUN_FOCUSED_CRYPT_REVIEW}
+if (isTRUE(RUN_FOCUSED_CRYPT_REVIEW)) {
 mouse_s_features <- unique(
   stats::na.omit(
     unname(
@@ -1778,13 +1879,17 @@ ggplot2::ggsave(
   width = 11,
   height = 6
 )
+} else {
+  message("Skipping PPAR-specific crypt cell-cycle review for ", COHORT_ID, ".")
+}
 ```
 
 ## Cross-library RNA consistency
 
 The following summary uses log-normalized RNA values. It asks whether the direction of a marker program is visible in both pooled libraries; it does not test a diet effect.
 
-```{r crypt-cross-library-expression}
+```{r crypt-cross-library-expression, eval=RUN_FOCUSED_CRYPT_REVIEW}
+if (isTRUE(RUN_FOCUSED_CRYPT_REVIEW)) {
 crypt_review_genes <- unique(
   c(
     "Cftr", "Htr4", "Slc12a2", "Lgr5", "Ascl2", "Smoc2", "Mki67", "Top2a",
@@ -1913,6 +2018,9 @@ ggplot2::ggsave(
 
 rm(rna_data)
 invisible(gc())
+} else {
+  message("Skipping PPAR-specific crypt library comparison for ", COHORT_ID, ".")
+}
 ```
 
 ## Focused RNA expression on the WNN embedding
@@ -1954,6 +2062,7 @@ ggplot2::ggsave(
 Coverage plots are not used as an automatic classifier. They provide a multimodal check that RNA-supported differences are accompanied by plausible accessibility near lineage-defining loci. Tracks are split by WNN cluster and pooled library.
 
 ```{r targeted-crypt-atac-coverage, cache=FALSE, eval=RUN_TARGETED_ATAC_COVERAGE}
+if (isTRUE(RUN_TARGETED_ATAC_COVERAGE)) {
 targeted_crypt_loci <- c(
   "Lgr5", "Ascl2", "Smoc2", "Atoh1", "Muc2", "Reg4", "Kit"
 )
@@ -2105,6 +2214,9 @@ grDevices::dev.off()
 
 rm(coverage_object, fragment_objects, atac_annotation)
 invisible(gc())
+} else {
+  message("Skipping PPAR-specific targeted ATAC coverage for ", COHORT_ID, ".")
+}
 ```
 
 # 12. Validate continuity with the historical d21 scRNA-seq analysis
@@ -2663,7 +2775,8 @@ config path, then complete one row per WNN cluster.
 Required decision fields are:
 
 - `broad_compartment`: epithelial, immune, stromal, vascular, neural, or an explicit unresolved category;
-- `cell_state`: the final biological label to store per nucleus;
+- `cell_state`: the compact biological label used in plots and legends;
+- `cell_state_full`: the complete descriptive biological label stored per nucleus;
 - `annotation_confidence`: `high`, `moderate`, or `low`;
 - `evidence_summary`: concise multi-gene and/or ATAC justification; and
 - `approved`: `TRUE` only after manual review.
@@ -2677,36 +2790,6 @@ top_marker_strings <- top_cluster_markers |>
     .groups = "drop"
   )
 
-review_hint_lookup <- c(
-  `0` = "low-complexity crypt epithelial candidate; review QC before labeling",
-  `1` = "immature goblet/secretory candidate",
-  `2` = "crypt progenitor/ISC-adjacent candidate",
-  `3` = "cycling ISC/early progenitor candidate",
-  `4` = "mature colonocyte candidate; strongly library-skewed",
-  `5` = "goblet candidate",
-  `6` = "ISC-like candidate with minimal canonical cycling-marker detection",
-  `7` = "absorptive/colonocyte candidate",
-  `8` = "mature colonocyte candidate; strongly library-skewed",
-  `9` = "absorptive/colonocyte candidate",
-  `10` = "T/NK lymphoid candidate",
-  `11` = "absorptive epithelial candidate",
-  `12` = "smooth-muscle candidate",
-  `13` = "Reg4-positive deep crypt secretory candidate",
-  `14` = "enterochromaffin-like EEC candidate",
-  `15` = "absorptive progenitor candidate; strongly library-skewed",
-  `16` = "MHC-II-high macrophage candidate; confirm C1q/Apoe/Ms4a7/Adgre1/Csf1r program",
-  `17` = "Pyy/Gcg-positive L-cell candidate",
-  `18` = "B-cell candidate",
-  `19` = "cycling secretory progenitor candidate",
-  `20` = "small goblet/secretory candidate; review low-complexity evidence",
-  `21` = "stress/inflammatory colonocyte candidate; strongly library-skewed",
-  `22` = "plasmacytoid dendritic-cell candidate",
-  `23` = "mast-cell candidate supported by Mcpt1/Mcpt2/Cpa3/Ms4a2/Kit",
-  `24` = "ECM-rich mesothelial candidate; Rspo1 is not lineage-specific and MMT is not established",
-  `25` = "lymphatic endothelial candidate",
-  `26` = "tuft candidate"
-)
-
 annotation_proposal <- cluster_inventory |>
   dplyr::mutate(cluster = as.character(cluster)) |>
   dplyr::left_join(top_marker_strings, by = "cluster") |>
@@ -2719,7 +2802,7 @@ annotation_proposal <- cluster_inventory |>
       cluster %in% NON_EPITHELIAL_REVIEW_CLUSTERS ~ "non_epithelial_review",
       TRUE ~ "standard_review"
     ),
-    review_hint = unname(review_hint_lookup[cluster]),
+    review_hint = unname(REVIEW_HINT_LOOKUP[cluster]),
     review_hint = dplyr::if_else(
       is.na(review_hint),
       "no preassigned hypothesis",
@@ -2727,6 +2810,7 @@ annotation_proposal <- cluster_inventory |>
     ),
     broad_compartment = NA_character_,
     cell_state = NA_character_,
+    cell_state_full = NA_character_,
     annotation_confidence = NA_character_,
     evidence_summary = NA_character_,
     approved = FALSE
@@ -2770,10 +2854,22 @@ annotation_decisions <- suppressMessages(
   )
 )
 
+if (
+  "cell_state" %in% colnames(annotation_decisions) &&
+    !"cell_state_full" %in% colnames(annotation_decisions)
+) {
+  message(
+    "Legacy annotation table detected without cell_state_full; ",
+    "using cell_state as the full biological label."
+  )
+  annotation_decisions$cell_state_full <- annotation_decisions$cell_state
+}
+
 required_decision_columns <- c(
   "cluster",
   "broad_compartment",
   "cell_state",
+  "cell_state_full",
   "annotation_confidence",
   "evidence_summary",
   "approved"
@@ -2814,6 +2910,7 @@ annotation_decisions <- annotation_decisions[
 decision_text_columns <- c(
   "broad_compartment",
   "cell_state",
+  "cell_state_full",
   "annotation_confidence",
   "evidence_summary"
 )
@@ -2876,7 +2973,7 @@ annotation_decisions
 
 # 15. Apply approved labels
 
-Numeric WNN cluster identities are preserved in `wnn_cluster`. The final biological label is stored separately in `cell_state`, and `cell_state_cluster` keeps one-to-one traceability when multiple clusters share the same state label.
+Numeric WNN cluster identities are preserved in `wnn_cluster`. The compact display label is stored in `cell_state`, the complete biological name is stored in `cell_state_full`, and `cell_state_cluster` keeps one-to-one traceability when multiple clusters share the same state label.
 
 ```{r apply-approved-labels}
 cluster_key <- as.character(multiome$wnn_cluster)
@@ -2888,6 +2985,11 @@ broad_compartment_lookup <- stats::setNames(
 
 cell_state_lookup <- stats::setNames(
   annotation_decisions$cell_state,
+  annotation_decisions$cluster
+)
+
+cell_state_full_lookup <- stats::setNames(
+  annotation_decisions$cell_state_full,
   annotation_decisions$cluster
 )
 
@@ -2907,6 +3009,10 @@ multiome$broad_compartment <- unname(
 
 multiome$cell_state <- unname(cell_state_lookup[cluster_key])
 
+multiome$cell_state_full <- unname(
+  cell_state_full_lookup[cluster_key]
+)
+
 multiome$annotation_confidence <- unname(
   confidence_lookup[cluster_key]
 )
@@ -2924,6 +3030,7 @@ multiome$cell_state_cluster <- paste0(
 applied_annotation_columns <- c(
   "broad_compartment",
   "cell_state",
+  "cell_state_full",
   "annotation_confidence",
   "annotation_evidence",
   "cell_state_cluster"
@@ -2951,6 +3058,11 @@ multiome$cell_state <- factor(
   levels = unique(annotation_decisions$cell_state)
 )
 
+multiome$cell_state_full <- factor(
+  multiome$cell_state_full,
+  levels = unique(annotation_decisions$cell_state_full)
+)
+
 multiome$annotation_confidence <- factor(
   multiome$annotation_confidence,
   levels = c("high", "moderate", "low")
@@ -2975,12 +3087,14 @@ annotation_application_summary <- multiome[[]] |>
     wnn_cluster = as.character(wnn_cluster),
     broad_compartment = as.character(broad_compartment),
     cell_state = as.character(cell_state),
+    cell_state_full = as.character(cell_state_full),
     annotation_confidence = as.character(annotation_confidence)
   ) |>
   dplyr::count(
     wnn_cluster,
     broad_compartment,
     cell_state,
+    cell_state_full,
     annotation_confidence,
     name = "nuclei"
   ) |>
@@ -3133,11 +3247,6 @@ ggplot2::ggsave(
 DefaultAssay(multiome) <- "RNA"
 Idents(multiome) <- "cell_state"
 
-step6_object_path <- file.path(
-  STEP6_DIR,
-  "Ppar_iKO_multiome_annotated.rds"
-)
-
 saveRDS(multiome, step6_object_path, compress = FALSE)
 
 step6_object_info <- data.frame(
@@ -3167,6 +3276,7 @@ writeLines(
     paste("Cells:", ncol(multiome)),
     paste("Chosen clustering resolution:", CHOSEN_RESOLUTION),
     paste("Chosen cluster column:", CHOSEN_CLUSTER_COLUMN),
+    paste("Clustering decision table:", CLUSTERING_DECISION_PATH),
     paste("WNN clusters:", length(cluster_levels)),
     paste("Broad compartments:", nlevels(multiome$broad_compartment)),
     paste("Cell states:", nlevels(multiome$cell_state)),

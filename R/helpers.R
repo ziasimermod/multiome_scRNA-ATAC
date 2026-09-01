@@ -762,6 +762,199 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   decisions[match(sample_sheet$sample_id, decisions$sample_id), , drop = FALSE]
 }
 
+wnn_resolution_column <- function(resolution) {
+  paste0(
+    "wnn_res_",
+    format(
+      resolution,
+      trim = TRUE,
+      scientific = FALSE,
+      nsmall = 1
+    )
+  )
+}
+
+write_clustering_decision_template <- function(
+  decision_path = CLUSTERING_DECISION_PATH,
+  cohort_id = COHORT_ID
+) {
+  if (file.exists(decision_path)) {
+    return(invisible(FALSE))
+  }
+
+  dir.create(
+    dirname(decision_path),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  template <- data.frame(
+    cohort_id = cohort_id,
+    resolution = NA_real_,
+    cluster_column = NA_character_,
+    approved = FALSE,
+    reviewer = NA_character_,
+    review_date = NA_character_,
+    decision_notes = NA_character_,
+    stringsAsFactors = FALSE
+  )
+
+  readr::write_csv(template, decision_path, na = "")
+  invisible(TRUE)
+}
+
+read_and_validate_clustering_decision <- function(
+  available_resolutions = NULL,
+  metadata_columns = NULL,
+  decision_path = CLUSTERING_DECISION_PATH,
+  cohort_id = COHORT_ID
+) {
+  assert_file(decision_path, "clustering decision table")
+
+  decision <- suppressMessages(readr::read_csv(
+    decision_path,
+    show_col_types = FALSE,
+    progress = FALSE
+  ))
+  decision <- as.data.frame(decision, stringsAsFactors = FALSE)
+
+  required_columns <- c(
+    "cohort_id",
+    "resolution",
+    "cluster_column",
+    "approved",
+    "reviewer",
+    "review_date",
+    "decision_notes"
+  )
+  missing_columns <- setdiff(required_columns, colnames(decision))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      "Clustering decision table is missing required columns: ",
+      paste(missing_columns, collapse = ", "),
+      ". File: ",
+      decision_path,
+      call. = FALSE
+    )
+  }
+
+  if (nrow(decision) != 1L) {
+    stop(
+      "Clustering decision table must contain exactly one row. File: ",
+      decision_path,
+      call. = FALSE
+    )
+  }
+
+  recorded_cohort <- tolower(trimws(as.character(decision$cohort_id)))
+  expected_cohort <- tolower(trimws(as.character(cohort_id)))
+
+  if (!identical(recorded_cohort, expected_cohort)) {
+    stop(
+      "Clustering decision cohort_id ('",
+      recorded_cohort,
+      "') does not match the active cohort ('",
+      expected_cohort,
+      "').",
+      call. = FALSE
+    )
+  }
+
+  approved <- tolower(trimws(as.character(decision$approved))) %in%
+    c("true", "t", "1", "yes", "y")
+
+  if (!isTRUE(approved)) {
+    stop(
+      "Clustering is paused intentionally. Review the resolution grid, then ",
+      "complete the active cohort's clustering_decision.csv and set ",
+      "approved=TRUE.",
+      call. = FALSE
+    )
+  }
+
+  decision$resolution <- suppressWarnings(as.numeric(decision$resolution))
+
+  if (!is.finite(decision$resolution)) {
+    stop(
+      "Clustering decision resolution must be a finite numeric value.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.null(available_resolutions) &&
+      !decision$resolution %in% available_resolutions
+  ) {
+    stop(
+      "Clustering decision resolution must be one of: ",
+      paste(available_resolutions, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  decision$cluster_column <- trimws(as.character(decision$cluster_column))
+  expected_cluster_column <- wnn_resolution_column(decision$resolution)
+
+  if (!identical(decision$cluster_column, expected_cluster_column)) {
+    stop(
+      "Clustering decision cluster_column must be '",
+      expected_cluster_column,
+      "' for resolution ",
+      decision$resolution,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.null(metadata_columns) &&
+      !decision$cluster_column %in% metadata_columns
+  ) {
+    stop(
+      "Chosen clustering column is absent from the WNN object: ",
+      decision$cluster_column,
+      call. = FALSE
+    )
+  }
+
+  audit_columns <- c("reviewer", "review_date", "decision_notes")
+  missing_audit <- vapply(
+    audit_columns,
+    function(column_name) {
+      value <- trimws(as.character(decision[[column_name]]))
+      is.na(value) || !nzchar(value)
+    },
+    logical(1)
+  )
+
+  if (any(missing_audit)) {
+    stop(
+      "Approved clustering decisions require completed audit fields: ",
+      paste(audit_columns[missing_audit], collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  review_date <- trimws(as.character(decision$review_date))
+  parsed_review_date <- suppressWarnings(
+    as.Date(review_date, format = "%Y-%m-%d")
+  )
+
+  if (
+    !grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", review_date) ||
+      is.na(parsed_review_date)
+  ) {
+    stop(
+      "Clustering decision review_date must use YYYY-MM-DD format.",
+      call. = FALSE
+    )
+  }
+
+  decision$approved <- TRUE
+  decision
+}
+
 add_joint_qc_flags <- function(object, thresholds) {
   metadata <- object[[]]
 
