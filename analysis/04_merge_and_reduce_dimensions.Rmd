@@ -1306,7 +1306,7 @@ Step 5 will load this object and build the weighted nearest-neighbor graph.
 ```{r save-reduced-object}
 DefaultAssay(merged) <- "RNA"
 
-step4_object_path <- file.path(STEP4_DIR, "Ppar_iKO_multiome_merged_reduced.rds")
+step4_object_path <- file.path(STEP4_DIR, "multiome_merged_reduced.rds")
 
 saveRDS(merged, step4_object_path, compress = FALSE)
 

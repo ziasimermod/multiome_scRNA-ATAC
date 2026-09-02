@@ -180,7 +180,7 @@ step4_marker <- file.path(OUTPUT_DIR, "04_reduction", "STEP_04_COMPLETE.txt")
 
 step4_object_path <- file.path(OUTPUT_DIR,
                                "04_reduction",
-                               "Ppar_iKO_multiome_merged_reduced.rds")
+                               "multiome_merged_reduced.rds")
 
 assert_file(step4_marker, "Step 4 completion marker")
 

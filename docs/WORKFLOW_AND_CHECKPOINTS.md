@@ -328,7 +328,7 @@ Outputs are written under:
 The primary checkpoint is:
 
 ```text
-04_reduction/Ppar_iKO_multiome_merged_reduced.rds
+04_reduction/multiome_merged_reduced.rds
 ```
 
 Additional outputs include:
