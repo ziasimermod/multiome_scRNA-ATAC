@@ -1,0 +1,1275 @@
+---
+title: "Step 5B - Review the IL17 C11/C17 biological offshoot"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 5 identified an IL17 WNN branch in which global cluster 11 was strongly
+enriched for the CON library. Focused review showed that this global cluster
+contains two different components:
+
+1. a small, coherent immune-like tuft population supported by RNA, ATAC, and
+   WNN structure;
+2. a larger low-complexity epithelial population that should not be assigned a
+   tuft identity.
+
+Global cluster 17 is included because clusters 11 and 17 descend from the same
+resolution-0.2 parent and therefore provide the nearest enteroendocrine
+comparison. This notebook recomputes RNA PCA, ATAC LSI, and WNN after subsetting
+those two global clusters. It then evaluates a focused resolution grid, applies
+the reviewed cohort-specific decision, and exports barcode-level assignments
+for Step 6.
+
+The focused analysis does not replace the global WNN solution. It creates a
+reviewed annotation override for one stable child population while preserving
+the original global cluster identities.
+
+A practical SOL allocation is **4 CPU cores, 32-64 GiB memory, 4 hours,
+R 4.4.2, no GPU**.
+
+## Statistical limitation
+
+There is one pooled CON library and one pooled HFD library. Sample identity and
+diet are therefore perfectly confounded. Sample composition is descriptive and
+must not be interpreted as a replicated diet effect.
+
+# 1. Setup
+
+Set the active dataset and cohort before running this notebook:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "il17"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(patchwork)
+})
+
+ggplot2::theme_set(theme_multiome())
+
+sample_sheet <- read_sample_sheet()
+
+unknown_diets <- setdiff(
+  unique(sample_sheet$diet),
+  names(DIET_COLORS)
+)
+
+if (length(unknown_diets) > 0L) {
+  stop(
+    "No plotting colors defined for: ",
+    paste(unknown_diets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_colors <- stats::setNames(
+  unname(DIET_COLORS[sample_sheet$diet]),
+  sample_sheet$sample_id
+)
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "il17")
+) {
+  stop(
+    "Step 5B is the reviewed IL17 C11/C17 case study. Set ",
+    "MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=il17 before running it.",
+    call. = FALSE
+  )
+}
+
+set.seed(12345)
+future::plan(future::sequential)
+```
+
+# 2. Define inputs and outputs
+
+The resolution grid includes 0.5 because it locates the transition between the
+stable four-cluster solution and the additional enteroendocrine subdivision
+that first appears at resolution 0.6.
+
+```{r define-inputs-and-outputs}
+STEP5_DIR <- file.path(OUTPUT_DIR, "05_wnn")
+
+FOCUSED_DIR <- file.path(
+  STEP5_DIR,
+  "focused_offshoot_C11_C17"
+)
+
+STEP5_REVIEW_OBJECT_PATH <- file.path(
+  STEP5_DIR,
+  "multiome_WNN_resolution_grid.rds"
+)
+
+SUBCLUSTERING_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
+  "subclustering_decision.csv"
+)
+
+FOCUSED_OBJECT_PATH <- file.path(
+  FOCUSED_DIR,
+  "IL17_C11_C17_focused_WNN.rds"
+)
+
+FOCUSED_ASSIGNMENT_PATH <- file.path(
+  FOCUSED_DIR,
+  "focused_subcluster_assignments.csv"
+)
+
+FOCUSED_RESOLUTIONS <- c(
+  0.1,
+  0.2,
+  0.3,
+  0.4,
+  0.5,
+  0.6,
+  0.8
+)
+
+RNA_DIMS_FOCUSED <- 1:20
+ATAC_DIMS_FOCUSED <- 2:20
+WNN_K_FOCUSED <- 20L
+
+dir.create(
+  FOCUSED_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+assert_file(
+  STEP5_REVIEW_OBJECT_PATH,
+  "Step 5 WNN resolution-grid object"
+)
+
+assert_file(
+  SUBCLUSTERING_DECISION_PATH,
+  "focused subclustering decision table"
+)
+```
+
+# 3. Read and validate the reviewed decision
+
+The decision table is kept under the active cohort configuration directory. It
+must contain exactly one approved row and complete audit fields.
+
+```{r validate-focused-decision}
+subclustering_decision <- suppressMessages(
+  readr::read_csv(
+    SUBCLUSTERING_DECISION_PATH,
+    show_col_types = FALSE,
+    progress = FALSE
+  )
+)
+
+subclustering_decision <- as.data.frame(
+  subclustering_decision,
+  stringsAsFactors = FALSE
+)
+
+required_decision_columns <- c(
+  "cohort_id",
+  "parent_cluster_column",
+  "parent_clusters",
+  "focused_resolution",
+  "focused_cluster_column",
+  "approved_child_cluster",
+  "annotation_unit",
+  "approved",
+  "reviewer",
+  "review_date",
+  "decision_notes"
+)
+
+missing_decision_columns <- setdiff(
+  required_decision_columns,
+  colnames(subclustering_decision)
+)
+
+if (length(missing_decision_columns) > 0L) {
+  stop(
+    "Subclustering decision table is missing: ",
+    paste(missing_decision_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (nrow(subclustering_decision) != 1L) {
+  stop(
+    "Subclustering decision table must contain exactly one row.",
+    call. = FALSE
+  )
+}
+
+approved <- tolower(
+  trimws(as.character(subclustering_decision$approved))
+) %in% c("true", "t", "1", "yes", "y")
+
+audit_columns <- c(
+  "reviewer",
+  "review_date",
+  "decision_notes"
+)
+
+missing_audit <- vapply(
+  audit_columns,
+  function(column_name) {
+    value <- trimws(
+      as.character(subclustering_decision[[column_name]])
+    )
+    is.na(value) || value == ""
+  },
+  logical(1)
+)
+
+if (!isTRUE(approved) || any(missing_audit)) {
+  stop(
+    "Focused subclustering is paused intentionally. Complete the ",
+    "decision table, its audit fields, and set approved=TRUE.",
+    call. = FALSE
+  )
+}
+
+if (
+  !identical(
+    tolower(trimws(subclustering_decision$cohort_id)),
+    COHORT_ID
+  )
+) {
+  stop(
+    "Subclustering decision cohort does not match the active cohort.",
+    call. = FALSE
+  )
+}
+
+PARENT_CLUSTER_COLUMN <- trimws(
+  subclustering_decision$parent_cluster_column
+)
+
+PARENT_CLUSTERS <- trimws(
+  strsplit(
+    subclustering_decision$parent_clusters,
+    ";",
+    fixed = TRUE
+  )[[1]]
+)
+
+CHOSEN_FOCUSED_RESOLUTION <- suppressWarnings(
+  as.numeric(subclustering_decision$focused_resolution)
+)
+
+CHOSEN_FOCUSED_CLUSTER_COLUMN <- trimws(
+  subclustering_decision$focused_cluster_column
+)
+
+APPROVED_CHILD_CLUSTER <- trimws(
+  as.character(subclustering_decision$approved_child_cluster)
+)
+
+APPROVED_ANNOTATION_UNIT <- trimws(
+  subclustering_decision$annotation_unit
+)
+
+if (
+  !is.finite(CHOSEN_FOCUSED_RESOLUTION) ||
+    !CHOSEN_FOCUSED_RESOLUTION %in% FOCUSED_RESOLUTIONS
+) {
+  stop(
+    "The approved focused resolution is not in FOCUSED_RESOLUTIONS.",
+    call. = FALSE
+  )
+}
+
+expected_focused_column <- paste0(
+  "offshoot_res_",
+  format(
+    CHOSEN_FOCUSED_RESOLUTION,
+    trim = TRUE,
+    scientific = FALSE,
+    nsmall = 1
+  )
+)
+
+if (!identical(CHOSEN_FOCUSED_CLUSTER_COLUMN, expected_focused_column)) {
+  stop(
+    "The decision table's focused cluster column does not match its ",
+    "resolution. Expected: ",
+    expected_focused_column,
+    call. = FALSE
+  )
+}
+
+subclustering_decision
+```
+
+# 4. Load the global Step 5 checkpoint and isolate the branch
+
+```{r load-and-subset-global-wnn}
+merged <- readRDS(STEP5_REVIEW_OBJECT_PATH)
+
+required_metadata <- c(
+  PARENT_CLUSTER_COLUMN,
+  "sample_id",
+  "diet"
+)
+
+missing_metadata <- setdiff(
+  required_metadata,
+  colnames(merged[[]])
+)
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "Step 5 object is missing metadata: ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!all(c("RNA", "ATAC") %in% names(merged@assays))) {
+  stop(
+    "Step 5 object must contain RNA and ATAC assays.",
+    call. = FALSE
+  )
+}
+
+parent_values <- as.character(
+  merged[[]][[PARENT_CLUSTER_COLUMN]]
+)
+
+focused_cells <- rownames(merged[[]])[
+  parent_values %in% PARENT_CLUSTERS
+]
+
+if (length(focused_cells) == 0L) {
+  stop(
+    "No cells matched the reviewed parent clusters.",
+    call. = FALSE
+  )
+}
+
+focused <- subset(
+  merged,
+  cells = focused_cells
+)
+
+focused$parent_wnn_cluster <- as.character(
+  focused[[]][[PARENT_CLUSTER_COLUMN]]
+)
+
+parent_sample_crosswalk <- focused[[]] |>
+  tibble::rownames_to_column("barcode") |>
+  dplyr::count(
+    parent_wnn_cluster,
+    sample_id,
+    diet,
+    name = "nuclei"
+  )
+
+readr::write_csv(
+  parent_sample_crosswalk,
+  file.path(
+    FOCUSED_DIR,
+    "parent_cluster_sample_crosswalk.csv"
+  )
+)
+
+parent_sample_crosswalk
+```
+
+# 5. Create fresh focused RNA and ATAC assays
+
+Fresh assay copies prevent the focused analysis from reusing scaled RNA values
+or ATAC inverse-document-frequency values calculated on the full cohort. ATAC
+features with zero counts in the focused cells are removed before TF-IDF.
+
+```{r create-focused-assays}
+rna_counts <- GetAssayData(
+  focused,
+  assay = "RNA",
+  layer = "counts"
+)
+
+focused[["RNA.focused"]] <- CreateAssayObject(
+  counts = rna_counts
+)
+
+focused[["ATAC.focused"]] <- focused[["ATAC"]]
+Key(focused[["ATAC.focused"]]) <- "ATACFOCUSED_"
+
+atac_counts <- GetAssayData(
+  focused,
+  assay = "ATAC.focused",
+  layer = "counts"
+)
+
+nonzero_atac_features <- Matrix::rowSums(atac_counts) > 0
+
+atac_feature_filter_summary <- data.frame(
+  ATAC_features_before = length(nonzero_atac_features),
+  zero_count_features_removed = sum(!nonzero_atac_features),
+  ATAC_features_retained = sum(nonzero_atac_features)
+)
+
+focused[["ATAC.focused"]] <- focused[["ATAC.focused"]][
+  nonzero_atac_features,
+]
+
+readr::write_csv(
+  atac_feature_filter_summary,
+  file.path(
+    FOCUSED_DIR,
+    "focused_ATAC_feature_filter_summary.csv"
+  )
+)
+
+rm(rna_counts, atac_counts)
+invisible(gc())
+
+atac_feature_filter_summary
+```
+
+# 6. Recompute focused RNA PCA and ATAC LSI
+
+```{r focused-rna-reduction}
+DefaultAssay(focused) <- "RNA.focused"
+
+focused <- NormalizeData(
+  focused,
+  assay = "RNA.focused",
+  verbose = FALSE
+)
+
+focused <- FindVariableFeatures(
+  focused,
+  assay = "RNA.focused",
+  selection.method = "vst",
+  nfeatures = 3000,
+  verbose = FALSE
+)
+
+focused <- ScaleData(
+  focused,
+  assay = "RNA.focused",
+  features = VariableFeatures(focused[["RNA.focused"]]),
+  verbose = FALSE
+)
+
+focused <- RunPCA(
+  focused,
+  assay = "RNA.focused",
+  features = VariableFeatures(focused[["RNA.focused"]]),
+  npcs = 30,
+  reduction.name = "offshoot.pca",
+  reduction.key = "OFFRNA_",
+  verbose = FALSE
+)
+
+focused <- RunUMAP(
+  focused,
+  reduction = "offshoot.pca",
+  dims = RNA_DIMS_FOCUSED,
+  reduction.name = "offshoot.rna.umap",
+  reduction.key = "OFFRNAUMAP_",
+  seed.use = 12345,
+  verbose = FALSE
+)
+```
+
+```{r focused-atac-reduction}
+DefaultAssay(focused) <- "ATAC.focused"
+
+focused <- RunTFIDF(
+  focused,
+  assay = "ATAC.focused",
+  verbose = FALSE
+)
+
+focused <- FindTopFeatures(
+  focused,
+  assay = "ATAC.focused",
+  min.cutoff = "q5",
+  verbose = FALSE
+)
+
+focused <- RunSVD(
+  focused,
+  assay = "ATAC.focused",
+  n = 30,
+  reduction.name = "offshoot.lsi",
+  reduction.key = "OFFLSI_",
+  verbose = FALSE
+)
+
+focused <- RunUMAP(
+  focused,
+  reduction = "offshoot.lsi",
+  dims = ATAC_DIMS_FOCUSED,
+  reduction.name = "offshoot.atac.umap",
+  reduction.key = "OFFATACUMAP_",
+  seed.use = 12345,
+  verbose = FALSE
+)
+```
+
+# 7. Build the focused WNN representation
+
+One metadata name is supplied for each modality so the focused RNA and ATAC
+weights remain explicit and cannot be confused with the global WNN weights.
+
+```{r focused-wnn}
+focused <- FindMultiModalNeighbors(
+  focused,
+  reduction.list = list(
+    "offshoot.pca",
+    "offshoot.lsi"
+  ),
+  dims.list = list(
+    RNA_DIMS_FOCUSED,
+    ATAC_DIMS_FOCUSED
+  ),
+  k.nn = WNN_K_FOCUSED,
+  knn.graph.name = "offshoot.wknn",
+  snn.graph.name = "offshoot.wsnn",
+  weighted.nn.name = "offshoot.weighted.nn",
+  modality.weight.name = c(
+    "focused.RNA.weight",
+    "focused.ATAC.weight"
+  ),
+  verbose = FALSE
+)
+
+focused <- RunUMAP(
+  focused,
+  nn.name = "offshoot.weighted.nn",
+  reduction.name = "offshoot.wnn.umap",
+  reduction.key = "OFFWNNUMAP_",
+  seed.use = 12345,
+  verbose = FALSE
+)
+
+reduction_validation <- vapply(
+  c(
+    "offshoot.pca",
+    "offshoot.lsi",
+    "offshoot.rna.umap",
+    "offshoot.atac.umap",
+    "offshoot.wnn.umap"
+  ),
+  function(reduction_name) {
+    all(
+      is.finite(
+        Embeddings(
+          focused,
+          reduction = reduction_name
+        )
+      )
+    )
+  },
+  logical(1)
+)
+
+if (!all(reduction_validation)) {
+  stop(
+    "One or more focused reductions contain non-finite values.",
+    call. = FALSE
+  )
+}
+
+reduction_validation
+```
+
+# 8. Record strict and inclusive tuft-program support
+
+The strict definition excludes `St18` because global cluster 17 expresses it
+without a complete tuft program. The inclusive definition retains `St18` to
+reproduce the original candidate review. Neither definition is used to build
+the focused clusters; they are independent post-clustering validation labels.
+
+```{r tuft-program-support}
+strict_tuft_genes <- c(
+  "Dclk1",
+  "Pou2f3",
+  "Trpm5",
+  "Gnat3",
+  "Plcb2",
+  "Rgs13",
+  "Sh2d6",
+  "Fyb",
+  "Ltc4s",
+  "Avil",
+  "Hck"
+)
+
+inclusive_tuft_genes <- union(
+  strict_tuft_genes,
+  "St18"
+)
+
+rna_focused_data <- GetAssayData(
+  focused,
+  assay = "RNA.focused",
+  layer = "data"
+)
+
+count_detected_genes <- function(features) {
+  available_features <- intersect(
+    features,
+    rownames(rna_focused_data)
+  )
+
+  Matrix::colSums(
+    rna_focused_data[
+      available_features,
+      colnames(focused),
+      drop = FALSE
+    ] > 0
+  )
+}
+
+strict_detected <- count_detected_genes(
+  strict_tuft_genes
+)
+
+inclusive_detected <- count_detected_genes(
+  inclusive_tuft_genes
+)
+
+focused$tuft_program_genes_detected_strict <-
+  strict_detected[colnames(focused)]
+
+focused$tuft_program_genes_detected_inclusive <-
+  inclusive_detected[colnames(focused)]
+
+focused$tuft_program_status_strict <- factor(
+  ifelse(
+    focused$tuft_program_genes_detected_strict >= 2,
+    "program_positive",
+    "program_negative"
+  ),
+  levels = c("program_negative", "program_positive")
+)
+
+focused$tuft_program_status_inclusive <- factor(
+  ifelse(
+    focused$tuft_program_genes_detected_inclusive >= 2,
+    "program_positive",
+    "program_negative"
+  ),
+  levels = c("program_negative", "program_positive")
+)
+
+strict_crosswalk <- focused[[]] |>
+  tibble::rownames_to_column("barcode") |>
+  dplyr::count(
+    parent_wnn_cluster,
+    sample_id,
+    diet,
+    tuft_program_status_strict,
+    name = "nuclei"
+  )
+
+inclusive_crosswalk <- focused[[]] |>
+  tibble::rownames_to_column("barcode") |>
+  dplyr::count(
+    parent_wnn_cluster,
+    sample_id,
+    diet,
+    tuft_program_status_inclusive,
+    name = "nuclei"
+  )
+
+readr::write_csv(
+  strict_crosswalk,
+  file.path(
+    FOCUSED_DIR,
+    "strict_tuft_program_crosswalk.csv"
+  )
+)
+
+readr::write_csv(
+  inclusive_crosswalk,
+  file.path(
+    FOCUSED_DIR,
+    "inclusive_tuft_program_crosswalk.csv"
+  )
+)
+
+strict_crosswalk
+inclusive_crosswalk
+```
+
+# 9. Construct and summarize the focused resolution grid
+
+```{r focused-resolution-grid}
+focused_resolution_columns <- character(
+  length(FOCUSED_RESOLUTIONS)
+)
+
+for (resolution_index in seq_along(FOCUSED_RESOLUTIONS)) {
+  resolution <- FOCUSED_RESOLUTIONS[[resolution_index]]
+
+  focused <- FindClusters(
+    focused,
+    graph.name = "offshoot.wsnn",
+    algorithm = 3,
+    resolution = resolution,
+    random.seed = 12345,
+    verbose = FALSE
+  )
+
+  resolution_column <- paste0(
+    "offshoot_res_",
+    format(
+      resolution,
+      trim = TRUE,
+      scientific = FALSE,
+      nsmall = 1
+    )
+  )
+
+  focused[[resolution_column]] <- as.character(
+    Idents(focused)
+  )
+
+  focused_resolution_columns[[resolution_index]] <-
+    resolution_column
+}
+
+focused_metadata <- focused[[]] |>
+  tibble::as_tibble()
+
+total_strict_positive <- sum(
+  focused_metadata$tuft_program_status_strict ==
+    "program_positive"
+)
+
+total_inclusive_positive <- sum(
+  focused_metadata$tuft_program_status_inclusive ==
+    "program_positive"
+)
+
+focused_resolution_summary <- dplyr::bind_rows(
+  lapply(
+    seq_along(FOCUSED_RESOLUTIONS),
+    function(resolution_index) {
+      resolution <- FOCUSED_RESOLUTIONS[[resolution_index]]
+
+      resolution_column <-
+        focused_resolution_columns[[resolution_index]]
+
+      focused_metadata |>
+        dplyr::group_by(
+          focused_subcluster = .data[[resolution_column]]
+        ) |>
+        dplyr::summarise(
+          nuclei = dplyr::n(),
+          parent_C11_percent = 100 * mean(
+            parent_wnn_cluster == "11"
+          ),
+          parent_C17_percent = 100 * mean(
+            parent_wnn_cluster == "17"
+          ),
+          strict_positive_n = sum(
+            tuft_program_status_strict ==
+              "program_positive"
+          ),
+          strict_positive_percent = 100 * mean(
+            tuft_program_status_strict ==
+              "program_positive"
+          ),
+          strict_positive_capture_percent = 100 *
+            sum(
+              tuft_program_status_strict ==
+                "program_positive"
+            ) /
+            total_strict_positive,
+          inclusive_positive_n = sum(
+            tuft_program_status_inclusive ==
+              "program_positive"
+          ),
+          inclusive_positive_percent = 100 * mean(
+            tuft_program_status_inclusive ==
+              "program_positive"
+          ),
+          inclusive_positive_capture_percent = 100 *
+            sum(
+              tuft_program_status_inclusive ==
+                "program_positive"
+            ) /
+            total_inclusive_positive,
+          CON_percent = 100 * mean(
+            as.character(diet) == "CON"
+          ),
+          HFD_percent = 100 * mean(
+            as.character(diet) == "HFD"
+          ),
+          nCount_RNA_median = median(nCount_RNA),
+          nCount_ATAC_median = median(nCount_ATAC),
+          RNA_weight_median = median(
+            .data[["focused.RNA.weight"]],
+            na.rm = TRUE
+          ),
+          .groups = "drop"
+        ) |>
+        dplyr::mutate(
+          resolution = resolution,
+          .before = 1
+        )
+    }
+  )
+) |>
+  tibble::as_tibble()
+
+readr::write_csv(
+  focused_resolution_summary,
+  file.path(
+    FOCUSED_DIR,
+    "focused_resolution_summary.csv"
+  )
+)
+
+focused_resolution_summary
+```
+
+# 10. Save the focused resolution and modality-support plots
+
+```{r save-focused-resolution-plots}
+for (resolution_index in seq_along(FOCUSED_RESOLUTIONS)) {
+  resolution <- FOCUSED_RESOLUTIONS[[resolution_index]]
+
+  resolution_column <-
+    focused_resolution_columns[[resolution_index]]
+
+  resolution_plot <- DimPlot(
+    focused,
+    reduction = "offshoot.wnn.umap",
+    group.by = resolution_column,
+    label = TRUE,
+    repel = TRUE
+  ) +
+    NoLegend() +
+    ggtitle(
+      paste(
+        "Focused C11/C17 WNN - resolution",
+        resolution
+      )
+    )
+
+  ggsave(
+    filename = file.path(
+      FOCUSED_DIR,
+      paste0(
+        "focused_WNN_clusters_resolution_",
+        resolution,
+        ".pdf"
+      )
+    ),
+    plot = resolution_plot,
+    width = 8,
+    height = 6
+  )
+}
+```
+
+```{r save-focused-support-plots}
+program_colors <- c(
+  program_negative = "#B8B8B8",
+  program_positive = "#D55E00"
+)
+
+rna_program_plot <- DimPlot(
+  focused,
+  reduction = "offshoot.rna.umap",
+  group.by = "tuft_program_status_strict",
+  cols = program_colors
+) +
+  ggtitle("Focused RNA support")
+
+atac_program_plot <- DimPlot(
+  focused,
+  reduction = "offshoot.atac.umap",
+  group.by = "tuft_program_status_strict",
+  cols = program_colors
+) +
+  ggtitle("Focused ATAC support")
+
+wnn_program_plot <- DimPlot(
+  focused,
+  reduction = "offshoot.wnn.umap",
+  group.by = "tuft_program_status_strict",
+  cols = program_colors
+) +
+  ggtitle("Focused WNN support")
+
+ggsave(
+  filename = file.path(
+    FOCUSED_DIR,
+    "focused_RNA_ATAC_WNN_tuft_program_support.pdf"
+  ),
+  plot = patchwork::wrap_plots(
+    rna_program_plot,
+    atac_program_plot,
+    wnn_program_plot,
+    nrow = 1
+  ),
+  width = 18,
+  height = 6
+)
+
+sample_plot <- DimPlot(
+  focused,
+  reduction = "offshoot.wnn.umap",
+  group.by = "sample_id",
+  cols = sample_colors
+) +
+  ggtitle("Focused C11/C17 WNN by sample")
+
+ggsave(
+  filename = file.path(
+    FOCUSED_DIR,
+    "focused_WNN_by_sample.pdf"
+  ),
+  plot = sample_plot,
+  width = 8,
+  height = 6
+)
+```
+
+# 11. Preserve the exploratory enteroendocrine subdivision
+
+Resolution 0.6 divides the global-cluster-17 enteroendocrine branch into two
+mixed-library children. This comparison is retained for cross-cohort follow-up,
+but the subdivision is not promoted to the primary IL17 annotation.
+
+```{r exploratory-eec-audit}
+EEC_REVIEW_COLUMN <- "offshoot_res_0.6"
+EEC_REVIEW_CLUSTERS <- c("1", "4")
+
+if (
+  EEC_REVIEW_COLUMN %in% colnames(focused[[]]) &&
+    all(
+      EEC_REVIEW_CLUSTERS %in%
+        unique(focused[[]][[EEC_REVIEW_COLUMN]])
+    )
+) {
+  DefaultAssay(focused) <- "RNA.focused"
+  Idents(focused) <- EEC_REVIEW_COLUMN
+
+  eec_split_markers <- FindMarkers(
+    focused,
+    ident.1 = "4",
+    ident.2 = "1",
+    assay = "RNA.focused",
+    logfc.threshold = 0.25,
+    min.pct = 0.10,
+    only.pos = FALSE
+  ) |>
+    tibble::rownames_to_column("gene") |>
+    dplyr::arrange(dplyr::desc(avg_log2FC))
+
+  readr::write_csv(
+    eec_split_markers,
+    file.path(
+      FOCUSED_DIR,
+      "RNA_EEC_subclusters_4_vs_1_resolution_0.6.csv"
+    )
+  )
+
+  eec_review <- subset(
+    focused,
+    idents = EEC_REVIEW_CLUSTERS
+  )
+
+  eec_panel <- intersect(
+    c(
+      "Chga",
+      "Chgb",
+      "Insm1",
+      "Neurod1",
+      "Rfx6",
+      "Pax6",
+      "Isl1",
+      "Tph1",
+      "Ddc",
+      "Lmx1a",
+      "Tac1",
+      "Gcg",
+      "Pyy",
+      "Nts",
+      "Sst",
+      "Cck",
+      "Ghrl",
+      "Reg4"
+    ),
+    rownames(eec_review[["RNA.focused"]])
+  )
+
+  eec_marker_plot <- DotPlot(
+    eec_review,
+    features = eec_panel,
+    group.by = EEC_REVIEW_COLUMN,
+    assay = "RNA.focused"
+  ) +
+    RotatedAxis() +
+    ggtitle(
+      "Focused enteroendocrine split at resolution 0.6"
+    )
+
+  ggsave(
+    filename = file.path(
+      FOCUSED_DIR,
+      "focused_EEC_marker_audit_resolution_0.6.pdf"
+    ),
+    plot = eec_marker_plot,
+    width = 11,
+    height = 5
+  )
+}
+```
+
+# 12. Apply the reviewed focused decision
+
+The selected child is identified from unsupervised focused WNN membership. The
+tuft-program flags remain validation evidence and do not directly determine
+which nuclei receive the override.
+
+```{r apply-focused-decision}
+if (
+  !CHOSEN_FOCUSED_CLUSTER_COLUMN %in%
+    colnames(focused[[]])
+) {
+  stop(
+    "Chosen focused cluster column is absent from the object: ",
+    CHOSEN_FOCUSED_CLUSTER_COLUMN,
+    call. = FALSE
+  )
+}
+
+focused$focused_subcluster <- as.character(
+  focused[[]][[CHOSEN_FOCUSED_CLUSTER_COLUMN]]
+)
+
+if (
+  !APPROVED_CHILD_CLUSTER %in%
+    unique(focused$focused_subcluster)
+) {
+  stop(
+    "Approved focused child cluster is absent from the chosen solution.",
+    call. = FALSE
+  )
+}
+
+approved_child_cells <- colnames(focused)[
+  focused$focused_subcluster == APPROVED_CHILD_CLUSTER
+]
+
+approved_child_parents <- unique(
+  focused$parent_wnn_cluster[
+    focused$focused_subcluster == APPROVED_CHILD_CLUSTER
+  ]
+)
+
+if (length(approved_child_parents) != 1L) {
+  stop(
+    "Approved focused child spans more than one global parent cluster.",
+    call. = FALSE
+  )
+}
+
+focused$annotation_unit_override <- ifelse(
+  focused$focused_subcluster == APPROVED_CHILD_CLUSTER,
+  APPROVED_ANNOTATION_UNIT,
+  NA_character_
+)
+
+focused_assignments <- focused[[]] |>
+  tibble::rownames_to_column("barcode") |>
+  dplyr::transmute(
+    barcode,
+    sample_id,
+    diet,
+    parent_cluster_column = PARENT_CLUSTER_COLUMN,
+    parent_wnn_cluster,
+    focused_resolution = CHOSEN_FOCUSED_RESOLUTION,
+    focused_cluster_column = CHOSEN_FOCUSED_CLUSTER_COLUMN,
+    focused_subcluster,
+    tuft_program_status_strict,
+    tuft_program_status_inclusive,
+    focused_RNA_weight = .data[["focused.RNA.weight"]],
+    focused_ATAC_weight = .data[["focused.ATAC.weight"]],
+    annotation_unit_override
+  )
+
+approved_assignment_count <- sum(
+  focused_assignments$annotation_unit_override ==
+    APPROVED_ANNOTATION_UNIT,
+  na.rm = TRUE
+)
+
+if (approved_assignment_count != length(approved_child_cells)) {
+  stop(
+    "Focused assignment count does not match the approved child size.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  focused_assignments,
+  FOCUSED_ASSIGNMENT_PATH
+)
+
+focused_decision_audit <- data.frame(
+  cohort_id = COHORT_ID,
+  parent_cluster_column = PARENT_CLUSTER_COLUMN,
+  parent_cluster = approved_child_parents,
+  parent_clusters_reviewed = paste(
+    PARENT_CLUSTERS,
+    collapse = ";"
+  ),
+  focused_resolution = CHOSEN_FOCUSED_RESOLUTION,
+  focused_cluster_column = CHOSEN_FOCUSED_CLUSTER_COLUMN,
+  approved_child_cluster = APPROVED_CHILD_CLUSTER,
+  annotation_unit = APPROVED_ANNOTATION_UNIT,
+  approved_nuclei = approved_assignment_count,
+  reviewer = subclustering_decision$reviewer,
+  review_date = subclustering_decision$review_date,
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  focused_decision_audit,
+  file.path(
+    FOCUSED_DIR,
+    "focused_subclustering_decision_applied.csv"
+  )
+)
+
+focused_decision_audit
+```
+
+# 13. Save the focused checkpoint
+
+```{r save-focused-checkpoint}
+DefaultAssay(focused) <- "RNA"
+
+saveRDS(
+  focused,
+  FOCUSED_OBJECT_PATH,
+  compress = FALSE
+)
+
+writeLines(
+  c(
+    paste(
+      "Focused subclustering completed:",
+      format(Sys.time())
+    ),
+    paste(
+      "Parent global clusters:",
+      paste(PARENT_CLUSTERS, collapse = ",")
+    ),
+    paste(
+      "Focused nuclei:",
+      ncol(focused)
+    ),
+    paste(
+      "Chosen focused resolution:",
+      CHOSEN_FOCUSED_RESOLUTION
+    ),
+    paste(
+      "Chosen focused cluster column:",
+      CHOSEN_FOCUSED_CLUSTER_COLUMN
+    ),
+    paste(
+      "Approved child cluster:",
+      APPROVED_CHILD_CLUSTER
+    ),
+    paste(
+      "Annotation unit override:",
+      APPROVED_ANNOTATION_UNIT
+    ),
+    paste(
+      "Approved nuclei:",
+      approved_assignment_count
+    ),
+    "Exploratory EEC subdivision promoted to primary annotation: FALSE"
+  ),
+  file.path(
+    FOCUSED_DIR,
+    "STEP_05B_COMPLETE.txt"
+  )
+)
+
+focused_object_info <- data.frame(
+  path = FOCUSED_OBJECT_PATH,
+  exists = file.exists(FOCUSED_OBJECT_PATH),
+  size_gb = file.info(FOCUSED_OBJECT_PATH)$size / 1024^3,
+  assignments_path = FOCUSED_ASSIGNMENT_PATH,
+  assignments_exist = file.exists(FOCUSED_ASSIGNMENT_PATH),
+  approved_nuclei = approved_assignment_count,
+  stringsAsFactors = FALSE
+)
+
+if (
+  !isTRUE(focused_object_info$exists) ||
+    !isTRUE(focused_object_info$assignments_exist)
+) {
+  stop(
+    "Focused Step 5B outputs were not saved successfully.",
+    call. = FALSE
+  )
+}
+
+focused_object_info
+```
+
+# 14. Interpretation checkpoint
+
+The approved 42-nucleus child is a stable, unsupervised WNN population derived
+entirely from global cluster 11. It is supported by both diets and by a
+coordinated immune-like tuft program. Step 6 will use
+`focused_subcluster_assignments.csv` to create the annotation unit `11_tuft`.
+
+The remaining global-cluster-11 nuclei retain their global identity and should
+receive a conservative low-complexity epithelial annotation. The exploratory
+resolution-0.6 enteroendocrine split is preserved in this checkpoint for later
+comparison with WT and PPAR but does not alter the primary IL17 labels.
