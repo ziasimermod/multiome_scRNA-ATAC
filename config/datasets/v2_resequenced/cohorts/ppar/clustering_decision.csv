@@ -1,0 +1,2 @@
+cohort_id,resolution,cluster_column,approved,reviewer,review_date,decision_notes
+ppar,0.8,wnn_res_0.8,TRUE,Dominic Saiz,2026-08-24,"Resolution 0.8 was selected during the original PPAR v2 WNN review after inspecting the 0.2-through-1.0 resolution grid, cluster-size distribution, pooled-library composition, and canonical mouse-colon marker programs. The reviewed 27-cluster object was finalized in commit 8892a9e and subsequently used for the completed Step 06 annotation. This row records that previously completed choice in the cohort-specific decision structure."

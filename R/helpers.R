@@ -26,7 +26,9 @@ required_packages <- c(
   "biovizBase",
   "SingleCellExperiment",
   "SummarizedExperiment",
-  "scDblFinder"
+  "scDblFinder",
+  "cowplot",
+  "scales"
 )
 
 minimum_package_versions <- c(
@@ -231,7 +233,11 @@ save_run_information <- function(package_status = NULL) {
   invisible(allocation)
 }
 
-read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
+read_sample_sheet <- function(
+  path = SAMPLE_SHEET_PATH,
+  cohort_id = COHORT_ID,
+  expected_group = COHORT_GROUP
+) {
   assert_file(path, "sample sheet")
   sample_sheet <- suppressMessages(readr::read_csv(
     path,
@@ -241,10 +247,18 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
 
   required_columns <- c(
     "sample_id",
+    "cohort_id",
+    "group",
+    "run_id",
     "pool_id",
     "genotype",
+    "model_detail",
     "diet",
-    "outs_dir"
+    "outs_dir",
+    "mice_pooled",
+    "female_mice",
+    "male_mice",
+    "pooling_design"
   )
   missing_columns <- setdiff(required_columns, colnames(sample_sheet))
   if (length(missing_columns) > 0L) {
@@ -256,9 +270,87 @@ read_sample_sheet <- function(path = SAMPLE_SHEET_PATH) {
   }
 
   sample_sheet <- as.data.frame(sample_sheet, stringsAsFactors = FALSE)
+
+  required_values <- c(
+    "sample_id",
+    "cohort_id",
+    "group",
+    "pool_id",
+    "genotype",
+    "model_detail",
+    "diet",
+    "outs_dir",
+    "pooling_design"
+  )
+  blank_required <- vapply(
+    required_values,
+    function(column_name) {
+      values <- trimws(as.character(sample_sheet[[column_name]]))
+      any(is.na(values) | values == "")
+    },
+    logical(1)
+  )
+  if (any(blank_required)) {
+    stop(
+      "The sample sheet contains missing required values in: ",
+      paste(required_values[blank_required], collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet$cohort_id <- tolower(trimws(sample_sheet$cohort_id))
+  sample_sheet$group <- toupper(trimws(sample_sheet$group))
+  sample_sheet$diet <- toupper(trimws(sample_sheet$diet))
+
   if (anyDuplicated(sample_sheet$sample_id)) {
     stop("Every sample_id must be unique.", call. = FALSE)
   }
+
+  available_cohorts <- sort(unique(sample_sheet$cohort_id))
+  if (!cohort_id %in% available_cohorts) {
+    stop(
+      "The selected cohort is absent from the sample sheet: ", cohort_id,
+      "\nAvailable cohorts: ",
+      paste(available_cohorts, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet <- sample_sheet[
+    sample_sheet$cohort_id == cohort_id,
+    ,
+    drop = FALSE
+  ]
+
+  expected_diets <- c("CON", "HFD")
+  diet_counts <- table(factor(sample_sheet$diet, levels = expected_diets))
+  if (nrow(sample_sheet) != 2L || any(diet_counts != 1L)) {
+    stop(
+      "Cohort ", cohort_id,
+      " must contain exactly one CON library and one HFD library.",
+      call. = FALSE
+    )
+  }
+
+  observed_groups <- unique(sample_sheet$group)
+  if (
+    length(observed_groups) != 1L ||
+    !identical(observed_groups, expected_group)
+  ) {
+    stop(
+      "Cohort ", cohort_id, " must use group label ", expected_group,
+      ". Observed: ", paste(observed_groups, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sample_sheet <- sample_sheet[
+    match(expected_diets, sample_sheet$diet),
+    ,
+    drop = FALSE
+  ]
+  rownames(sample_sheet) <- NULL
+
   if (anyDuplicated(sample_sheet$pool_id)) {
     warning(
       "Repeated pool_id values indicate multiple libraries derived from ",
@@ -564,9 +656,12 @@ populate_qc_decision_draft <- function(suggestions, decision_path = QC_DECISION_
   extra_samples <- setdiff(decisions$sample_id, suggestions$sample_id)
   if (length(missing_samples) > 0L || length(extra_samples) > 0L) {
     stop(
-      "Sample IDs differ between suggestions and config/qc_thresholds.csv. ",
-      "Missing in decision file: ", paste(missing_samples, collapse = ", "),
-      "; extra in decision file: ", paste(extra_samples, collapse = ", "),
+      "Sample IDs differ between suggestions and the active QC decision table: ",
+      decision_path,
+      ". Missing in decision file: ",
+      paste(missing_samples, collapse = ", "),
+      "; extra in decision file: ",
+      paste(extra_samples, collapse = ", "),
       call. = FALSE
     )
   }
@@ -601,8 +696,10 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   missing_columns <- setdiff(required, colnames(decisions))
   if (length(missing_columns) > 0L) {
     stop(
-      "config/qc_thresholds.csv is missing: ",
+      "QC decision table is missing required columns: ",
       paste(missing_columns, collapse = ", "),
+      ". File: ",
+      QC_DECISION_PATH,
       call. = FALSE
     )
   }
@@ -611,7 +708,8 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   extra_samples <- setdiff(decisions$sample_id, sample_sheet$sample_id)
   if (length(missing_samples) > 0L || length(extra_samples) > 0L) {
     stop(
-      "Sample IDs in the QC decision table do not match config/samples.csv.",
+      "Sample IDs in the QC decision table do not match the active sample sheet: ",
+      SAMPLE_SHEET_PATH,
       call. = FALSE
     )
   }
@@ -631,7 +729,7 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   if (!all(approved)) {
     stop(
       "QC is paused intentionally. Review the plots, then set approved=TRUE ",
-      "for every sample in config/qc_thresholds.csv and rerun this chunk.",
+      "for every sample in the active cohort's qc_thresholds.csv and rerun this chunk.",
       call. = FALSE
     )
   }
@@ -662,6 +760,199 @@ read_and_validate_qc_decisions <- function(sample_sheet) {
   }
   decisions$approved <- approved
   decisions[match(sample_sheet$sample_id, decisions$sample_id), , drop = FALSE]
+}
+
+wnn_resolution_column <- function(resolution) {
+  paste0(
+    "wnn_res_",
+    format(
+      resolution,
+      trim = TRUE,
+      scientific = FALSE,
+      nsmall = 1
+    )
+  )
+}
+
+write_clustering_decision_template <- function(
+  decision_path = CLUSTERING_DECISION_PATH,
+  cohort_id = COHORT_ID
+) {
+  if (file.exists(decision_path)) {
+    return(invisible(FALSE))
+  }
+
+  dir.create(
+    dirname(decision_path),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  template <- data.frame(
+    cohort_id = cohort_id,
+    resolution = NA_real_,
+    cluster_column = NA_character_,
+    approved = FALSE,
+    reviewer = NA_character_,
+    review_date = NA_character_,
+    decision_notes = NA_character_,
+    stringsAsFactors = FALSE
+  )
+
+  readr::write_csv(template, decision_path, na = "")
+  invisible(TRUE)
+}
+
+read_and_validate_clustering_decision <- function(
+  available_resolutions = NULL,
+  metadata_columns = NULL,
+  decision_path = CLUSTERING_DECISION_PATH,
+  cohort_id = COHORT_ID
+) {
+  assert_file(decision_path, "clustering decision table")
+
+  decision <- suppressMessages(readr::read_csv(
+    decision_path,
+    show_col_types = FALSE,
+    progress = FALSE
+  ))
+  decision <- as.data.frame(decision, stringsAsFactors = FALSE)
+
+  required_columns <- c(
+    "cohort_id",
+    "resolution",
+    "cluster_column",
+    "approved",
+    "reviewer",
+    "review_date",
+    "decision_notes"
+  )
+  missing_columns <- setdiff(required_columns, colnames(decision))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      "Clustering decision table is missing required columns: ",
+      paste(missing_columns, collapse = ", "),
+      ". File: ",
+      decision_path,
+      call. = FALSE
+    )
+  }
+
+  if (nrow(decision) != 1L) {
+    stop(
+      "Clustering decision table must contain exactly one row. File: ",
+      decision_path,
+      call. = FALSE
+    )
+  }
+
+  recorded_cohort <- tolower(trimws(as.character(decision$cohort_id)))
+  expected_cohort <- tolower(trimws(as.character(cohort_id)))
+
+  if (!identical(recorded_cohort, expected_cohort)) {
+    stop(
+      "Clustering decision cohort_id ('",
+      recorded_cohort,
+      "') does not match the active cohort ('",
+      expected_cohort,
+      "').",
+      call. = FALSE
+    )
+  }
+
+  approved <- tolower(trimws(as.character(decision$approved))) %in%
+    c("true", "t", "1", "yes", "y")
+
+  if (!isTRUE(approved)) {
+    stop(
+      "Clustering is paused intentionally. Review the resolution grid, then ",
+      "complete the active cohort's clustering_decision.csv and set ",
+      "approved=TRUE.",
+      call. = FALSE
+    )
+  }
+
+  decision$resolution <- suppressWarnings(as.numeric(decision$resolution))
+
+  if (!is.finite(decision$resolution)) {
+    stop(
+      "Clustering decision resolution must be a finite numeric value.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.null(available_resolutions) &&
+      !decision$resolution %in% available_resolutions
+  ) {
+    stop(
+      "Clustering decision resolution must be one of: ",
+      paste(available_resolutions, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  decision$cluster_column <- trimws(as.character(decision$cluster_column))
+  expected_cluster_column <- wnn_resolution_column(decision$resolution)
+
+  if (!identical(decision$cluster_column, expected_cluster_column)) {
+    stop(
+      "Clustering decision cluster_column must be '",
+      expected_cluster_column,
+      "' for resolution ",
+      decision$resolution,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.null(metadata_columns) &&
+      !decision$cluster_column %in% metadata_columns
+  ) {
+    stop(
+      "Chosen clustering column is absent from the WNN object: ",
+      decision$cluster_column,
+      call. = FALSE
+    )
+  }
+
+  audit_columns <- c("reviewer", "review_date", "decision_notes")
+  missing_audit <- vapply(
+    audit_columns,
+    function(column_name) {
+      value <- trimws(as.character(decision[[column_name]]))
+      is.na(value) || !nzchar(value)
+    },
+    logical(1)
+  )
+
+  if (any(missing_audit)) {
+    stop(
+      "Approved clustering decisions require completed audit fields: ",
+      paste(audit_columns[missing_audit], collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  review_date <- trimws(as.character(decision$review_date))
+  parsed_review_date <- suppressWarnings(
+    as.Date(review_date, format = "%Y-%m-%d")
+  )
+
+  if (
+    !grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", review_date) ||
+      is.na(parsed_review_date)
+  ) {
+    stop(
+      "Clustering decision review_date must use YYYY-MM-DD format.",
+      call. = FALSE
+    )
+  }
+
+  decision$approved <- TRUE
+  decision
 }
 
 add_joint_qc_flags <- function(object, thresholds) {
@@ -731,6 +1022,44 @@ summarize_qc_decision <- function(object, sample_id) {
   )
 }
 
+theme_multiome <- function(
+    base_size = 11,
+    base_family = "sans"
+) {
+
+  cowplot::theme_cowplot(
+    font_size = base_size,
+    font_family = base_family,
+    line_size = 0.45
+  ) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        size = ggplot2::rel(1.15),
+        margin = ggplot2::margin(b = 4)
+      ),
+      plot.subtitle = ggplot2::element_text(
+        color = "grey30",
+        margin = ggplot2::margin(b = 8)
+      ),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text = ggplot2::element_text(color = "grey20"),
+      strip.background = ggplot2::element_rect(
+        fill = "#F2F2F2",
+        color = NA
+      ),
+      strip.text = ggplot2::element_text(face = "bold"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      legend.position = "top",
+      plot.caption.position = "plot",
+      plot.caption = ggplot2::element_text(
+        color = "grey40",
+        hjust = 0
+      )
+    )
+}
+
 save_sample_qc_plots <- function(
     metadata,
     sample_id,
@@ -763,7 +1092,7 @@ save_sample_qc_plots <- function(
       x = NULL,
       y = NULL
     ) +
-    ggplot2::theme_classic(base_size = 11) +
+    theme_multiome() +
     ggplot2::theme(axis.text.x = ggplot2::element_blank())
 
   rna <- ggplot2::ggplot(
@@ -778,7 +1107,7 @@ save_sample_qc_plots <- function(
       title = paste(sample_id, "RNA complexity"),
       color = "% mitochondrial"
     ) +
-    ggplot2::theme_classic(base_size = 11)
+    theme_multiome()
 
   atac <- ggplot2::ggplot(
     metadata,
@@ -795,7 +1124,7 @@ save_sample_qc_plots <- function(
       title = paste(sample_id, "ATAC quality"),
       color = "nucleosome signal"
     ) +
-    ggplot2::theme_classic(base_size = 11)
+    theme_multiome()
 
   if (!is.null(thresholds)) {
     rna <- rna +
@@ -844,3 +1173,18 @@ save_sample_qc_plots <- function(
   )
   invisible(list(violin = violin, rna = rna, atac = atac))
 }
+
+DIET_COLORS <- c(
+  CON = "#E69F00",
+  HFD = "#56B4E9"
+)
+
+QC_STATUS_COLORS <- c(
+  Pass = "#009E73",
+  Fail = "#B8B8B8"
+)
+
+DOUBLET_CLASS_COLORS <- c(
+  singlet = "#666666",
+  doublet = "red3"
+)

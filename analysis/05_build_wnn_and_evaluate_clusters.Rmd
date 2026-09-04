@@ -75,6 +75,28 @@ suppressPackageStartupMessages({
   library(dplyr)
 })
 
+ggplot2::theme_set(theme_multiome())
+
+sample_sheet <- read_sample_sheet()
+
+unknown_diets <- setdiff(
+  unique(sample_sheet$diet),
+  names(DIET_COLORS)
+)
+
+if (length(unknown_diets) > 0L) {
+  stop(
+    "No plotting colors defined for: ",
+    paste(unknown_diets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_colors <- stats::setNames(
+  unname(DIET_COLORS[sample_sheet$diet]),
+  sample_sheet$sample_id
+)
+
 configure_parallel_plan()
 
 cat("Configured future workers:", future::nbrOfWorkers(), "\n")
@@ -94,51 +116,38 @@ measure of statistical significance. It controls how finely the shared-neighbor
 graph is partitioned: larger values generally produce more clusters.
 
 ```{r step-five-parameters}
-STEP5_DIR <- file.path(
-  OUTPUT_DIR,
-  "05_wnn"
-)
+STEP5_DIR <- file.path(OUTPUT_DIR, "05_wnn")
 
-STEP5_PLOT_DIR <- file.path(
+STEP5_PLOT_DIR <- file.path(STEP5_DIR, "plots")
+
+step5_review_object_path <- file.path(
   STEP5_DIR,
-  "plots"
+  "multiome_WNN_resolution_grid.rds"
 )
 
-dir.create(
+legacy_step5_review_object_path <- file.path(
   STEP5_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
+  "Ppar_iKO_multiome_WNN_resolution_grid.rds"
 )
 
-dir.create(
-  STEP5_PLOT_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
+step5_final_object_path <- file.path(
+  STEP5_DIR,
+  "multiome_WNN_clustered.rds"
 )
+
+dir.create(STEP5_DIR, recursive = TRUE, showWarnings = FALSE)
+
+dir.create(STEP5_PLOT_DIR,
+           recursive = TRUE,
+           showWarnings = FALSE)
 
 RNA_DIMS_WNN <- 1:30
 ATAC_DIMS_WNN <- 2:30
 WNN_K <- 20L
 
-CLUSTER_RESOLUTIONS <- c(
-  0.2,
-  0.4,
-  0.6,
-  0.8,
-  1.0
-)
+CLUSTER_RESOLUTIONS <- c(0.2, 0.4, 0.6, 0.8, 1.0)
 
-resolution_column <- function(resolution) {
-  paste0(
-    "wnn_res_",
-    format(
-      resolution,
-      trim = TRUE,
-      scientific = FALSE,
-      nsmall = 1
-    )
-  )
-}
+resolution_column <- wnn_resolution_column
 
 step5_parameters <- data.frame(
   parameter = c(
@@ -167,43 +176,21 @@ audited in Step 4, so this notebook requires the Step 4 completion marker and
 saved reduced object.
 
 ```{r load-step-four}
-step4_marker <- file.path(
-  OUTPUT_DIR,
-  "04_reduction",
-  "STEP_04_COMPLETE.txt"
-)
+step4_marker <- file.path(OUTPUT_DIR, "04_reduction", "STEP_04_COMPLETE.txt")
 
-step4_object_path <- file.path(
-  OUTPUT_DIR,
-  "04_reduction",
-  "Ppar_iKO_multiome_merged_reduced.rds"
-)
+step4_object_path <- file.path(OUTPUT_DIR,
+                               "04_reduction",
+                               "multiome_merged_reduced.rds")
 
-assert_file(
-  step4_marker,
-  "Step 4 completion marker"
-)
+assert_file(step4_marker, "Step 4 completion marker")
 
-assert_file(
-  step4_object_path,
-  "Step 4 reduced merged object"
-)
+assert_file(step4_object_path, "Step 4 reduced merged object")
 
-merged <- readRDS(
-  step4_object_path
-)
+merged <- readRDS(step4_object_path)
 
-required_reductions <- c(
-  "pca",
-  "lsi",
-  "umap.rna",
-  "umap.atac"
-)
+required_reductions <- c("pca", "lsi", "umap.rna", "umap.atac")
 
-missing_reductions <- setdiff(
-  required_reductions,
-  names(merged@reductions)
-)
+missing_reductions <- setdiff(required_reductions, names(merged@reductions))
 
 if (length(missing_reductions) > 0L) {
   stop(
@@ -214,17 +201,13 @@ if (length(missing_reductions) > 0L) {
 }
 
 if (max(RNA_DIMS_WNN) > ncol(Embeddings(merged, "pca"))) {
-  stop(
-    "Requested RNA WNN dimensions exceed the available PCA dimensions.",
-    call. = FALSE
-  )
+  stop("Requested RNA WNN dimensions exceed the available PCA dimensions.",
+       call. = FALSE)
 }
 
 if (max(ATAC_DIMS_WNN) > ncol(Embeddings(merged, "lsi"))) {
-  stop(
-    "Requested ATAC WNN dimensions exceed the available LSI dimensions.",
-    call. = FALSE
-  )
+  stop("Requested ATAC WNN dimensions exceed the available LSI dimensions.",
+       call. = FALSE)
 }
 
 step4_validation <- data.frame(
@@ -239,9 +222,7 @@ step4_validation <- data.frame(
 
 step4_validation
 
-table(
-  merged$sample_id
-)
+table(merged$sample_id)
 ```
 
 # 4. Construct the weighted nearest-neighbor graph
@@ -266,26 +247,25 @@ The resulting objects have different jobs:
 - `RNA.weight` records the learned RNA contribution for each nucleus.
 
 ```{r build-wnn, cache=FALSE}
+step5_complete_marker <- file.path(STEP5_DIR, "STEP_05_COMPLETE.txt")
+
+if (file.exists(step5_complete_marker)) {
+  message("Invalidating the previous Step 5 completion marker before rebuilding WNN.")
+
+  unlink(step5_complete_marker)
+}
+
 set.seed(20260727)
 
 merged <- FindMultiModalNeighbors(
   merged,
-  reduction.list = list(
-    "pca",
-    "lsi"
-  ),
-  dims.list = list(
-    RNA_DIMS_WNN,
-    ATAC_DIMS_WNN
-  ),
+  reduction.list = list("pca", "lsi"),
+  dims.list = list(RNA_DIMS_WNN, ATAC_DIMS_WNN),
   k.nn = WNN_K,
   knn.graph.name = "wknn",
   snn.graph.name = "wsnn",
   weighted.nn.name = "weighted.nn",
-  modality.weight.name = c(
-  "RNA.weight",
-  "ATAC.weight"
-),
+  modality.weight.name = c("RNA.weight", "ATAC.weight"),
   verbose = TRUE
 )
 ```
@@ -377,6 +357,17 @@ if (any(atac_weight < 0 | atac_weight > 1)) {
   )
 }
 
+weight_sum_error <- abs(
+  rna_weight + atac_weight - 1
+)
+
+if (any(weight_sum_error > 1e-6)) {
+  stop(
+    "RNA and ATAC modality weights do not sum to one.",
+    call. = FALSE
+  )
+}
+
 modality_weight_summary <- merged[[]] |>
   dplyr::group_by(sample_id) |>
   dplyr::summarise(
@@ -431,7 +422,7 @@ p_weight_violin <- ggplot2::ggplot(
     x = NULL,
     y = "RNA modality weight"
   ) +
-  ggplot2::theme_classic(base_size = 11)
+  theme_multiome()
 
 print(p_weight_violin)
 
@@ -445,6 +436,7 @@ ggplot2::ggsave(
   height = 5
 )
 ```
+RNA and ATAC modality-weight distributions were similar between the two pooled libraries, supporting use of the joint WNN representation.
 
 # 6. Build the WNN UMAP
 
@@ -476,11 +468,20 @@ p_wnn_sample <- DimPlot(
   merged,
   reduction = "wnn.umap",
   group.by = "sample_id",
-  pt.size = 0.25
+  cols = sample_colors,
+  pt.size = 0.25,
+  seed = 20260727,
+  shuffle = TRUE
 ) +
-  ggplot2::ggtitle(
-    "WNN UMAP by Cell Ranger library"
-  )
+  ggplot2::labs(
+    title = "Multimodal structure across pooled libraries",
+    subtitle = paste(
+      "WNN combines RNA and ATAC neighborhood information;",
+      "library and diet remain confounded."
+    ),
+    color = NULL
+  ) +
+  theme_multiome()
 
 print(p_wnn_sample)
 
@@ -533,7 +534,7 @@ p_rna_weight <- ggplot2::ggplot(
     y = "WNN UMAP 2",
     color = "RNA weight"
   ) +
-  ggplot2::theme_classic(base_size = 11)
+  theme_multiome()
 
 p_atac_weight <- ggplot2::ggplot(
   wnn_embedding,
@@ -554,7 +555,7 @@ p_atac_weight <- ggplot2::ggplot(
     y = "WNN UMAP 2",
     color = "ATAC weight"
   ) +
-  ggplot2::theme_classic(base_size = 11)
+  theme_multiome()
 
 print(p_rna_weight)
 print(p_atac_weight)
@@ -602,17 +603,10 @@ expected in advance.**
 
 future::plan(future::sequential)
 
-cat(
-  "Workers used for clustering:",
-  future::nbrOfWorkers(),
-  "\n"
-)
+cat("Workers used for clustering:", future::nbrOfWorkers(), "\n")
 
 for (resolution in CLUSTER_RESOLUTIONS) {
-
-  cluster_column <- resolution_column(
-    resolution
-  )
+  cluster_column <- resolution_column(resolution)
 
   merged <- FindClusters(
     merged,
@@ -628,11 +622,9 @@ for (resolution in CLUSTER_RESOLUTIONS) {
 # Restore the project-wide parallel configuration afterward.
 configure_parallel_plan()
 
-cat(
-  "Workers restored after clustering:",
-  future::nbrOfWorkers(),
-  "\n"
-)
+cat("Workers restored after clustering:",
+    future::nbrOfWorkers(),
+    "\n")
 ```
 
 ## Summarize cluster number and size
@@ -795,11 +787,6 @@ readr::write_csv(
   )
 )
 
-step5_review_object_path <- file.path(
-  STEP5_DIR,
-  "Ppar_iKO_multiome_WNN_resolution_grid.rds"
-)
-
 saveRDS(
   merged,
   step5_review_object_path,
@@ -836,6 +823,10 @@ writeLines(
       "Resolution grid:",
       paste(CLUSTER_RESOLUTIONS, collapse = ",")
     ),
+    paste(
+      "Clustering decision table:",
+      CLUSTERING_DECISION_PATH
+    ),
     "Final clustering resolution approved: FALSE"
   ),
   file.path(
@@ -843,6 +834,15 @@ writeLines(
     "STEP_05_READY_FOR_CLUSTER_REVIEW.txt"
   )
 )
+
+clustering_template_created <- write_clustering_decision_template()
+
+if (isTRUE(clustering_template_created)) {
+  message(
+    "Created an unapproved clustering decision template: ",
+    CLUSTERING_DECISION_PATH
+  )
+}
 ```
 
 # STOP HERE FOR THE MANUAL RESOLUTION REVIEW
@@ -857,17 +857,56 @@ Before continuing, inspect:
 6. whether increasing resolution is separating visibly coherent states or only
    fragmenting continuous structures.
 
-Then discuss the candidate resolutions before setting `CHOSEN_RESOLUTION` below.
+Then record the reviewed resolution in the active cohort's
+`clustering_decision.csv`. The decision table is the auditable checkpoint;
+the notebook does not contain a cohort-independent default resolution.
 
 ---
 
 # 9. Choose one clustering resolution after review
 
-Do **not** edit this value until the resolution-grid checkpoint has been
-reviewed. Leaving it as `NA_real_` intentionally stops the notebook here.
+This chunk validates the versioned cohort decision before applying it. In a
+fresh R session, it reloads the saved resolution-grid object automatically;
+there is no need to rebuild WNN simply to finalize a reviewed resolution.
 
 ```{r choose-resolution}
-CHOSEN_RESOLUTION <- 0.8
+if (!exists("merged", inherits = FALSE)) {
+  review_checkpoint_candidates <- c(
+    step5_review_object_path,
+    legacy_step5_review_object_path
+  )
+
+  available_review_checkpoints <- review_checkpoint_candidates[
+    file.exists(review_checkpoint_candidates)
+  ]
+
+  if (length(available_review_checkpoints) == 0L) {
+    stop(
+      "No Step 5 resolution-grid checkpoint was found. Run through Step 8 ",
+      "before validating the clustering decision.",
+      call. = FALSE
+    )
+  }
+
+  checkpoint_to_load <- available_review_checkpoints[[1]]
+
+  if (identical(checkpoint_to_load, legacy_step5_review_object_path)) {
+    message(
+      "Loading legacy-named resolution-grid checkpoint: ",
+      checkpoint_to_load
+    )
+  }
+
+  merged <- readRDS(checkpoint_to_load)
+}
+
+clustering_decision <- read_and_validate_clustering_decision(
+  available_resolutions = CLUSTER_RESOLUTIONS,
+  metadata_columns = colnames(merged[[]])
+)
+
+CHOSEN_RESOLUTION <- clustering_decision$resolution[[1]]
+CHOSEN_CLUSTER_COLUMN <- clustering_decision$cluster_column[[1]]
 
 if (
   length(CHOSEN_RESOLUTION) != 1L ||
@@ -876,16 +915,12 @@ if (
 ) {
   stop(
     paste0(
-      "Manual checkpoint: choose one reviewed value from CLUSTER_RESOLUTIONS ",
-      "and assign it to CHOSEN_RESOLUTION before continuing."
+      "The approved clustering resolution must match one value in ",
+      "CLUSTER_RESOLUTIONS."
     ),
     call. = FALSE
   )
 }
-
-CHOSEN_CLUSTER_COLUMN <- resolution_column(
-  CHOSEN_RESOLUTION
-)
 
 Idents(merged) <- merged[[]][[
   CHOSEN_CLUSTER_COLUMN
@@ -1073,19 +1108,37 @@ if (length(detected_marker_genes) == 0L) {
   )
 }
 
-p_colon_markers <- DotPlot(
-  merged,
-  features = detected_marker_genes,
-  group.by = CHOSEN_CLUSTER_COLUMN
-) +
-  RotatedAxis() +
-  ggplot2::ggtitle(
-    paste0(
-      "Mouse-colon marker programs across WNN clusters (resolution ",
-      CHOSEN_RESOLUTION,
-      ")"
-    )
-  )
+p_colon_markers <- suppressMessages(
+  Seurat::DotPlot(
+    merged,
+    features = detected_marker_genes,
+    group.by = CHOSEN_CLUSTER_COLUMN,
+    assay = "RNA",
+    scale = TRUE,
+    col.min = -2,
+    col.max = 2
+  ) +
+    ggplot2::scale_color_gradient2(
+      low = "#2166AC",
+      mid = "#D9D9D9",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = c(-2, 2),
+      oob = scales::squish,
+      name = "Scaled average\nexpression"
+    ) +
+    Seurat::RotatedAxis() +
+    ggplot2::labs(
+      title = paste0(
+        "Mouse-colon marker programs across WNN clusters (resolution ",
+        CHOSEN_RESOLUTION,
+        ")"
+      ),
+      x = NULL,
+      y = "WNN cluster"
+    ) +
+    theme_multiome(base_size = 10)
+)
 
 print(
   p_colon_markers
@@ -1101,7 +1154,7 @@ ggplot2::ggsave(
     )
   ),
   plot = p_colon_markers,
-  width = 15,
+  width = 20,
   height = 8
 )
 ```
@@ -1188,11 +1241,6 @@ readr::write_csv(
   )
 )
 
-step5_final_object_path <- file.path(
-  STEP5_DIR,
-  "Ppar_iKO_multiome_WNN_clustered.rds"
-)
-
 DefaultAssay(merged) <- "RNA"
 
 saveRDS(
@@ -1244,6 +1292,18 @@ writeLines(
     paste(
       "Chosen cluster column:",
       CHOSEN_CLUSTER_COLUMN
+    ),
+    paste(
+      "Clustering decision table:",
+      CLUSTERING_DECISION_PATH
+    ),
+    paste(
+      "Clustering decision reviewer:",
+      clustering_decision$reviewer[[1]]
+    ),
+    paste(
+      "Clustering decision review date:",
+      clustering_decision$review_date[[1]]
     ),
     paste(
       "Clusters:",

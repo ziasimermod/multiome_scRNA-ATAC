@@ -1,0 +1,3 @@
+sample_id,cohort_id,group,run_id,pool_id,genotype,model_detail,diet,outs_dir,mice_pooled,female_mice,male_mice,pooling_design
+Ppar-CON-1,ppar,PPAR,NA,Ppar-CON-1,Ppara_Ppard_iKO,Villin-driven Cre; Ppara/Ppard conditional knockout,CON,/scratch/dsaiz/Yesenia_scData2026/cellranger_runs/v1_initial_depth/CON_cellranger-arc-output/Ppar-CON-1/outs,6,2,4,whole-litter pooled colon epithelial cells
+Ppar-HFD-1,ppar,PPAR,NA,Ppar-HFD-1,Ppara_Ppard_iKO,Villin-driven Cre; Ppara/Ppard conditional knockout,HFD,/scratch/dsaiz/Yesenia_scData2026/cellranger_runs/v1_initial_depth/HFD_cellranger-arc-output/Ppar-HFD-1/outs,10,2,8,whole-litter pooled colon epithelial cells

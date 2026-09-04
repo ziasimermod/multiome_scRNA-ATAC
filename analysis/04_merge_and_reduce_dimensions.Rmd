@@ -9,9 +9,7 @@ output:
 
 # The goal of this notebook
 
-Steps 1–3 created quality-controlled Multiome objects in which every retained
-cell has paired RNA and ATAC measurements, and every sample now uses the same
-ATAC peak coordinates.
+Steps 1–3 created quality-controlled Multiome objects in which every retained cell has paired RNA and ATAC measurements, and every sample now uses the same ATAC peak coordinates.
 
 Step 4 is the transition from **quality control** to **biological structure**.
 We will:
@@ -27,29 +25,20 @@ We will:
 9. preview a small set of mouse-colon epithelial marker programs on the RNA UMAP;
 10. save a reduced merged object for weighted nearest-neighbor (WNN) analysis.
 
-A practical SOL allocation for this step is **4 CPU cores, 64–96 GiB memory,
-8–12 hours, R 4.4.2, no GPU**.
+A practical SOL allocation for this step is **4 CPU cores, 64–96 GiB memory, 8–12 hours, R 4.4.2, no GPU**.
 
 ## Why are we merging but not integrating?
 
-For the current dataset there is one CON library and one HFD library. Therefore,
-**sample identity and diet condition are perfectly confounded**. A method that
-tries to remove differences between the two samples cannot know whether a
-CON-versus-HFD difference is technical or biological.
+For the current dataset there is one CON library and one HFD library. Therefore, **sample identity and diet condition are perfectly confounded**. A method that tries to remove differences between the two samples cannot know whether a CON-versus-HFD difference is technical or biological.
 
-For that reason, this notebook performs an uncorrected merge and dimensional
-reduction. We can visualize whether sample identity strongly structures the
-RNA or ATAC spaces, but we will not use anchors, Harmony, RPCA, CCA, or another
-batch-correction method to force the samples together.
+For that reason, this notebook performs an uncorrected merge and dimensional reduction. We can visualize whether sample identity strongly structures the RNA or ATAC spaces, but we will not use anchors, Harmony, RPCA, CCA, or another batch-correction method to force the samples together.
 
 This is an important analysis-design distinction:
 
 - **merge** = place cells in the same feature space so they can be analyzed together;
-- **integrate/batch-correct** = mathematically align datasets to remove unwanted
-  dataset-specific differences.
+- **integrate/batch-correct** = mathematically align datasets to remove unwanted dataset-specific differences.
 
-With biological replicates in a future experiment, integration can be evaluated
-without making treatment and sample identity inseparable.
+With biological replicates in a future experiment, integration can be evaluated without making treatment and sample identity inseparable.
 
 # 1. Setup
 
@@ -91,19 +80,11 @@ cat("Configured future workers:", future::nbrOfWorkers(), "\n")
 
 # 2. Define Step 4 parameters and output directories
 
-Dimensionality reduction requires a few explicit analysis choices. We record
-those choices here instead of hiding them inside later function calls.
+Dimensionality reduction requires a few explicit analysis choices. We record those choices here instead of hiding them inside later function calls.
 
-For RNA we use standard log normalization followed by 3,000 highly variable
-genes and 50 principal components. We do **not** regress out `sample_id`,
-`diet`, or mitochondrial percentage. Sample/diet regression would directly
-remove the contrast we eventually want to inspect, while mitochondrial signal
-has already been controlled through QC.
+For RNA we use standard log normalization followed by 3,000 highly variable genes and 50 principal components. We do **not** regress out `sample_id`, `diet`, or mitochondrial percentage. Sample/diet regression would directly remove the contrast we eventually want to inspect, while mitochondrial signal has already been controlled through QC.
 
-For ATAC we use the standard Signac TF-IDF + SVD workflow. LSI dimension 1 is
-excluded from the exploratory ATAC UMAP because the first LSI component is
-often strongly associated with sequencing depth. We will calculate that
-correlation explicitly rather than assuming it silently.
+For ATAC we use the standard Signac TF-IDF + SVD workflow. LSI dimension 1 is excluded from the exploratory ATAC UMAP because the first LSI component is often strongly associated with sequencing depth. We will calculate that correlation explicitly rather than assuming it silently.
 
 ```{r analysis-parameters}
 STEP4_DIR <- file.path(
@@ -157,11 +138,30 @@ analysis_parameters
 
 # 3. Confirm the Step 3 inputs
 
-This notebook requires the Step 3 completion marker, the canonical common peak
-set, and one common-feature post-QC object for every row in `samples.csv`.
+This notebook requires the Step 3 completion marker, the canonical common peak set, and one common-feature post-QC object for every row in `samples.csv`.
 
 ```{r confirm-step-three}
 sample_sheet <- read_sample_sheet()
+
+ggplot2::theme_set(theme_multiome())
+
+unknown_diets <- setdiff(
+  unique(sample_sheet$diet),
+  names(DIET_COLORS)
+)
+
+if (length(unknown_diets) > 0L) {
+  stop(
+    "No plotting colors defined for: ",
+    paste(unknown_diets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_colors <- stats::setNames(
+  unname(DIET_COLORS[sample_sheet$diet]),
+  sample_sheet$sample_id
+)
 
 step_three_marker <- file.path(
   OUTPUT_DIR,
@@ -219,12 +219,9 @@ step3_input_summary
 
 # 4. Load and validate the sample objects before merging
 
-The merge should only happen after we prove that all ATAC assays contain the
-same coordinates in the same order. Step 3 already performed this validation,
-but repeating the check here makes Step 4 independently safe.
+The merge should only happen after we prove that all ATAC assays contain the same coordinates in the same order. Step 3 already performed this validation, but repeating the check here makes Step 4 independently safe.
 
-We also verify that every sample contains both RNA and ATAC assays and that its
-fragment mapping still contains every retained cell.
+We also verify that every sample contains both RNA and ATAC assays and that its fragment mapping still contains every retained cell.
 
 ```{r validate-step-three-objects}
 step3_objects <- lapply(
@@ -350,15 +347,11 @@ premerge_validation
 
 # 5. Merge the Multiome objects
 
-Because the ATAC feature spaces are already identical, Signac can safely merge
-the `ChromatinAssay` objects and preserve the separate fragment-file mappings.
+Because the ATAC feature spaces are already identical, Signac can safely merge the `ChromatinAssay` objects and preserve the separate fragment-file mappings.
 
-Cell barcodes such as `AAAC...-1` can occur independently in both 10x
-libraries. `add.cell.ids` therefore prefixes each cell with its sample ID so
-that every merged cell name is globally unique.
+Cell barcodes such as `AAAC...-1` can occur independently in both 10x libraries. `add.cell.ids` therefore prefixes each cell with its sample ID so that every merged cell name is globally unique.
 
-We use `merge.data = FALSE` because RNA normalization will be performed fresh
-on the merged count matrix in this notebook.
+We use `merge.data = FALSE` because RNA normalization will be performed fresh on the merged count matrix in this notebook.
 
 ```{r merge-objects}
 for (i in seq_along(step3_objects)) {
@@ -388,14 +381,16 @@ print(
     useNA = "ifany"
   )
 )
+
+merged$sample_id <- factor(
+  merged$sample_id,
+  levels = sample_sheet$sample_id
+)
 ```
 
 ## Join the Seurat v5 RNA layers
 
-In Seurat v5, merging objects can preserve the individual RNA count matrices as
-separate assay layers. We are **not** performing RNA batch integration here, so
-we join those count layers into one ordinary RNA count layer before standard
-normalization.
+In Seurat v5, merging objects can preserve the individual RNA count matrices as separate assay layers. We are **not** performing RNA batch integration here, so we join those count layers into one ordinary RNA count layer before standard normalization.
 
 ```{r join-rna-layers}
 DefaultAssay(merged) <- "RNA"
@@ -434,11 +429,9 @@ if (!any(grepl(
 
 # 6. Validate the merged ATAC assay and fragment mappings
 
-Merging should not change the 130,476-feature common ATAC coordinate system.
-It should also retain one fragment mapping for each source library.
+Merging should not change the 130,476-feature common ATAC coordinate system. It should also retain one fragment mapping for each source library.
 
-If the gene annotation was lost during the merge, we restore the exact GRCm39
-GENCODE vM33 annotation saved in Step 0.
+If the gene annotation was lost during the merge, we restore the exact GRCm39GENCODEvM33 annotation saved in Step 0.
 
 ```{r validate-merged-atac}
 DefaultAssay(merged) <- "ATAC"
@@ -554,14 +547,9 @@ merged_atac_validation
 
 # 7. RNA preprocessing and PCA
 
-RNA and ATAC measure different molecular quantities and require different
-normalization approaches.
+RNA and ATAC measure different molecular quantities and require different normalization approaches.
 
-For RNA, `NormalizeData()` performs library-size normalization followed by a
-log transformation. `FindVariableFeatures()` then identifies genes whose
-cell-to-cell variation is especially informative relative to their average
-expression. PCA compresses those correlated gene-expression patterns into a
-small number of orthogonal dimensions.
+For RNA, `NormalizeData()` performs library-size normalization followed by a log transformation. `FindVariableFeatures()` then identifies genes whose cell-to-cell variation is especially informative relative to their average expression. PCA compresses those correlated gene-expression patterns into a small number of orthogonal dimensions.
 
 The RNA workflow is:
 
@@ -612,10 +600,7 @@ merged <- RunPCA(
 
 ## Inspect the RNA PCs
 
-An elbow plot is not a statistical test. It is a visual diagnostic showing how
-quickly the variance explained by successive PCs declines. Step 5 will use a
-predeclared exploratory range of PCs, but this plot remains part of the audit
-trail so the dimensional choice can be revisited if needed.
+An elbow plot is not a statistical test. It is a visual diagnostic showing how quickly the variance explained by successive PCs declines. Step 5 will use a predeclared exploratory range of PCs, but this plot remains part of the audit trail so the dimensional choice can be revisited if needed.
 
 ```{r inspect-rna-pca, fig.width=9, fig.height=5}
 p_rna_elbow <- ElbowPlot(
@@ -623,7 +608,23 @@ p_rna_elbow <- ElbowPlot(
   reduction = "pca",
   ndims = N_RNA_PCS
 ) +
-  ggtitle("RNA PCA elbow plot")
+  ggplot2::geom_vline(
+    xintercept = max(RNA_DIMS_EXPLORATORY),
+    linetype = "dashed",
+    linewidth = 0.6,
+    color = "#D55E00"
+  ) +
+  ggplot2::labs(
+    title = "RNA principal-component selection",
+    subtitle = paste0(
+  "The dashed line marks the ",
+  max(RNA_DIMS_EXPLORATORY),
+  " PCs used for exploratory reduction."
+),
+    x = "Principal component",
+    y = "Standard deviation"
+  ) +
+  theme_multiome()
 
 print(p_rna_elbow)
 
@@ -658,13 +659,9 @@ head(
 
 # 8. Build the RNA-only exploratory UMAP
 
-UMAP does not create the biological structure in the data; it provides a
-low-dimensional visualization of neighborhood relationships already captured
-by the selected PCs.
+UMAP does not create the biological structure in the data; it provides a low-dimensional visualization of neighborhood relationships already captured by the selected PCs.
 
-This RNA-only UMAP is useful for asking whether recognizable cell states emerge
-from gene expression and whether sample identity dominates the transcriptional
-space.
+This RNA-only UMAP is useful for asking whether recognizable cell states emerge from gene expression and whether sample identity dominates the transcriptional space.
 
 ```{r rna-umap}
 DefaultAssay(merged) <- "RNA"
@@ -675,6 +672,8 @@ merged <- RunUMAP(
   dims = RNA_DIMS_EXPLORATORY,
   reduction.name = "umap.rna",
   reduction.key = "rnaUMAP_",
+  umap.method = "uwot",
+  metric = "cosine",
   seed.use = 20260727,
   verbose = TRUE
 )
@@ -683,9 +682,20 @@ p_rna_sample <- DimPlot(
   merged,
   reduction = "umap.rna",
   group.by = "sample_id",
+  cols = sample_colors,
+  pt.size = 0.25,
+  seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("RNA UMAP — colored by sample")
+  ggplot2::labs(
+    title = "RNA structure before multimodal neighbor construction",
+    subtitle = paste(
+      "Colors indicate pooled libraries;",
+      "diet and sample identity are confounded in this two-library dataset."
+    ),
+    color = NULL
+  ) +
+  theme_multiome()
 
 print(p_rna_sample)
 
@@ -702,12 +712,9 @@ ggsave(
 
 # 9. ATAC preprocessing and latent semantic indexing
 
-ATAC counts are much sparser than RNA counts. Standard RNA log normalization
-is therefore not appropriate for the chromatin assay.
+ATAC counts are much sparser than RNA counts. Standard RNA log normalization is therefore not appropriate for the chromatin assay.
 
-Signac uses term-frequency inverse-document-frequency (TF-IDF) normalization
-followed by singular value decomposition (SVD), producing an LSI embedding.
-Conceptually:
+Signac uses term-frequency inverse-document-frequency (TF-IDF) normalization followed by singular value decomposition (SVD), producing an LSI embedding. Conceptually:
 
 - **term frequency** asks how much of a cell's ATAC signal occurs in a peak;
 - **inverse document frequency** downweights peaks that are accessible in nearly every cell and therefore provide less discrimination;
@@ -720,6 +727,91 @@ The ATAC workflow is:
 ```{r preprocess-atac}
 DefaultAssay(merged) <- "ATAC"
 
+# Identify common peaks that contain no counts across any retained cell.
+atac_counts <- SeuratObject::GetAssayData(
+  merged,
+  assay = "ATAC",
+  layer = "counts"
+)
+
+atac_feature_totals <- Matrix::rowSums(atac_counts)
+
+zero_count_atac_features <- rownames(atac_counts)[
+  atac_feature_totals == 0
+]
+
+retained_atac_features <- rownames(atac_counts)[
+  atac_feature_totals > 0
+]
+
+atac_feature_filter_summary <- data.frame(
+  canonical_common_ATAC_features = nrow(atac_counts),
+  zero_count_ATAC_features_removed =
+    length(zero_count_atac_features),
+  ATAC_features_retained_for_TFIDF =
+    length(retained_atac_features)
+)
+
+atac_feature_filter_summary
+
+if (length(zero_count_atac_features) > 0L) {
+  message(
+    "Removing ",
+    length(zero_count_atac_features),
+    " common ATAC features with zero counts across all retained cells."
+  )
+
+  merged[["ATAC"]] <- subset(
+    x = merged[["ATAC"]],
+    features = retained_atac_features
+  )
+}
+
+# Confirm that the analysis-ready ATAC assay contains no all-zero rows.
+filtered_atac_counts <- SeuratObject::GetAssayData(
+  merged,
+  assay = "ATAC",
+  layer = "counts"
+)
+
+remaining_zero_count_features <- sum(
+  Matrix::rowSums(filtered_atac_counts) == 0
+)
+
+if (remaining_zero_count_features != 0L) {
+  stop(
+    "Zero-count ATAC features remain after filtering.",
+    call. = FALSE
+  )
+}
+
+if (
+  nrow(merged[["ATAC"]]) !=
+    atac_feature_filter_summary$ATAC_features_retained_for_TFIDF
+) {
+  stop(
+    "The filtered ATAC assay does not contain the expected number of features.",
+    call. = FALSE
+  )
+}
+
+cat(
+  "ATAC features retained for TF-IDF:",
+  nrow(merged[["ATAC"]]),
+  "\n"
+)
+
+rm(
+  atac_counts,
+  atac_feature_totals,
+  zero_count_atac_features,
+  retained_atac_features,
+  filtered_atac_counts,
+  remaining_zero_count_features
+)
+
+invisible(gc())
+
 merged <- RunTFIDF(
   merged,
   method = 1,
@@ -729,7 +821,7 @@ merged <- RunTFIDF(
 
 merged <- FindTopFeatures(
   merged,
-  min.cutoff = "q0",
+  min.cutoff = 0,
   verbose = TRUE
 )
 
@@ -748,13 +840,9 @@ merged <- RunSVD(
 
 # 10. Quantify ATAC sequencing-depth correlation
 
-LSI dimension 1 frequently tracks sequencing depth in scATAC-seq. Rather than
-simply repeating that rule, we calculate the Spearman correlation between each
-LSI component and the fragment-derived ATAC depth stored in Step 3.
+LSI dimension 1 frequently tracks sequencing depth in scATAC-seq. Rather than simply repeating that rule, we calculate the Spearman correlation between each LSI component and the fragment-derived ATAC depth stored in Step 3.
 
-A strong depth correlation does not mean that an LSI component is "wrong"; it
-means that the component contains substantial technical depth information and
-should generally not drive biological neighborhood construction.
+A strong depth correlation does not mean that an LSI component is "wrong"; it means that the component contains substantial technical depth information and should generally not drive biological neighborhood construction.
 
 ```{r atac-depth-correlation, fig.width=10, fig.height=5}
 if (!"nCount_ATAC_common" %in% colnames(merged[[]])) {
@@ -800,27 +888,46 @@ head(
   15
 )
 
-p_lsi_depth <- ggplot(
-  subset(
-    lsi_depth_summary,
-    dimension <= 20
-  ),
-  aes(
+lsi_plot_data <- subset(
+  lsi_depth_summary,
+  dimension <= 20
+) |>
+  dplyr::mutate(
+    dimension_status = ifelse(
+      dimension %in% ATAC_DIMS_EXPLORATORY,
+      "Used",
+      "Excluded"
+    )
+  )
+
+p_lsi_depth <- ggplot2::ggplot(
+  lsi_plot_data,
+  ggplot2::aes(
     x = factor(dimension),
-    y = spearman_depth_correlation
+    y = spearman_depth_correlation,
+    fill = dimension_status
   )
 ) +
-  geom_col() +
-  geom_hline(
+  ggplot2::geom_col(width = 0.8) +
+  ggplot2::geom_hline(
     yintercept = 0,
-    linetype = "dashed"
+    linetype = "dashed",
+    color = "grey35"
   ) +
-  labs(
-    title = "ATAC LSI correlation with sequencing depth",
+  ggplot2::scale_fill_manual(
+    values = c(
+      Used = "#756BB1",
+      Excluded = "#B8B8B8"
+    )
+  ) +
+  ggplot2::labs(
+    title = "ATAC LSI association with sequencing depth",
+    subtitle = "LSI 1 is excluded because it is dominated by ATAC depth.",
     x = "LSI dimension",
-    y = "Spearman correlation with log10 ATAC depth"
+    y = "Spearman correlation with log10 ATAC depth",
+    fill = NULL
   ) +
-  theme_minimal(base_size = 12)
+  theme_multiome()
 
 print(p_lsi_depth)
 
@@ -837,9 +944,7 @@ ggsave(
 
 # 11. Build the ATAC-only exploratory UMAP
 
-The ATAC UMAP uses LSI dimensions 2–30, excluding LSI 1 from neighborhood
-visualization. The depth-correlation table above should always be inspected to
-confirm that this remains a reasonable choice for the current dataset.
+The ATAC UMAP uses LSI dimensions 2–30, excluding LSI 1 from neighborhood visualization. The depth-correlation table above should always be inspected to confirm that this remains a reasonable choice for the current dataset.
 
 ```{r atac-umap}
 DefaultAssay(merged) <- "ATAC"
@@ -850,6 +955,8 @@ merged <- RunUMAP(
   dims = ATAC_DIMS_EXPLORATORY,
   reduction.name = "umap.atac",
   reduction.key = "atacUMAP_",
+  umap.method = "uwot",
+  metric = "cosine",
   seed.use = 20260727,
   verbose = TRUE
 )
@@ -858,9 +965,20 @@ p_atac_sample <- DimPlot(
   merged,
   reduction = "umap.atac",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("ATAC UMAP — colored by sample")
+  ggplot2::labs(
+  title = "ATAC structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 print(p_atac_sample)
 
@@ -873,6 +991,36 @@ ggsave(
   width = 8,
   height = 6
 )
+
+merged$log10_nCount_ATAC_common <- log10(
+  merged$nCount_ATAC_common + 1
+)
+
+p_atac_depth <- FeaturePlot(
+  merged,
+  features = "log10_nCount_ATAC_common",
+  reduction = "umap.atac",
+  order = TRUE,
+  pt.size = 0.25
+) +
+  ggplot2::labs(
+    title = "ATAC depth across the accessibility embedding",
+    subtitle = "Depth is shown for diagnostic review, not as a biological state.",
+    color = expression(log[10]~"ATAC counts")
+  ) +
+  theme_multiome()
+
+print(p_atac_depth)
+
+ggplot2::ggsave(
+  filename = file.path(
+    STEP4_PLOT_DIR,
+    "04B_ATAC_UMAP_by_depth.pdf"
+  ),
+  plot = p_atac_depth,
+  width = 8,
+  height = 6
+)
 ```
 
 # 12. First biological preview: mouse-colon epithelial RNA markers
@@ -880,10 +1028,7 @@ ggsave(
 We have not clustered or annotated cells yet. This section is therefore a
 **sanity check**, not a cell-type assignment step.
 
-The marker panel below represents several major epithelial programs expected
-in the mouse colon. Only genes actually present in the RNA assay are plotted.
-Their purpose is to ask whether recognizable biological expression patterns
-occupy coherent regions of the RNA embedding.
+The marker panel below represents several major epithelial programs expected in the mouse colon. Only genes actually present in the RNA assay are plotted. Their purpose is to ask whether recognizable biological expression patterns occupy coherent regions of the RNA embedding.
 
 Examples include:
 
@@ -895,9 +1040,7 @@ Examples include:
 - `Chga`: enteroendocrine-associated program;
 - `Dclk1`: tuft-cell-associated program.
 
-The presence or absence of any one marker is not sufficient to assign a cell
-identity. Formal cluster annotation is performed in a later step using
-multi-gene programs and multimodal evidence.
+The presence or absence of any one marker is not sufficient to assign a cell identity. Formal cluster annotation is performed in a later step using multi-gene programs and multimodal evidence.
 
 ```{r biological-marker-preview, fig.width=12, fig.height=12}
 DefaultAssay(merged) <- "RNA"
@@ -949,7 +1092,6 @@ cat(
 )
 
 if (length(present_markers) > 0L) {
-
   p_marker_preview <- FeaturePlot(
     merged,
     features = present_markers,
@@ -960,13 +1102,13 @@ if (length(present_markers) > 0L) {
     ncol = 4
   )
 
+  p_marker_preview <- p_marker_preview &
+  theme_multiome(base_size = 9)
+
   print(p_marker_preview)
 
   ggsave(
-    filename = file.path(
-      STEP4_PLOT_DIR,
-      "05_RNA_mouse_colon_marker_preview.pdf"
-    ),
+    filename = file.path(STEP4_PLOT_DIR, "05_RNA_mouse_colon_marker_preview.pdf"),
     plot = p_marker_preview,
     width = 12,
     height = 12
@@ -976,30 +1118,48 @@ if (length(present_markers) > 0L) {
 
 # 13. Compare the RNA and ATAC embeddings
 
-These are still **modality-specific** views. We are not expecting the two UMAPs
-to have identical geometry. Instead, look for broad agreement in whether cells
-form structured populations and whether one modality appears much more
-sample-dominated than the other.
+These are still **modality-specific** views. We are not expecting the two UMAPs to have identical geometry. Instead, look for broad agreement in whether cells form structured populations and whether one modality appears much more sample-dominated than the other.
 
-Step 5 will combine the RNA PCA and ATAC LSI neighborhoods with WNN rather than
-trying to average these two UMAP coordinate systems.
+Step 5 will combine the RNA PCA and ATAC LSI neighborhoods with WNN rather than trying to average these two UMAP coordinate systems.
 
 ```{r compare-modality-embeddings, fig.width=12, fig.height=6}
 p_rna_compare <- DimPlot(
   merged,
   reduction = "umap.rna",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("RNA")
+  ggplot2::labs(
+  title = "RNA structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 p_atac_compare <- DimPlot(
   merged,
   reduction = "umap.atac",
   group.by = "sample_id",
+  cols = sample_colors,
+pt.size = 0.25,
+seed = 20260727,
   shuffle = TRUE
 ) +
-  ggtitle("ATAC")
+  ggplot2::labs(
+  title = "ATAC structure before multimodal neighbor construction",
+  subtitle = paste(
+    "Colors indicate pooled libraries;",
+    "diet and sample identity are confounded in this two-library dataset."
+  ),
+  color = NULL
+) +
+theme_multiome()
 
 if (requireNamespace(
   "patchwork",
@@ -1026,8 +1186,7 @@ if (requireNamespace(
 
 # 14. Save the Step 4 audit trail
 
-The audit outputs make the dimensional-reduction decisions recoverable without
-having to reopen the full Seurat object.
+The audit outputs make the dimensional-reduction decisions recoverable without having to reopen the full Seurat object.
 
 ```{r save-step-four-audit}
 cell_counts_by_sample <- as.data.frame(
@@ -1047,13 +1206,23 @@ step4_summary <- data.frame(
   RNA_features = nrow(merged[["RNA"]]),
   RNA_variable_features = length(rna_variable_features),
   PCA_dimensions = ncol(Embeddings(merged, "pca")),
+
+  canonical_common_ATAC_features =
+    atac_feature_filter_summary$canonical_common_ATAC_features[[1]],
+
+  zero_count_ATAC_features_removed =
+    atac_feature_filter_summary$zero_count_ATAC_features_removed[[1]],
+
   ATAC_features = nrow(merged[["ATAC"]]),
+
   ATAC_features_used_for_LSI = length(
     VariableFeatures(
       merged[["ATAC"]]
     )
   ),
+
   LSI_dimensions = ncol(Embeddings(merged, "lsi")),
+
   fragment_objects = length(
     Signac::Fragments(
       merged[["ATAC"]]
@@ -1118,29 +1287,28 @@ readr::write_csv(
     "step4_summary.csv"
   )
 )
+
+readr::write_csv(
+  atac_feature_filter_summary,
+  file.path(
+    STEP4_DIR,
+    "ATAC_feature_filter_summary.csv"
+  )
+)
 ```
 
 # 15. Save the reduced merged object
 
-This checkpoint contains the raw RNA and ATAC assays, normalized RNA data,
-RNA PCA, ATAC TF-IDF values, ATAC LSI, both modality-specific UMAPs, metadata,
-gene annotation, and fragment-file mappings.
+This checkpoint contains the raw RNA and ATAC assays, normalized RNA data, RNA PCA, ATAC TF-IDF values, ATAC LSI, both modality-specific UMAPs, metadata, gene annotation, and fragment-file mappings.
 
 Step 5 will load this object and build the weighted nearest-neighbor graph.
 
 ```{r save-reduced-object}
 DefaultAssay(merged) <- "RNA"
 
-step4_object_path <- file.path(
-  STEP4_DIR,
-  "Ppar_iKO_multiome_merged_reduced.rds"
-)
+step4_object_path <- file.path(STEP4_DIR, "multiome_merged_reduced.rds")
 
-saveRDS(
-  merged,
-  step4_object_path,
-  compress = FALSE
-)
+saveRDS(merged, step4_object_path, compress = FALSE)
 
 saved_object_info <- data.frame(
   path = step4_object_path,
@@ -1151,34 +1319,24 @@ saved_object_info <- data.frame(
 saved_object_info
 
 if (!isTRUE(saved_object_info$exists)) {
-  stop(
-    "The Step 4 merged object was not saved successfully.",
-    call. = FALSE
-  )
+  stop("The Step 4 merged object was not saved successfully.", call. = FALSE)
 }
 
 writeLines(
   c(
+    paste("Step 4 completed:", format(Sys.time())),
+    paste("Merged cells:", ncol(merged)),
+    paste("RNA PCA dimensions:", ncol(Embeddings(merged, "pca"))),
+    paste("ATAC LSI dimensions:", ncol(Embeddings(merged, "lsi"))),
     paste(
-      "Step 4 completed:",
-      format(Sys.time())
+      "Canonical common ATAC features:",
+      atac_feature_filter_summary$canonical_common_ATAC_features[[1]]
     ),
     paste(
-      "Merged cells:",
-      ncol(merged)
+      "Zero-count ATAC features removed:",
+      atac_feature_filter_summary$zero_count_ATAC_features_removed[[1]]
     ),
-    paste(
-      "RNA PCA dimensions:",
-      ncol(Embeddings(merged, "pca"))
-    ),
-    paste(
-      "ATAC LSI dimensions:",
-      ncol(Embeddings(merged, "lsi"))
-    ),
-    paste(
-      "Common ATAC features:",
-      nrow(merged[["ATAC"]])
-    ),
+    paste("ATAC features retained for TF-IDF:", nrow(merged[["ATAC"]])),
     "Batch integration performed: FALSE",
     paste(
       "RNA exploratory dimensions:",
@@ -1189,10 +1347,7 @@ writeLines(
       paste(ATAC_DIMS_EXPLORATORY, collapse = ",")
     )
   ),
-  file.path(
-    STEP4_DIR,
-    "STEP_04_COMPLETE.txt"
-  )
+  file.path(STEP4_DIR, "STEP_04_COMPLETE.txt")
 )
 ```
 
@@ -1217,9 +1372,7 @@ Before proceeding to WNN, be able to answer the following questions:
 Step 5 will use the paired measurements from each nucleus to construct a
 **weighted nearest-neighbor (WNN)** representation.
 
-For every cell, WNN learns how informative RNA and ATAC are for defining that
-cell's neighborhood. The two modalities are therefore not forced to contribute
-an equal amount. The resulting WNN graph will be used for:
+For every cell, WNN learns how informative RNA and ATAC are for defining that cell's neighborhood. The two modalities are therefore not forced to contribute an equal amount. The resulting WNN graph will be used for:
 
 - multimodal UMAP visualization;
 - graph-based clustering;

@@ -52,7 +52,30 @@ A practical current location is:
 /scratch/dsaiz/Yesenia_scData2026/multiome_scRNA-ATAC
 ```
 
-The analysis does not depend on that exact repository location. The data paths are currently explicit in `config/project_config.R` and `config/samples.csv`.
+The analysis does not depend on that exact repository location. The data paths are currently explicit in `config/project_config.R` and `config/datasets/<dataset_version>/samples.csv`.
+
+## Select the dataset and cohort
+
+The project configuration reads two environment variables. Set them in the
+RStudio Console before running a notebook's setup chunk:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "ppar"
+)
+```
+
+Valid v2 cohort IDs are `ppar`, `wt`, and `il17`. The v1 initial-depth dataset
+contains only `ppar`. If the variables are unset, the workflow defaults to the
+v2 PPAR cohort. Restarting R clears console-only selections, so confirm the
+active configuration table in Step 0 before creating outputs.
+
+Each independent run writes beneath:
+
+```text
+/scratch/dsaiz/Yesenia_scData2026/results/<dataset_version>/independent/<cohort_id>/
+```
 
 ## RStudio is not the storage location
 
@@ -78,4 +101,3 @@ For Steps 1–2:
 3. confirm completed checkpoint files under the configured `OUTPUT_DIR`;
 4. leave checkpoint reuse enabled;
 5. rerun the notebook from the top so it reconstructs the small in-memory variables safely.
-

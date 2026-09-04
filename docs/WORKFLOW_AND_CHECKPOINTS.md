@@ -30,7 +30,8 @@ flowchart TD
 ### Inputs
 
 - `config/project_config.R`
-- `config/samples.csv`
+- `config/datasets/<dataset_version>/samples.csv`
+- `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`
 - Cell Ranger ARC `outs/` directories
 - GRCm39 / GENCODE vM33 reference annotation
 
@@ -48,6 +49,7 @@ Expected records include:
 - `compute_environment.csv`
 - `sessionInfo.txt`
 - `sample_sheet_used.csv`
+- `run_configuration.csv`
 - `cellranger_input_report.csv`
 - `GRCm39_GENCODE_vM33_gene_annotation.rds`
 - `STEP_00_COMPLETE.txt`
@@ -58,15 +60,10 @@ Are the expected files, software environment, sample metadata, genome build, and
 
 ### Experimental-design limitation
 
-The CON library contains colon epithelial cells pooled from 6 mice:
-
-- 2 female
-- 4 male
-
-The HFD library contains colon epithelial cells pooled from 10 mice:
-
-- 2 female
-- 8 male
+Every current cohort contains one pooled CON library and one pooled HFD
+library. The PPAR manifest records 6 mice (2 female, 4 male) in CON and 10 mice
+(2 female, 8 male) in HFD. WT and IL17 pooling counts remain `NA` pending
+wet-lab confirmation.
 
 Individual mouse identities are not recoverable after pooling. Therefore, pooled-library identity and diet condition are completely confounded.
 
@@ -82,7 +79,7 @@ The nuclei within a library are not independent biological replicates for diet-l
 - ATAC fragment file and tabix index
 - per-barcode Cell Ranger metrics
 - saved GRCm39 / GENCODE vM33 annotation
-- `config/samples.csv`
+- `config/datasets/<dataset_version>/samples.csv`
 
 ### Main operations
 
@@ -132,7 +129,7 @@ Step 1 calculates QC metrics and provides starting threshold suggestions. Those 
 - Step 1 QC checkpoints
 - Step 1 QC tables
 - Step 1 QC plots
-- reviewed `config/qc_thresholds.csv`
+- reviewed `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`
 
 ### Main operations
 
@@ -175,7 +172,7 @@ Completion marker:
 
 ### Decision point
 
-Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/qc_thresholds.csv`.
+Final QC thresholds, reviewer information, review date, notes, and approval are recorded in `config/datasets/<dataset_version>/cohorts/<cohort_id>/qc_thresholds.csv`.
 
 ---
 
@@ -331,7 +328,7 @@ Outputs are written under:
 The primary checkpoint is:
 
 ```text
-04_reduction/Ppar_iKO_multiome_merged_reduced.rds
+04_reduction/multiome_merged_reduced.rds
 ```
 
 Additional outputs include:
@@ -392,7 +389,8 @@ LSI dimensions 2-30
 - compare cluster stability and granularity;
 - inspect library representation within clusters;
 - inspect mouse-colon epithelial marker programs;
-- manually choose one working clustering resolution.
+- record one manually reviewed clustering resolution in the active cohort's
+  version-controlled decision table.
 
 ### WNN objects
 
@@ -443,13 +441,14 @@ Observed cluster counts:
 | 0.8 | 23 |
 | 1.0 | 23 |
 
-### Reviewed working resolution
+### Example reviewed working resolution
 
 ```text
 0.8
 ```
 
-This resolution was selected after comparing:
+For the original PPAR development run, this resolution was selected after
+comparing:
 
 - cluster stability;
 - biologically coherent subdivisions;
@@ -484,7 +483,13 @@ Outputs are written under:
 The primary checkpoint is:
 
 ```text
-05_wnn/Ppar_iKO_multiome_WNN_clustered.rds
+05_wnn/multiome_WNN_clustered.rds
+```
+
+The reviewed resolution is stored separately from the large checkpoint:
+
+```text
+config/datasets/<dataset_version>/cohorts/<cohort_id>/clustering_decision.csv
 ```
 
 Additional outputs include:
@@ -519,21 +524,21 @@ and there are not multiple independently measured libraries within each diet.
 
 ### Status
 
-Next analysis unit.
+PPAR complete; WT and IL17 require independent cohort-specific review.
 
 ### Inputs
 
 - finalized Step 5 WNN object
-- reviewed WNN resolution `0.8`
+- approved cohort-specific WNN clustering decision
 - cluster-level RNA marker results
 - mouse-colon epithelial marker programs
 - targeted ATAC evidence where informative
 
-### Planned strategy
+### Strategy
 
-Step 6 will separate **marker discovery** from **annotation decisions**.
+Step 6 separates **marker discovery** from **annotation decisions**.
 
-Planned operations include:
+Operations include:
 
 - identify RNA markers for every WNN cluster;
 - examine marker effect size and prevalence;
@@ -549,32 +554,29 @@ Planned operations include:
 
 Cell-level marker statistics may help rank annotation evidence, but their P values will not be interpreted as replicated treatment inference.
 
-### Planned version-controlled decision record
+### Version-controlled decision record
 
-Annotation decisions should be stored in:
+Annotation decisions are stored in:
 
 ```text
-config/cluster_annotations.csv
+config/datasets/<dataset_version>/cohorts/<cohort_id>/cell_state_annotations.csv
 ```
 
-The table should retain fields such as:
+The table retains the cluster evidence generated by Step 6 together with
+fields such as:
 
 ```text
 cluster
-preliminary_label
-final_label
-broad_lineage
-rna_evidence
-atac_evidence
-confidence
-reviewer
-review_date
-notes
+broad_compartment
+cell_state
+annotation_confidence
+evidence_summary
+approved
 ```
 
 This keeps biological interpretation reviewable independently of the large Seurat object.
 
-### Planned outputs
+### Outputs
 
 Outputs will be written under:
 
@@ -582,7 +584,7 @@ Outputs will be written under:
 06_annotation/
 ```
 
-Expected outputs include:
+Outputs include:
 
 - cluster-level RNA marker tables;
 - marker-program summaries;

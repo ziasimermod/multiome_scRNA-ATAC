@@ -247,7 +247,7 @@ for (row_index in seq_len(nrow(sample_sheet))) {
 
 Count cutoffs are suggested from broad hard limits plus four median absolute deviations on a log scale within each sample. This is a robust way to identify extreme tails, but it cannot decide whether a tail represents a rare, valid colon population. That requires plots and marker-aware biological judgment.
 
-This chunk fills previously blank numeric cells in `config/qc_thresholds.csv`. It does **not** change `approved` to `TRUE` and does not overwrite numeric decisions that are already present.
+This chunk fills previously blank numeric cells in the active dataset-specific QC decision table (`QC_DECISION_PATH`). It does **not** change `approved` to `TRUE` and does not overwrite numeric decisions that are already present.
 
 ```{r save-suggestions}
 threshold_suggestions <- dplyr::bind_rows(threshold_suggestions)

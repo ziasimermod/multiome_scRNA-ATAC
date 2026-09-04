@@ -51,6 +51,8 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(Signac)
 })
+
+ggplot2::theme_set(theme_multiome())
 ```
 
 # 2. Load the small QC tables first
@@ -62,6 +64,23 @@ step_one_marker <- file.path(OUTPUT_DIR, "01_qc", "STEP_01_COMPLETE.txt")
 assert_file(step_one_marker, "Step 1 completion marker")
 
 sample_sheet <- read_sample_sheet()
+
+unknown_diets <- setdiff(
+  unique(as.character(sample_sheet$diet)),
+  names(DIET_COLORS)
+)
+
+if (length(unknown_diets) > 0L) {
+  stop(
+    "No plotting colors defined for: ",
+    paste(unknown_diets, collapse = ", ")
+  )
+}
+
+sample_colors <- stats::setNames(
+  unname(DIET_COLORS[as.character(sample_sheet$diet)]),
+  sample_sheet$sample_id
+)
 
 metadata_tables <- lapply(sample_sheet$sample_id, function(sample_id) {
   path <- file.path(
@@ -80,13 +99,67 @@ suggestions <- suppressMessages(readr::read_csv(
   file.path(OUTPUT_DIR, "01_qc", "qc_thresholds_suggested.csv"),
   show_col_types = FALSE
 ))
-decisions <- suppressMessages(readr::read_csv(
+decisions_preview <- suppressMessages(readr::read_csv(
   QC_DECISION_PATH,
   show_col_types = FALSE
 ))
 
 suggestions
-decisions
+decisions_preview
+
+# Load the proposed QC thresholds for diagnostic preview plots.
+#
+# This deliberately reads the table without enforcing approval yet.
+# The approval check occurs later, immediately before final filtering.
+```
+
+```{r}
+required_preview_columns <- c(
+  "sample_id",
+  "nCount_RNA_min",
+  "nCount_RNA_max",
+  "nFeature_RNA_min",
+  "nFeature_RNA_max",
+  "nCount_ATAC_min",
+  "nCount_ATAC_max",
+  "percent_mt_max",
+  "TSS_enrichment_min",
+  "nucleosome_signal_max",
+  "frip_min"
+)
+
+missing_preview_columns <- setdiff(
+  required_preview_columns,
+  names(decisions_preview)
+)
+
+if (length(missing_preview_columns) > 0L) {
+  stop(
+    "QC decision table is missing required columns: ",
+    paste(missing_preview_columns, collapse = ", ")
+  )
+}
+
+get_preview_thresholds <- function(target_sample_id) {
+
+  thresholds <- decisions_preview[
+    decisions_preview$sample_id == target_sample_id,
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(thresholds) != 1L) {
+    stop(
+      "Expected exactly one QC threshold row for ",
+      target_sample_id,
+      "; found ",
+      nrow(thresholds),
+      "."
+    )
+  }
+
+  thresholds
+}
 ```
 
 # 3. Compare samples without pooling their thresholds
@@ -115,12 +188,12 @@ qc_long$metric <- factor(qc_long$metric, levels = metric_order)
 ggplot2::ggplot(qc_long, ggplot2::aes(sample_id, value, fill = sample_id)) +
   ggplot2::geom_violin(scale = "width", color = "grey25") +
   ggplot2::facet_wrap(~ metric, scales = "free_y", ncol = 4) +
+  ggplot2::scale_fill_manual(values = sample_colors) +
   ggplot2::labs(
     title = "Pre-filter QC distributions by Cell Ranger library",
     x = NULL,
     y = NULL
   ) +
-  ggplot2::theme_classic(base_size = 11) +
   ggplot2::theme(legend.position = "none")
 ```
 
@@ -134,8 +207,7 @@ ggplot2::ggplot(
   ggplot2::scale_y_log10() +
   ggplot2::scale_color_viridis_c() +
   ggplot2::facet_wrap(~ sample_id) +
-  ggplot2::labs(title = "RNA complexity before filtering") +
-  ggplot2::theme_classic(base_size = 11)
+  ggplot2::labs(title = "RNA complexity before filtering")
 ```
 
 ```{r compare-atac}
@@ -147,8 +219,7 @@ ggplot2::ggplot(
   ggplot2::scale_x_log10() +
   ggplot2::scale_color_viridis_c() +
   ggplot2::facet_wrap(~ sample_id) +
-  ggplot2::labs(title = "ATAC quality before filtering") +
-  ggplot2::theme_classic(base_size = 11)
+  ggplot2::labs(title = "ATAC quality before filtering")
 ```
 
 # 3A. Inspect doublet calls relative to library size
@@ -179,6 +250,10 @@ ggplot2::ggplot(
     alpha = 0.35,
     size = 0.45
   ) +
+  ggplot2::scale_color_manual(
+  values = DOUBLET_CLASS_COLORS,
+  drop = FALSE
+) +
   ggplot2::scale_x_log10() +
   ggplot2::scale_y_log10() +
   ggplot2::facet_wrap(~ sample_id) +
@@ -187,59 +262,57 @@ ggplot2::ggplot(
     x = "RNA UMIs",
     y = "ATAC counts",
     color = "scDblFinder"
-  ) +
-  ggplot2::theme_classic(base_size = 11)
+  )
 ```
+
 # 3B. Lower limit summary for RNA and ATAC
-```{r}
-lower_tail_summary <- lapply(
-  sample_sheet$sample_id,
-  function(sample_id) {
+```{r plot-rna-bin-pass, fig.width=10, fig.height=7}
+lower_tail_summary <- lapply(sample_sheet$sample_id, function(sample_id) {
+  metadata <- metadata_tables[[sample_id]]
 
-    metadata <- metadata_tables[[sample_id]]
-
-    metadata |>
-      dplyr::mutate(
-        RNA_bin = cut(
-          nCount_RNA,
-          breaks = c(-Inf, 200, 300, 400, 500, 750, 1000, Inf),
-          labels = c(
-            "<200",
-            "200-299",
-            "300-399",
-            "400-499",
-            "500-749",
-            "750-999",
-            ">=1000"
-          ),
-          right = FALSE
+  metadata |>
+    dplyr::mutate(
+      RNA_bin = cut(
+        nCount_RNA,
+        breaks = c(-Inf, 200, 300, 400, 500, 750, 1000, Inf),
+        labels = c(
+          "<200",
+          "200-299",
+          "300-399",
+          "400-499",
+          "500-749",
+          "750-999",
+          ">=1000"
         ),
-        ATAC_bin = cut(
-          nCount_ATAC,
-          breaks = c(-Inf, 500, 750, 1000, 1500, 2000, Inf),
-          labels = c(
-            "<500",
-            "500-749",
-            "750-999",
-            "1000-1499",
-            "1500-1999",
-            ">=2000"
-          ),
-          right = FALSE
-        )
-      ) |>
-      dplyr::group_by(RNA_bin) |>
-      dplyr::summarise(
-        sample_id = .env$sample_id,
-        modality = "RNA",
-        n = dplyr::n(),
-        median_features = median(nFeature_RNA),
-        median_mt = median(percent.mt),
-        singlet_pct = 100 * mean(scDblFinder.class == "singlet"),
-        .groups = "drop"
+        right = FALSE
+      ),
+      ATAC_bin = cut(
+        nCount_ATAC,
+        breaks = c(-Inf, 500, 750, 1000, 1500, 2000, Inf),
+        labels = c(
+          "<500",
+          "500-749",
+          "750-999",
+          "1000-1499",
+          "1500-1999",
+          ">=2000"
+        ),
+        right = FALSE
       )
-  }
-) |>
+    ) |>
+    dplyr::group_by(RNA_bin) |>
+    dplyr::summarise(
+      sample_id = .env$sample_id,
+      modality = "RNA",
+      n = dplyr::n(),
+      median_features = median(nFeature_RNA, na.rm = TRUE),
+      median_mt = median(percent.mt, na.rm = TRUE),
+      singlet_pct = 100 * mean(
+        scDblFinder.class == "singlet",
+        na.rm = TRUE),
+      .groups = "drop"
+    )
+}) |>
   dplyr::bind_rows()
 
 lower_tail_summary
@@ -273,7 +346,10 @@ lower_atac_summary <- lapply(
         median_TSS = median(TSS.enrichment, na.rm = TRUE),
         median_FRiP = median(frip_cr, na.rm = TRUE),
         median_nucleosome = median(nucleosome_signal, na.rm = TRUE),
-        singlet_pct = 100 * mean(scDblFinder.class == "singlet"),
+        singlet_pct = 100 * mean(
+  scDblFinder.class == "singlet",
+  na.rm = TRUE
+),
         .groups = "drop"
       )
   }
@@ -289,12 +365,12 @@ rna_bin_pass_summary <- lapply(
   function(sample_id) {
 
     metadata <- metadata_tables[[sample_id]]
+    thresholds <- get_preview_thresholds(sample_id)
 
-    thresholds <- decisions_preview[
-      decisions_preview$sample_id == sample_id,
-      ,
-      drop = FALSE
-    ]
+    feature_min <- thresholds$nFeature_RNA_min[[1]]
+    mt_max <- thresholds$percent_mt_max[[1]]
+    TSS_min <- thresholds$TSS_enrichment_min[[1]]
+    FRiP_min <- thresholds$frip_min[[1]]
 
     metadata |>
       dplyr::mutate(
@@ -320,25 +396,25 @@ rna_bin_pass_summary <- lapply(
 
         feature_pass_pct =
           100 * mean(
-            nFeature_RNA >= thresholds$nFeature_RNA_min,
+            nFeature_RNA >= feature_min,
             na.rm = TRUE
           ),
 
         mt_pass_pct =
           100 * mean(
-            percent.mt <= thresholds$percent_mt_max,
+            percent.mt <= mt_max,
             na.rm = TRUE
           ),
 
         TSS_pass_pct =
           100 * mean(
-            TSS.enrichment >= thresholds$TSS_enrichment_min,
+            TSS.enrichment >= TSS_min,
             na.rm = TRUE
           ),
 
         FRiP_pass_pct =
           100 * mean(
-            frip_cr >= thresholds$frip_min,
+            frip_cr >= FRiP_min,
             na.rm = TRUE
           ),
 
@@ -354,8 +430,84 @@ rna_bin_pass_summary <- lapply(
 ) |>
   dplyr::bind_rows()
 
-rna_bin_pass_summary
+rna_bin_pass_plot_data <- rna_bin_pass_summary |>
+  tidyr::pivot_longer(
+    cols = c(
+      feature_pass_pct,
+      mt_pass_pct,
+      TSS_pass_pct,
+      FRiP_pass_pct,
+      singlet_pct
+    ),
+    names_to = "metric",
+    values_to = "pass_pct"
+  ) |>
+  dplyr::mutate(
+    metric = factor(
+      metric,
+      levels = c(
+        "feature_pass_pct",
+        "mt_pass_pct",
+        "TSS_pass_pct",
+        "FRiP_pass_pct",
+        "singlet_pct"
+      ),
+      labels = c(
+        "RNA features",
+        "Mitochondrial fraction",
+        "TSS enrichment",
+        "FRiP",
+        "Singlet classification"
+      )
+    )
+  )
 
+rna_bin_pass_plot <- ggplot2::ggplot(
+  rna_bin_pass_plot_data,
+  ggplot2::aes(
+    x = RNA_bin,
+    y = pass_pct,
+    color = sample_id,
+    group = sample_id
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.85) +
+  ggplot2::geom_point(size = 2.2) +
+  ggplot2::facet_wrap(
+    ggplot2::vars(metric),
+    ncol = 2
+  ) +
+  ggplot2::scale_color_manual(
+    values = sample_colors
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 25),
+    labels = scales::label_percent(scale = 1),
+    expand = ggplot2::expansion(mult = c(0, 0.03))
+  ) +
+  ggplot2::labs(
+    title = "Independent QC performance across RNA-count bins",
+    subtitle = paste(
+      "Each panel shows the percentage of cells passing one QC metric;",
+      "metrics are evaluated independently."
+    ),
+    x = "RNA UMI bin",
+    y = "Cells passing metric",
+    color = NULL
+  ) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+rna_bin_pass_summary
+rna_bin_pass_plot
+```
+
+```{r plot-atac-bin-pass, fig.width=10, fig.height=7}
 # Percentage passing independent QC metrics within ATAC-count bins
 
 atac_bin_pass_summary <- lapply(
@@ -363,12 +515,7 @@ atac_bin_pass_summary <- lapply(
   function(sample_id) {
 
     metadata <- metadata_tables[[sample_id]]
-
-    thresholds <- decisions_preview[
-      decisions_preview$sample_id == sample_id,
-      ,
-      drop = FALSE
-    ]
+    thresholds <- get_preview_thresholds(sample_id)
 
     metadata |>
       dplyr::mutate(
@@ -427,11 +574,85 @@ atac_bin_pass_summary <- lapply(
 ) |>
   dplyr::bind_rows()
 
+atac_bin_pass_plot_data <- atac_bin_pass_summary |>
+  tidyr::pivot_longer(
+    cols = c(
+      RNA_feature_pass_pct,
+      mt_pass_pct,
+      TSS_pass_pct,
+      FRiP_pass_pct,
+      singlet_pct
+    ),
+    names_to = "metric",
+    values_to = "pass_pct"
+  ) |>
+  dplyr::mutate(
+    metric = factor(
+      metric,
+      levels = c(
+        "RNA_feature_pass_pct",
+        "mt_pass_pct",
+        "TSS_pass_pct",
+        "FRiP_pass_pct",
+        "singlet_pct"
+      ),
+      labels = c(
+        "RNA features",
+        "Mitochondrial fraction",
+        "TSS enrichment",
+        "FRiP",
+        "Singlet classification"
+      )
+    )
+  )
+
+atac_bin_pass_plot <- ggplot2::ggplot(
+  atac_bin_pass_plot_data,
+  ggplot2::aes(
+    x = ATAC_bin,
+    y = pass_pct,
+    color = sample_id,
+    group = sample_id
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.85) +
+  ggplot2::geom_point(size = 2.2) +
+  ggplot2::facet_wrap(
+    ggplot2::vars(metric),
+    ncol = 2
+  ) +
+  ggplot2::scale_color_manual(
+    values = sample_colors
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 25),
+    labels = scales::label_percent(scale = 1),
+    expand = ggplot2::expansion(mult = c(0, 0.03))
+  ) +
+  ggplot2::labs(
+    title = "Independent QC performance across ATAC-count bins",
+    subtitle = paste(
+      "Each panel shows the percentage of cells passing one QC metric;",
+      "metrics are evaluated independently."
+    ),
+    x = "ATAC fragment-count bin",
+    y = "Cells passing metric",
+    color = NULL
+  ) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
 atac_bin_pass_summary
+atac_bin_pass_plot
 ```
 # 4. Record the decision
 
-Open `config/qc_thresholds.csv` in RStudio. Step 1 populated blank numeric cells with starting suggestions. For every sample:
+Open the active dataset-specific QC decision table in RStudio. Its path is stored in `QC_DECISION_PATH`. Step 1 populated blank numeric cells with starting suggestions. For every sample:
 
 1. compare the threshold to its full distribution;
 2. change values when biology or a clear quality mode supports the change;
@@ -456,12 +677,71 @@ Questions to discuss while reviewing:
 
 Rerun this chunk after saving the CSV. It produces threshold-overlay PDFs, but it does not yet filter cells.
 
-```{r preview-thresholds}
+```{r reload-threshold-preview}
 decisions_preview <- suppressMessages(readr::read_csv(
   QC_DECISION_PATH,
   show_col_types = FALSE
 ))
+```
 
+```{r plot-joint-count-window}
+joint_count_window_plot <- ggplot2::ggplot(
+  qc_metadata,
+  ggplot2::aes(
+    x = nCount_RNA,
+    y = nCount_ATAC
+  )
+) +
+  ggplot2::geom_rect(
+    data = decisions_preview,
+    ggplot2::aes(
+      xmin = nCount_RNA_min,
+      xmax = nCount_RNA_max,
+      ymin = nCount_ATAC_min,
+      ymax = nCount_ATAC_max,
+      fill = sample_id
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.12,
+    color = NA
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = sample_id),
+    alpha = 0.12,
+    size = 0.4,
+    show.legend = FALSE
+  ) +
+  ggplot2::facet_wrap(
+    ggplot2::vars(sample_id)
+  ) +
+  ggplot2::scale_x_log10(
+    labels = scales::label_number(big.mark = ",")
+  ) +
+  ggplot2::scale_y_log10(
+    labels = scales::label_number(big.mark = ",")
+  ) +
+  ggplot2::scale_color_manual(
+    values = sample_colors
+  ) +
+  ggplot2::scale_fill_manual(
+    values = sample_colors
+  ) +
+  ggplot2::labs(
+    title = "Joint RNA and ATAC count distributions",
+    subtitle = "Shading marks the manually selected count window",
+    x = "RNA UMIs per cell",
+    y = "ATAC fragments per cell",
+    fill = NULL,
+    caption = paste(
+      "The shaded region represents RNA and ATAC count thresholds only.",
+      "All remaining RNA, ATAC, and doublet criteria are evaluated separately."
+    )
+  )
+
+joint_count_window_plot
+```
+
+```{r save-threshold-previews}
 for (sample_id in sample_sheet$sample_id) {
   sample_metadata <- metadata_tables[[sample_id]]
   threshold_row <- decisions_preview[

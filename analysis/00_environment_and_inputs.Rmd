@@ -23,6 +23,11 @@ Do not run analysis on a SOL login node. Open this notebook from an allocated Op
 
 Open `multiome_scRNA-ATAC.Rproj` before running this notebook. The setup chunk finds the repository root whether the notebook working directory is the project root or the `analysis/` directory.
 
+The default selection is the v2 PPAR cohort. To analyze another cohort, set
+`MULTIOME_DATASET_VERSION` and `MULTIOME_COHORT_ID` in the RStudio Console
+before running the setup chunk. Valid v2 cohort IDs are `ppar`, `wt`, and
+`il17`.
+
 ```{r setup}
 knitr::opts_chunk$set(
   echo = TRUE,
@@ -64,16 +69,39 @@ cat("Library search paths:\n")
 print(.libPaths())
 ```
 
+```{r active-configuration}
+run_configuration <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  group = COHORT_GROUP,
+  sample_sheet_path = SAMPLE_SHEET_PATH,
+  qc_decision_path = QC_DECISION_PATH,
+  output_dir = OUTPUT_DIR,
+  stringsAsFactors = FALSE
+)
+run_configuration
+```
+
 # 3. Read the sample sheet
 
-The sample sheet is the biological map for the analysis. `sample_id` names a Cell Ranger library, while `pool_id` identifies the pooled biological material used to generate that library. In this dataset, each pool contains colon epithelial cells collected from multiple mice, so `pool_id` does not represent an independently measured biological replicate.
+The dataset-level sample sheet is the biological map for the analysis.
+`read_sample_sheet()` selects the active cohort and requires exactly one CON
+library and one HFD library. `sample_id` names a Cell Ranger library, while
+`pool_id` identifies the pooled biological material used to generate that
+library. Each pool contains colon epithelial cells collected from multiple
+mice, so `pool_id` does not represent an independently measured biological
+replicate.
 
 ```{r read-sample-sheet}
 sample_sheet <- read_sample_sheet()
 sample_sheet[, c(
   "sample_id",
+  "cohort_id",
+  "group",
+  "run_id",
   "pool_id",
   "genotype",
+  "model_detail",
   "diet",
   "mice_pooled",
   "female_mice",
@@ -84,7 +112,13 @@ sample_sheet[, c(
 
 ## Important design limitation
 
-There is one pooled CON library and one pooled HFD library. The CON library contains cells pooled from 6 mice (2 female, 4 male), while the HFD library contains cells pooled from 10 mice (2 female, 8 male). Individual mouse identities are not recoverable after pooling. Therefore, diet and pooled-library identity are completely confounded, and nuclei cannot be treated as independent biological replicates for CON-versus-HFD inference.
+Every current cohort contains one pooled CON library and one pooled HFD
+library. Individual mouse identities are not recoverable after pooling. The
+known PPAR pool and sex counts are recorded in the manifest; pending WT and
+IL17 counts remain `NA` until confirmed by the wet-lab record. Regardless of
+those pool sizes, diet and pooled-library identity are completely confounded,
+and nuclei cannot be treated as independent biological replicates for
+CON-versus-HFD inference.
 
 ```{r replication-table}
 replication_table <- as.data.frame(with(
@@ -158,6 +192,10 @@ readr::write_csv(
 readr::write_csv(
   sample_sheet,
   file.path(OUTPUT_DIR, "00_run_info", "sample_sheet_used.csv")
+)
+readr::write_csv(
+  run_configuration,
+  file.path(OUTPUT_DIR, "00_run_info", "run_configuration.csv")
 )
 save_run_information(package_status)
 
