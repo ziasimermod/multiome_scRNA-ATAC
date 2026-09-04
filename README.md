@@ -26,8 +26,8 @@ Each numbered notebook has one job, reads documented inputs or completed checkpo
 | 2 | `analysis/02_review_qc_and_filter.Rmd` | Review QC distributions, record thresholds, and make one joint keep/remove decision per paired barcode | Ready |
 | 3 | `analysis/03_build_common_atac_peak_set.Rmd` | Build a common GRCm39 ATAC peak space and requantify post-QC nuclei | Ready |
 | 4 | `analysis/04_merge_and_reduce_dimensions.Rmd` | Merge libraries, perform RNA log-normalization/PCA and ATAC TF-IDF/LSI, and inspect modality-specific structure | Ready |
-| 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready |
-| 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | PPAR complete; WT/IL17 require cohort-specific review |
+| 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready; added offshoot workflow for IL17 |
+| 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | Ready |
 | 7 | composition/pseudobulk workflow | Descriptive composition summaries and preparation of pseudobulk-ready downstream matrices | Planned |
 
 The PPAR development run is complete through Step 6. Steps 00-06 use shared
