@@ -1,0 +1,2594 @@
+---
+title: "Step 7B - Audit and model WT epithelial trajectories"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 7B evaluates whether the annotated WT d21 epithelial states support a
+defensible RNA trajectory. It does not assume that cluster 8 is an intestinal
+stem-cell root simply because it was labeled `ISC-like crypt`.
+
+The d21 epithelium may show greater transcriptional infidelity than later
+timepoints. Mixed lineage programs, sparse canonical stem markers, and
+cell-cycle structure can therefore create a smooth embedding without defining
+a reliable developmental trajectory.
+
+This notebook is intentionally divided by a manual checkpoint:
+
+1. audit candidate root and terminal states in both pooled libraries;
+2. quantify stem, cycling, absorptive, and secretory program mixing;
+3. visualize RNA topology with and without cell-cycle labels;
+4. write a proposed trajectory decision table; and
+5. stop until the root, included states, and terminal states are approved.
+
+Only after approval does the notebook fit separate absorptive and secretory
+Slingshot trajectories. The separation avoids forcing all epithelial fates
+through one highly connected graph.
+
+## Statistical limitation
+
+There is one pooled CON and one pooled HFD library. Pseudotime-distribution and
+gene-trend differences are descriptive library comparisons. They do not
+estimate mouse-to-mouse variance and must not be presented as replicated diet
+effects.
+
+A practical review-stage allocation is **4 CPU cores, 64--96 GiB memory, and
+8--12 hours**. The post-approval Slingshot models are smaller than the global
+Multiome object but retain RNA data for gene-trend summaries.
+
+# 1. Setup
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+  library(Matrix)
+  library(patchwork)
+})
+
+ggplot2::theme_set(theme_multiome())
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 7B is the WT d21 trajectory review. Set ",
+    "MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt before running it.",
+    call. = FALSE
+  )
+}
+
+set.seed(20260904)
+future::plan(future::sequential)
+```
+
+# 2. Define inputs, outputs, and candidate lineages
+
+The proposed root is global WT annotation unit 8, but it is not approved in
+code. Cluster 2 is excluded despite crypt-associated markers because its
+low-complexity profile and high mitochondrial fraction make its position
+difficult to interpret. Cluster 10 and mixed cluster 17 are also excluded.
+
+```{r define-inputs-and-candidates}
+STEP6_DIR <- file.path(OUTPUT_DIR, "06_annotation")
+STEP7_DIR <- file.path(OUTPUT_DIR, "07_diet_response")
+TRAJECTORY_DIR <- file.path(OUTPUT_DIR, "07b_trajectories")
+TRAJECTORY_PLOT_DIR <- file.path(TRAJECTORY_DIR, "plots")
+TRAJECTORY_TABLE_DIR <- file.path(TRAJECTORY_DIR, "tables")
+
+STEP6_OBJECT_PATH <- file.path(
+  STEP6_DIR,
+  "multiome_annotated.rds"
+)
+
+STEP7_COMPLETE_MARKER <- file.path(
+  STEP7_DIR,
+  "STEP_07_COMPLETE.txt"
+)
+
+TRAJECTORY_PROPOSAL_PATH <- file.path(
+  TRAJECTORY_DIR,
+  "trajectory_decision_proposed.csv"
+)
+
+TRAJECTORY_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
+  "trajectory_decision.csv"
+)
+
+TRAJECTORY_REVIEW_MARKER <- file.path(
+  TRAJECTORY_DIR,
+  "STEP_07B_READY_FOR_TRAJECTORY_REVIEW.txt"
+)
+
+TRAJECTORY_COMPLETE_MARKER <- file.path(
+  TRAJECTORY_DIR,
+  "STEP_07B_COMPLETE.txt"
+)
+
+dir.create(TRAJECTORY_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TRAJECTORY_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TRAJECTORY_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+assert_file(STEP6_OBJECT_PATH, "Step 6 annotated multimodal object")
+assert_file(STEP7_COMPLETE_MARKER, "Step 7 completion marker")
+
+PREFERRED_ANALYSIS_UNIT_COLUMN <- "annotation_unit"
+LEGACY_ANALYSIS_UNIT_COLUMN <- "wnn_cluster"
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+
+MINIMUM_NUCLEI_PER_DIET_FOR_ROOT <- 100L
+N_VARIABLE_FEATURES <- 3000L
+N_RNA_PCS <- 30L
+RNA_DIMS_TRAJECTORY <- 1:20
+N_PSEUDOTIME_BINS <- 10L
+MINIMUM_CURVE_WEIGHT <- 0.50
+
+trajectory_programs <- list(
+  stem = c(
+    "Lgr5", "Ascl2", "Smoc2", "Axin2", "Lrig1", "Ephb2"
+  ),
+  crypt = c(
+    "Cftr", "Htr4", "Slc12a2", "Pde3a", "Dmbt1"
+  ),
+  cycling = c(
+    "Mki67", "Top2a", "Cdk1", "Ccnb1", "Ccna2", "Kif11"
+  ),
+  absorptive = c(
+    "Car1", "Car4", "Aqp8", "Slc26a3", "Krt20", "Tgm3"
+  ),
+  secretory = c(
+    "Atoh1", "Spdef", "Muc2", "Agr2", "Kit", "Spink4"
+  ),
+  mature_goblet = c(
+    "Fcgbp", "Clca1", "Zg16", "Tff3", "Bcas1"
+  ),
+  deep_crypt_secretory = c(
+    "Reg4", "Mptx1", "Retnlb", "Ccl6", "Selenom"
+  )
+)
+
+candidate_trajectories <- data.frame(
+  cohort_id = "wt",
+  trajectory_id = c(
+    "crypt_to_absorptive",
+    "crypt_to_secretory"
+  ),
+  analysis_units = c(
+    "8;0;6;1;3",
+    "8;0;6;18;4;7;5;9"
+  ),
+  root_unit = c("8", "8"),
+  terminal_units = c("3", "5;9"),
+  approved = FALSE,
+  reviewer = "",
+  review_date = "",
+  decision_notes = c(
+    paste(
+      "Proposed ISC-like to immature absorptive to mature colonocyte path.",
+      "Approve only if unit 8 is root-like in both libraries and RNA topology",
+      "is not dominated by cell cycle or mixed lineage expression."
+    ),
+    paste(
+      "Proposed ISC-like/crypt to cycling secretory and goblet/DCS branches.",
+      "Approve only if secretory commitment is coherent and the Reg4+ DCS",
+      "endpoint is supported independently of diet composition."
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  candidate_trajectories,
+  TRAJECTORY_PROPOSAL_PATH
+)
+```
+
+# 3. Load and validate the WT object
+
+```{r load-and-validate-wt-object}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+metadata <- multiome[[]]
+
+resolve_analysis_unit_column <- function(metadata) {
+  if (PREFERRED_ANALYSIS_UNIT_COLUMN %in% colnames(metadata)) {
+    return(PREFERRED_ANALYSIS_UNIT_COLUMN)
+  }
+
+  if (!LEGACY_ANALYSIS_UNIT_COLUMN %in% colnames(metadata)) {
+    stop(
+      "The Step 6 object contains neither '",
+      PREFERRED_ANALYSIS_UNIT_COLUMN,
+      "' nor '",
+      LEGACY_ANALYSIS_UNIT_COLUMN,
+      "'.",
+      call. = FALSE
+    )
+  }
+
+  focused_decision_path <- file.path(
+    COHORT_CONFIG_DIR,
+    "subclustering_decision.csv"
+  )
+
+  if (file.exists(focused_decision_path)) {
+    focused_decision <- suppressMessages(
+      readr::read_csv(
+        focused_decision_path,
+        show_col_types = FALSE,
+        progress = FALSE
+      )
+    )
+
+    if ("approved" %in% colnames(focused_decision)) {
+      approved_focused_decision <- tolower(
+        trimws(as.character(focused_decision$approved))
+      ) %in% c("true", "t", "1", "yes", "y")
+
+      if (any(approved_focused_decision)) {
+        stop(
+          "This cohort has an approved focused-subclustering decision, ",
+          "but the Step 6 object lacks annotation_unit. Rerun Step 6 ",
+          "before trajectory analysis.",
+          call. = FALSE
+        )
+      }
+    }
+  }
+
+  message(
+    "Legacy WT Step 6 object detected without annotation_unit; ",
+    "using wnn_cluster as the trajectory analysis unit."
+  )
+
+  LEGACY_ANALYSIS_UNIT_COLUMN
+}
+
+ANALYSIS_UNIT_COLUMN <- resolve_analysis_unit_column(metadata)
+
+trajectory_analysis_unit_resolution <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  preferred_column = PREFERRED_ANALYSIS_UNIT_COLUMN,
+  resolved_column = ANALYSIS_UNIT_COLUMN,
+  legacy_fallback_used = !identical(
+    ANALYSIS_UNIT_COLUMN,
+    PREFERRED_ANALYSIS_UNIT_COLUMN
+  ),
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  trajectory_analysis_unit_resolution,
+  file.path(
+    TRAJECTORY_DIR,
+    "trajectory_analysis_unit_resolution.csv"
+  )
+)
+
+if (!all(c("RNA", "ATAC") %in% names(multiome))) {
+  stop(
+    "The WT object must contain RNA and ATAC assays.",
+    call. = FALSE
+  )
+}
+
+rna_layers <- SeuratObject::Layers(multiome[["RNA"]])
+
+if (!all(c("counts", "data") %in% rna_layers)) {
+  stop(
+    "The RNA assay must contain joined counts and data layers.",
+    call. = FALSE
+  )
+}
+
+cell_cycle_columns <- c(
+  "Phase",
+  "S.Score",
+  "G2M.Score"
+)
+
+cell_cycle_columns_present_before <- cell_cycle_columns %in%
+  colnames(metadata)
+
+cell_cycle_score_source <- "Step 6 metadata"
+matched_s_features <- character()
+matched_g2m_features <- character()
+
+if (!all(cell_cycle_columns_present_before)) {
+  message(
+    "Step 6 metadata lacks one or more cell-cycle columns; ",
+    "computing Phase, S.Score, and G2M.Score from normalized RNA data."
+  )
+
+  match_features_case_insensitive <- function(
+      requested_features,
+      available_features
+  ) {
+    matched_index <- match(
+      toupper(requested_features),
+      toupper(available_features)
+    )
+
+    unique(
+      available_features[
+        matched_index[!is.na(matched_index)]
+      ]
+    )
+  }
+
+  cell_cycle_reference <- Seurat::cc.genes.updated.2019
+  available_rna_features <- rownames(multiome[["RNA"]])
+
+  matched_s_features <- match_features_case_insensitive(
+    cell_cycle_reference$s.genes,
+    available_rna_features
+  )
+
+  matched_g2m_features <- match_features_case_insensitive(
+    cell_cycle_reference$g2m.genes,
+    available_rna_features
+  )
+
+  minimum_cell_cycle_features <- 10L
+
+  if (
+    length(matched_s_features) < minimum_cell_cycle_features ||
+      length(matched_g2m_features) < minimum_cell_cycle_features
+  ) {
+    stop(
+      "Too few mouse-matched cell-cycle genes were available. ",
+      "Matched S genes: ",
+      length(matched_s_features),
+      "; matched G2M genes: ",
+      length(matched_g2m_features),
+      ".",
+      call. = FALSE
+    )
+  }
+
+  previous_default_assay <- DefaultAssay(multiome)
+  DefaultAssay(multiome) <- "RNA"
+
+  multiome <- CellCycleScoring(
+    multiome,
+    s.features = matched_s_features,
+    g2m.features = matched_g2m_features,
+    set.ident = FALSE
+  )
+
+  DefaultAssay(multiome) <- previous_default_assay
+
+  # Refresh metadata after CellCycleScoring added the columns.
+  metadata <- multiome[[]]
+  cell_cycle_score_source <- "computed in Step 7B"
+}
+
+missing_cell_cycle_columns <- setdiff(
+  cell_cycle_columns,
+  colnames(metadata)
+)
+
+if (length(missing_cell_cycle_columns) > 0L) {
+  stop(
+    "Cell-cycle scoring did not create the required column(s): ",
+    paste(missing_cell_cycle_columns, collapse = ", "),
+    ".",
+    call. = FALSE
+  )
+}
+
+cell_cycle_scoring_audit <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  score_source = cell_cycle_score_source,
+  Phase_present_before =
+    cell_cycle_columns_present_before[[1]],
+  S_Score_present_before =
+    cell_cycle_columns_present_before[[2]],
+  G2M_Score_present_before =
+    cell_cycle_columns_present_before[[3]],
+  matched_S_features = if (
+    identical(cell_cycle_score_source, "computed in Step 7B")
+  ) {
+    length(matched_s_features)
+  } else {
+    NA_integer_
+  },
+  matched_G2M_features = if (
+    identical(cell_cycle_score_source, "computed in Step 7B")
+  ) {
+    length(matched_g2m_features)
+  } else {
+    NA_integer_
+  },
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  cell_cycle_scoring_audit,
+  file.path(
+    TRAJECTORY_DIR,
+    "trajectory_cell_cycle_scoring_audit.csv"
+  )
+)
+
+required_metadata <- c(
+  "sample_id",
+  "diet",
+  "wnn_cluster",
+  ANALYSIS_UNIT_COLUMN,
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence",
+  "nCount_RNA",
+  "percent.mt",
+  "TSS.enrichment",
+  "frip_cr",
+  "Phase",
+  "S.Score",
+  "G2M.Score"
+)
+
+missing_metadata <- setdiff(required_metadata, colnames(metadata))
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "The Step 6 object is missing trajectory metadata column(s): ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+metadata$cell_barcode <- rownames(metadata)
+metadata$sample_id <- as.character(metadata$sample_id)
+metadata$diet <- as.character(metadata$diet)
+metadata$analysis_unit <- as.character(
+  metadata[[ANALYSIS_UNIT_COLUMN]]
+)
+metadata$wnn_cluster <- as.character(metadata$wnn_cluster)
+metadata$broad_compartment <- as.character(
+  metadata$broad_compartment
+)
+metadata$cell_state <- as.character(metadata$cell_state)
+metadata$cell_state_full <- as.character(metadata$cell_state_full)
+metadata$annotation_confidence <- tolower(
+  as.character(metadata$annotation_confidence)
+)
+
+expected_diets <- c(REFERENCE_DIET, COMPARISON_DIET)
+
+if (!setequal(unique(metadata$diet), expected_diets)) {
+  stop(
+    "Expected exactly CON and HFD in the WT object.",
+    call. = FALSE
+  )
+}
+
+rna_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+
+rna_data <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "data"
+)
+
+metadata_cells <- rownames(metadata)
+
+align_matrix_to_metadata <- function(
+    feature_matrix,
+    metadata_cells,
+    matrix_label
+) {
+  matrix_cells <- colnames(feature_matrix)
+
+  if (is.null(matrix_cells)) {
+    stop(matrix_label, " has no cell names.", call. = FALSE)
+  }
+
+  if (anyDuplicated(matrix_cells) > 0L) {
+    stop(matrix_label, " contains duplicate cell names.", call. = FALSE)
+  }
+
+  if (anyDuplicated(metadata_cells) > 0L) {
+    stop(
+      "The Step 6 metadata contains duplicate cell names.",
+      call. = FALSE
+    )
+  }
+
+  missing_from_matrix <- setdiff(metadata_cells, matrix_cells)
+  extra_in_matrix <- setdiff(matrix_cells, metadata_cells)
+
+  if (
+    length(missing_from_matrix) > 0L ||
+      length(extra_in_matrix) > 0L
+  ) {
+    stop(
+      matrix_label,
+      " and the Step 6 metadata contain different cell sets. ",
+      "Missing from matrix: ",
+      length(missing_from_matrix),
+      "; extra in matrix: ",
+      length(extra_in_matrix),
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (!identical(matrix_cells, metadata_cells)) {
+    message(
+      matrix_label,
+      " contains the correct cells in a different order; ",
+      "reordering columns to match the Step 6 metadata."
+    )
+
+    feature_matrix <- feature_matrix[
+      ,
+      metadata_cells,
+      drop = FALSE
+    ]
+  }
+
+  if (!identical(colnames(feature_matrix), metadata_cells)) {
+    stop(
+      "Failed to align ",
+      matrix_label,
+      " to the Step 6 metadata.",
+      call. = FALSE
+    )
+  }
+
+  feature_matrix
+}
+
+trajectory_matrix_alignment_audit <- data.frame(
+  matrix = c("RNA counts", "RNA data"),
+  matrix_cells = c(ncol(rna_counts), ncol(rna_data)),
+  metadata_cells = length(metadata_cells),
+  same_cell_set = c(
+    setequal(colnames(rna_counts), metadata_cells),
+    setequal(colnames(rna_data), metadata_cells)
+  ),
+  identical_order_before_alignment = c(
+    identical(colnames(rna_counts), metadata_cells),
+    identical(colnames(rna_data), metadata_cells)
+  ),
+  stringsAsFactors = FALSE
+)
+
+rna_counts <- align_matrix_to_metadata(
+  rna_counts,
+  metadata_cells,
+  "RNA counts"
+)
+
+rna_data <- align_matrix_to_metadata(
+  rna_data,
+  metadata_cells,
+  "RNA data"
+)
+
+readr::write_csv(
+  trajectory_matrix_alignment_audit,
+  file.path(
+    TRAJECTORY_DIR,
+    "trajectory_matrix_cell_alignment_audit.csv"
+  )
+)
+
+candidate_units <- unique(
+  unlist(
+    strsplit(
+      candidate_trajectories$analysis_units,
+      split = ";",
+      fixed = TRUE
+    )
+  )
+)
+
+missing_candidate_units <- setdiff(
+  candidate_units,
+  unique(metadata$analysis_unit)
+)
+
+if (length(missing_candidate_units) > 0L) {
+  stop(
+    "Candidate trajectory unit(s) are absent from the WT object: ",
+    paste(missing_candidate_units, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+candidate_annotation <- metadata |>
+  dplyr::filter(analysis_unit %in% candidate_units) |>
+  dplyr::distinct(
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence
+  )
+
+if (
+  any(candidate_annotation$broad_compartment != "epithelial") ||
+    any(candidate_annotation$annotation_confidence == "low")
+) {
+  stop(
+    "Candidate trajectories must contain only high- or moderate-confidence ",
+    "epithelial units.",
+    call. = FALSE
+  )
+}
+```
+
+# 4. Audit candidate-state representation in both libraries
+
+```{r audit-candidate-state-representation}
+candidate_unit_counts <- metadata |>
+  dplyr::filter(analysis_unit %in% candidate_units) |>
+  dplyr::count(
+    analysis_unit,
+    cell_state,
+    sample_id,
+    diet,
+    name = "nuclei"
+  ) |>
+  tidyr::complete(
+    nesting(analysis_unit, cell_state),
+    nesting(sample_id, diet),
+    fill = list(nuclei = 0L)
+  )
+
+readr::write_csv(
+  candidate_unit_counts,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "candidate_unit_nuclei_by_library.csv"
+  )
+)
+
+root_count_audit <- candidate_unit_counts |>
+  dplyr::filter(analysis_unit == "8") |>
+  dplyr::group_by(diet) |>
+  dplyr::summarise(
+    nuclei = sum(nuclei),
+    .groups = "drop"
+  )
+
+if (any(root_count_audit$nuclei < MINIMUM_NUCLEI_PER_DIET_FOR_ROOT)) {
+  warning(
+    "The proposed root has fewer than ",
+    MINIMUM_NUCLEI_PER_DIET_FOR_ROOT,
+    " nuclei in at least one diet."
+  )
+}
+```
+
+# 5. Quantify lineage-program co-detection and transcriptional mixing
+
+Program scores are the mean log-normalized expression of available genes in
+each program. They are used for within-dataset review, not as universal or
+batch-corrected scores.
+
+```{r calculate-program-scores}
+program_feature_audit <- dplyr::bind_rows(
+  lapply(
+    names(trajectory_programs),
+    function(program_name) {
+      genes <- trajectory_programs[[program_name]]
+
+      data.frame(
+        program = program_name,
+        gene = genes,
+        present_in_RNA = genes %in% rownames(rna_counts),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+)
+
+readr::write_csv(
+  program_feature_audit,
+  file.path(TRAJECTORY_TABLE_DIR, "trajectory_program_feature_audit.csv")
+)
+
+essential_program_coverage <- program_feature_audit |>
+  dplyr::filter(program %in% c("stem", "absorptive", "secretory")) |>
+  dplyr::group_by(program) |>
+  dplyr::summarise(
+    genes_present = sum(present_in_RNA),
+    .groups = "drop"
+  )
+
+if (any(essential_program_coverage$genes_present < 2L)) {
+  stop(
+    "At least one essential trajectory program has fewer than two RNA ",
+    "features in the active object.",
+    call. = FALSE
+  )
+}
+
+score_cells_for_program <- function(
+  normalized_matrix,
+  count_matrix,
+  genes,
+  cells
+) {
+  matched_genes <- intersect(genes, rownames(normalized_matrix))
+
+  if (length(matched_genes) == 0L) {
+    return(data.frame(
+      score = rep(NA_real_, length(cells)),
+      genes_detected = rep(NA_integer_, length(cells))
+    ))
+  }
+
+  data.frame(
+    score = Matrix::colMeans(
+      normalized_matrix[matched_genes, cells, drop = FALSE]
+    ),
+    genes_detected = Matrix::colSums(
+      count_matrix[matched_genes, cells, drop = FALSE] > 0
+    )
+  )
+}
+
+trajectory_metadata <- metadata |>
+  dplyr::filter(analysis_unit %in% candidate_units)
+
+for (program_name in names(trajectory_programs)) {
+  program_result <- score_cells_for_program(
+    normalized_matrix = rna_data,
+    count_matrix = rna_counts,
+    genes = trajectory_programs[[program_name]],
+    cells = trajectory_metadata$cell_barcode
+  )
+
+  trajectory_metadata[[paste0(program_name, "_score")]] <-
+    program_result$score
+
+  trajectory_metadata[[paste0(
+    program_name,
+    "_genes_detected"
+  )]] <- program_result$genes_detected
+}
+
+trajectory_metadata <- trajectory_metadata |>
+  dplyr::mutate(
+    stem_program_positive = stem_genes_detected >= 2L,
+    absorptive_program_positive =
+      absorptive_genes_detected >= 2L,
+    secretory_program_positive =
+      secretory_genes_detected >= 2L,
+    absorptive_and_secretory_codetected =
+      absorptive_program_positive &
+      secretory_program_positive,
+    lineage_programs_positive =
+      as.integer(stem_program_positive) +
+      as.integer(absorptive_program_positive) +
+      as.integer(secretory_program_positive),
+    multiple_lineage_programs_detected =
+      lineage_programs_positive >= 2L
+  )
+
+program_score_columns <- grep(
+  "_score$",
+  colnames(trajectory_metadata),
+  value = TRUE
+)
+
+program_detection_columns <- grep(
+  "_genes_detected$",
+  colnames(trajectory_metadata),
+  value = TRUE
+)
+
+trajectory_program_summary <- trajectory_metadata |>
+  dplyr::group_by(
+    analysis_unit,
+    cell_state,
+    sample_id,
+    diet
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    dplyr::across(
+      dplyr::all_of(program_score_columns),
+      ~ stats::median(.x, na.rm = TRUE),
+      .names = "median_{.col}"
+    ),
+    dplyr::across(
+      dplyr::all_of(program_detection_columns),
+      ~ stats::median(.x, na.rm = TRUE),
+      .names = "median_{.col}"
+    ),
+    stem_program_positive_percent =
+      100 * mean(stem_program_positive),
+    absorptive_program_positive_percent =
+      100 * mean(absorptive_program_positive),
+    secretory_program_positive_percent =
+      100 * mean(secretory_program_positive),
+    absorptive_secretory_codetection_percent =
+      100 * mean(absorptive_and_secretory_codetected),
+    multiple_lineage_program_percent =
+      100 * mean(multiple_lineage_programs_detected),
+    median_nCount_RNA = stats::median(nCount_RNA),
+    median_percent_mt = stats::median(percent.mt),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  trajectory_program_summary,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "trajectory_program_summary_by_unit_and_library.csv"
+  )
+)
+
+readr::write_csv(
+  trajectory_metadata |>
+    dplyr::select(
+      cell_barcode,
+      sample_id,
+      diet,
+      analysis_unit,
+      cell_state,
+      Phase,
+      dplyr::all_of(program_score_columns),
+      dplyr::all_of(program_detection_columns),
+      multiple_lineage_programs_detected,
+      absorptive_and_secretory_codetected
+    ),
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "trajectory_program_scores_by_nucleus.csv.gz"
+  )
+)
+```
+
+## Cell-cycle and program-mixing summaries
+
+```{r cell-cycle-and-mixing-audit}
+candidate_cell_cycle_summary <- trajectory_metadata |>
+  dplyr::count(
+    analysis_unit,
+    cell_state,
+    sample_id,
+    diet,
+    Phase,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(analysis_unit, sample_id) |>
+  dplyr::mutate(
+    percent_of_unit_library = 100 * nuclei / sum(nuclei)
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  candidate_cell_cycle_summary,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "candidate_unit_cell_cycle_by_library.csv"
+  )
+)
+
+p_program_mixing <- ggplot2::ggplot(
+  trajectory_metadata,
+  ggplot2::aes(
+    x = absorptive_score,
+    y = secretory_score,
+    color = analysis_unit
+  )
+) +
+  ggplot2::geom_point(
+    size = 0.35,
+    alpha = 0.55
+  ) +
+  ggplot2::facet_wrap(~ diet) +
+  ggplot2::labs(
+    title = "Absorptive and secretory program mixing",
+    subtitle = paste(
+      "A smooth distribution can indicate transitional biology,",
+      "transcriptional infidelity, or both."
+    ),
+    x = "Mean absorptive-program expression",
+    y = "Mean secretory-program expression",
+    color = "Annotation unit"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_program_mixing)
+
+ggplot2::ggsave(
+  file.path(
+    TRAJECTORY_PLOT_DIR,
+    "01_absorptive_secretory_program_mixing.pdf"
+  ),
+  p_program_mixing,
+  width = 11,
+  height = 7
+)
+```
+
+# 6. Recompute a focused RNA embedding for topology review
+
+Cell-cycle scores are retained as metadata and are not regressed from the
+primary audit embedding. Removing them could erase a genuine cycling
+transit-amplifying state. A cell-cycle-regressed embedding is generated only
+as a sensitivity view; Slingshot does not use it unless a later reviewed
+decision explicitly changes the model.
+
+```{r focused-rna-topology-audit}
+focused_cells <- trajectory_metadata$cell_barcode
+
+focused_audit <- subset(
+  multiome,
+  cells = focused_cells
+)
+
+DefaultAssay(focused_audit) <- "RNA"
+
+focused_audit <- NormalizeData(
+  focused_audit,
+  verbose = FALSE
+)
+
+focused_audit <- FindVariableFeatures(
+  focused_audit,
+  selection.method = "vst",
+  nfeatures = N_VARIABLE_FEATURES,
+  verbose = FALSE
+)
+
+trajectory_variable_features <- VariableFeatures(focused_audit)
+
+excluded_variable_features <- grepl(
+  "^mt-|^Rpl|^Rps",
+  trajectory_variable_features
+)
+
+trajectory_variable_features <- trajectory_variable_features[
+  !excluded_variable_features
+]
+
+VariableFeatures(focused_audit) <- trajectory_variable_features
+
+focused_audit <- ScaleData(
+  focused_audit,
+  features = trajectory_variable_features,
+  verbose = FALSE
+)
+
+focused_audit <- RunPCA(
+  focused_audit,
+  features = trajectory_variable_features,
+  npcs = N_RNA_PCS,
+  reduction.name = "trajectory.audit.pca",
+  reduction.key = "trajAuditPC_",
+  verbose = FALSE
+)
+
+focused_audit <- RunUMAP(
+  focused_audit,
+  reduction = "trajectory.audit.pca",
+  dims = RNA_DIMS_TRAJECTORY,
+  reduction.name = "trajectory.audit.umap",
+  reduction.key = "trajAuditUMAP_",
+  seed.use = 20260904,
+  verbose = FALSE
+)
+
+focused_audit <- ScaleData(
+  focused_audit,
+  features = trajectory_variable_features,
+  vars.to.regress = c("S.Score", "G2M.Score"),
+  verbose = FALSE
+)
+
+focused_audit <- RunPCA(
+  focused_audit,
+  features = trajectory_variable_features,
+  npcs = N_RNA_PCS,
+  reduction.name = "trajectory.cycle.sensitivity.pca",
+  reduction.key = "trajCyclePC_",
+  verbose = FALSE
+)
+
+focused_audit <- RunUMAP(
+  focused_audit,
+  reduction = "trajectory.cycle.sensitivity.pca",
+  dims = RNA_DIMS_TRAJECTORY,
+  reduction.name = "trajectory.cycle.sensitivity.umap",
+  reduction.key = "trajCycleUMAP_",
+  seed.use = 20260905,
+  verbose = FALSE
+)
+
+p_audit_unit <- DimPlot(
+  focused_audit,
+  reduction = "trajectory.audit.umap",
+  group.by = ANALYSIS_UNIT_COLUMN,
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.35,
+  seed = 20260904,
+  shuffle = TRUE
+) +
+  ggplot2::labs(
+    title = "Candidate WT epithelial trajectory units",
+    subtitle = "Focused RNA topology; low-confidence units are excluded.",
+    color = "Annotation unit"
+  ) +
+  theme_multiome(base_size = 9)
+
+p_audit_diet <- DimPlot(
+  focused_audit,
+  reduction = "trajectory.audit.umap",
+  group.by = "diet",
+  cols = DIET_COLORS,
+  pt.size = 0.35,
+  seed = 20260904,
+  shuffle = TRUE
+) +
+  ggplot2::labs(
+    title = "Candidate trajectory topology by pooled library",
+    subtitle = "Diet and library remain perfectly confounded.",
+    color = NULL
+  ) +
+  theme_multiome(base_size = 9)
+
+p_audit_phase <- DimPlot(
+  focused_audit,
+  reduction = "trajectory.audit.umap",
+  group.by = "Phase",
+  cols = c(
+    G1 = "#4C78A8",
+    S = "#F2CF5B",
+    G2M = "#E45756"
+  ),
+  pt.size = 0.35,
+  seed = 20260904,
+  shuffle = TRUE
+) +
+  ggplot2::labs(
+    title = "Cell-cycle support across candidate topology",
+    subtitle = "Review whether the proposed paths are phase-dominated.",
+    color = NULL
+  ) +
+  theme_multiome(base_size = 9)
+
+p_audit_cycle_sensitivity <- DimPlot(
+  focused_audit,
+  reduction = "trajectory.cycle.sensitivity.umap",
+  group.by = ANALYSIS_UNIT_COLUMN,
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.35,
+  seed = 20260905,
+  shuffle = TRUE
+) +
+  ggplot2::labs(
+    title = "Cell-cycle-regressed sensitivity topology",
+    subtitle = "Sensitivity view only; not the primary trajectory input.",
+    color = "Annotation unit"
+  ) +
+  theme_multiome(base_size = 9)
+
+p_topology_audit <-
+  p_audit_unit + p_audit_diet +
+  p_audit_phase + p_audit_cycle_sensitivity +
+  patchwork::plot_layout(ncol = 2)
+
+print(p_topology_audit)
+
+ggplot2::ggsave(
+  file.path(
+    TRAJECTORY_PLOT_DIR,
+    "02_candidate_RNA_topology_unit_diet_phase.pdf"
+  ),
+  p_topology_audit,
+  width = 14,
+  height = 12
+)
+```
+
+# 7. Audit the proposed root directly
+
+```{r proposed-root-audit}
+root_marker_table <- program_feature_audit |>
+  dplyr::filter(program %in% c("stem", "crypt"))
+
+root_marker_summary <- list()
+root_summary_index <- 1L
+
+for (gene in root_marker_table$gene[root_marker_table$present_in_RNA]) {
+  for (analysis_unit_value in candidate_units) {
+    for (diet_value in expected_diets) {
+      selected_cells <- trajectory_metadata$cell_barcode[
+        trajectory_metadata$analysis_unit == analysis_unit_value &
+          trajectory_metadata$diet == diet_value
+      ]
+
+      if (length(selected_cells) == 0L) {
+        next
+      }
+
+      root_marker_summary[[root_summary_index]] <- data.frame(
+        analysis_unit = analysis_unit_value,
+        diet = diet_value,
+        gene = gene,
+        nuclei = length(selected_cells),
+        percent_detected = 100 * mean(
+          rna_counts[gene, selected_cells, drop = TRUE] > 0
+        ),
+        average_log_normalized_expression = mean(
+          rna_data[gene, selected_cells, drop = TRUE]
+        ),
+        stringsAsFactors = FALSE
+      )
+
+      root_summary_index <- root_summary_index + 1L
+    }
+  }
+}
+
+root_marker_summary <- dplyr::bind_rows(root_marker_summary) |>
+  dplyr::left_join(
+    candidate_annotation |>
+      dplyr::select(analysis_unit, cell_state),
+    by = "analysis_unit"
+  )
+
+readr::write_csv(
+  root_marker_summary,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "proposed_root_marker_expression.csv"
+  )
+)
+
+p_root_markers <- ggplot2::ggplot(
+  root_marker_summary,
+  ggplot2::aes(
+    x = analysis_unit,
+    y = gene,
+    size = percent_detected,
+    color = average_log_normalized_expression
+  )
+) +
+  ggplot2::geom_point() +
+  ggplot2::facet_wrap(~ diet) +
+  ggplot2::scale_color_gradientn(
+    colors = c("#2C7BB6", "#F7F7F7", "#D7191C")
+  ) +
+  ggplot2::labs(
+    title = "Proposed root marker audit",
+    subtitle = "Unit 8 must be root-like in both pooled libraries.",
+    x = "Annotation unit",
+    y = NULL,
+    size = "Percent detected",
+    color = "Average log-normalized expression"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_root_markers)
+
+ggplot2::ggsave(
+  file.path(
+    TRAJECTORY_PLOT_DIR,
+    "03_proposed_root_marker_audit.pdf"
+  ),
+  p_root_markers,
+  width = 11,
+  height = 7
+)
+```
+
+# STOP HERE FOR MANUAL ROOT AND TOPOLOGY REVIEW
+
+Before continuing, inspect:
+
+1. `candidate_unit_nuclei_by_library.csv`;
+2. `trajectory_program_summary_by_unit_and_library.csv`;
+3. the absorptive-versus-secretory program-mixing plot;
+4. the focused RNA topology colored by annotation unit, diet, and phase;
+5. the proposed root marker audit; and
+6. whether unit 8 remains the most defensible root in both libraries.
+
+The proposed trajectory table is written to:
+
+```text
+07b_trajectories/trajectory_decision_proposed.csv
+```
+
+Copy it to the active WT cohort configuration directory as:
+
+```text
+config/datasets/v2_resequenced/cohorts/wt/trajectory_decision.csv
+```
+
+Complete the audit fields and set `approved=TRUE` only after review. It is
+valid to leave one proposed trajectory unapproved or to change its root,
+included units, or terminal units based on the audit.
+
+```{r write-ready-for-review-marker}
+writeLines(
+  c(
+    paste("Trajectory review checkpoint created:", format(Sys.time())),
+    paste("Candidate nuclei:", nrow(trajectory_metadata)),
+    paste("Candidate annotation units:", paste(candidate_units, collapse = ",")),
+    paste("Proposed root:", "8"),
+    paste("Decision proposal:", TRAJECTORY_PROPOSAL_PATH),
+    "Trajectory root and topology approved: FALSE"
+  ),
+  TRAJECTORY_REVIEW_MARKER
+)
+```
+
+# 8. Read and validate the trajectory decision
+
+```{r validate-trajectory-decision}
+if (!file.exists(TRAJECTORY_DECISION_PATH)) {
+  stop(
+    "Manual trajectory checkpoint reached. Review the Step 7B audit, copy:\n",
+    TRAJECTORY_PROPOSAL_PATH,
+    "\nto:\n",
+    TRAJECTORY_DECISION_PATH,
+    "\nand approve only the trajectories supported by the data.",
+    call. = FALSE
+  )
+}
+
+trajectory_decision <- suppressMessages(
+  readr::read_csv(
+    TRAJECTORY_DECISION_PATH,
+    show_col_types = FALSE,
+    progress = FALSE
+  )
+)
+
+trajectory_decision <- as.data.frame(
+  trajectory_decision,
+  stringsAsFactors = FALSE
+)
+
+required_decision_columns <- c(
+  "cohort_id",
+  "trajectory_id",
+  "analysis_units",
+  "root_unit",
+  "terminal_units",
+  "approved",
+  "reviewer",
+  "review_date",
+  "decision_notes"
+)
+
+missing_decision_columns <- setdiff(
+  required_decision_columns,
+  colnames(trajectory_decision)
+)
+
+if (length(missing_decision_columns) > 0L) {
+  stop(
+    "Trajectory decision table is missing column(s): ",
+    paste(missing_decision_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+trajectory_decision$cohort_id <- tolower(trimws(
+  as.character(trajectory_decision$cohort_id)
+))
+
+trajectory_decision$trajectory_id <- trimws(
+  as.character(trajectory_decision$trajectory_id)
+)
+
+trajectory_decision$approved <- tolower(trimws(
+  as.character(trajectory_decision$approved)
+)) %in% c("true", "t", "1", "yes", "y")
+
+if (any(trajectory_decision$cohort_id != COHORT_ID)) {
+  stop(
+    "Every trajectory decision row must match the active WT cohort.",
+    call. = FALSE
+  )
+}
+
+if (anyDuplicated(trajectory_decision$trajectory_id) > 0L) {
+  stop("Trajectory IDs must be unique.", call. = FALSE)
+}
+
+approved_trajectories <- trajectory_decision |>
+  dplyr::filter(approved)
+
+if (nrow(approved_trajectories) == 0L) {
+  stop(
+    "No trajectory has been approved. This is a valid biological decision, ",
+    "but there is no model to fit.",
+    call. = FALSE
+  )
+}
+
+split_units <- function(value) {
+  if (length(value) != 1L || is.na(value)) {
+    return(character())
+  }
+
+  units <- trimws(unlist(strsplit(value, ";", fixed = TRUE)))
+  unique(units[nzchar(units)])
+}
+
+for (decision_index in seq_len(nrow(approved_trajectories))) {
+  included_units <- split_units(
+    approved_trajectories$analysis_units[[decision_index]]
+  )
+  root_unit <- trimws(
+    approved_trajectories$root_unit[[decision_index]]
+  )
+  terminal_units <- split_units(
+    approved_trajectories$terminal_units[[decision_index]]
+  )
+
+  if (
+    length(included_units) < 2L ||
+      !nzchar(root_unit) ||
+      length(terminal_units) == 0L
+  ) {
+    stop(
+      "Approved trajectory ",
+      approved_trajectories$trajectory_id[[decision_index]],
+      " requires at least two included units, one root, and at least one ",
+      "terminal unit.",
+      call. = FALSE
+    )
+  }
+
+  if (root_unit %in% terminal_units) {
+    stop(
+      "The root cannot also be a terminal unit for ",
+      approved_trajectories$trajectory_id[[decision_index]],
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (!root_unit %in% included_units) {
+    stop(
+      "Trajectory root is not included in analysis_units for ",
+      approved_trajectories$trajectory_id[[decision_index]],
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (!all(terminal_units %in% included_units)) {
+    stop(
+      "At least one terminal unit is absent from analysis_units for ",
+      approved_trajectories$trajectory_id[[decision_index]],
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (!all(included_units %in% unique(metadata$analysis_unit))) {
+    stop(
+      "An approved trajectory references an unavailable annotation unit.",
+      call. = FALSE
+    )
+  }
+
+  included_annotation <- metadata |>
+    dplyr::filter(analysis_unit %in% included_units) |>
+    dplyr::distinct(
+      analysis_unit,
+      broad_compartment,
+      annotation_confidence
+    )
+
+  if (
+    any(included_annotation$broad_compartment != "epithelial") ||
+      any(included_annotation$annotation_confidence == "low")
+  ) {
+    stop(
+      "Approved trajectories may contain only high- or ",
+      "moderate-confidence epithelial annotation units.",
+      call. = FALSE
+    )
+  }
+
+  approved_root_counts <- metadata |>
+    dplyr::filter(analysis_unit == root_unit) |>
+    dplyr::count(diet, name = "nuclei")
+
+  if (
+    nrow(approved_root_counts) != length(expected_diets) ||
+      any(
+        approved_root_counts$nuclei <
+          MINIMUM_NUCLEI_PER_DIET_FOR_ROOT
+      )
+  ) {
+    warning(
+      "The approved root for ",
+      approved_trajectories$trajectory_id[[decision_index]],
+      " has fewer than ",
+      MINIMUM_NUCLEI_PER_DIET_FOR_ROOT,
+      " nuclei in at least one diet."
+    )
+  }
+
+  audit_values <- trimws(as.character(unlist(
+    approved_trajectories[
+      decision_index,
+      c("reviewer", "review_date", "decision_notes")
+    ],
+    use.names = FALSE
+  )))
+
+  if (any(is.na(audit_values) | !nzchar(audit_values))) {
+    stop(
+      "Approved trajectories require reviewer, review_date, and notes.",
+      call. = FALSE
+    )
+  }
+
+  review_date <- trimws(as.character(
+    approved_trajectories$review_date[[decision_index]]
+  ))
+
+  parsed_review_date <- suppressWarnings(
+    as.Date(review_date, format = "%Y-%m-%d")
+  )
+
+  if (
+    !grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", review_date) ||
+      is.na(parsed_review_date)
+  ) {
+    stop(
+      "Approved trajectory review_date must use YYYY-MM-DD format.",
+      call. = FALSE
+    )
+  }
+}
+
+approved_trajectories
+```
+
+# 9. Fit approved Slingshot trajectories
+
+This section requires `SingleCellExperiment`, `S4Vectors`, and `slingshot`.
+Install them with Bioconductor before running beyond the manual checkpoint if
+they are not already available.
+
+```{r fit-approved-trajectories}
+trajectory_packages <- c(
+  "SingleCellExperiment",
+  "S4Vectors",
+  "slingshot"
+)
+
+missing_trajectory_packages <- trajectory_packages[
+  !vapply(
+    trajectory_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_trajectory_packages) > 0L) {
+  stop(
+    "Install the following trajectory package(s) before continuing: ",
+    paste(missing_trajectory_packages, collapse = ", "),
+    ". Use BiocManager::install(c(",
+    paste0('"', missing_trajectory_packages, '"', collapse = ", "),
+    ")).",
+    call. = FALSE
+  )
+}
+
+trajectory_model_paths <- character()
+trajectory_assignment_tables <- list()
+trajectory_summary_tables <- list()
+trajectory_trend_tables <- list()
+trajectory_lineage_tables <- list()
+
+approved_trajectory_units <- unique(
+  unlist(
+    lapply(
+      approved_trajectories$analysis_units,
+      split_units
+    )
+  )
+)
+
+trajectory_annotation_lookup <- metadata |>
+  dplyr::filter(analysis_unit %in% approved_trajectory_units) |>
+  dplyr::distinct(
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence
+  )
+
+duplicate_trajectory_annotations <- trajectory_annotation_lookup |>
+  dplyr::count(analysis_unit, name = "annotation_rows") |>
+  dplyr::filter(annotation_rows != 1L)
+
+if (nrow(duplicate_trajectory_annotations) > 0L) {
+  stop(
+    "At least one approved trajectory unit maps to multiple annotations.",
+    call. = FALSE
+  )
+}
+
+trajectory_annotation_key <- metadata |>
+  dplyr::filter(analysis_unit %in% approved_trajectory_units) |>
+  dplyr::count(
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    diet,
+    name = "nuclei"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = nuclei,
+    names_prefix = "nuclei_",
+    values_fill = 0L
+  ) |>
+  dplyr::arrange(as.integer(analysis_unit))
+
+lookup_annotation <- function(unit_values, annotation_column) {
+  matched_values <- trajectory_annotation_lookup[[annotation_column]][
+    match(
+      as.character(unit_values),
+      trajectory_annotation_lookup$analysis_unit
+    )
+  ]
+
+  if (anyNA(matched_values)) {
+    stop(
+      "Could not map every trajectory unit to ",
+      annotation_column,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  as.character(matched_values)
+}
+
+annotate_unit_path <- function(unit_path, annotation_column) {
+  path_units <- split_units(unit_path)
+  path_labels <- lookup_annotation(path_units, annotation_column)
+
+  paste(
+    paste0(path_units, " (", path_labels, ")"),
+    collapse = " -> "
+  )
+}
+
+wnn_context_available <- "wnn.umap" %in% names(multiome@reductions)
+
+if (wnn_context_available) {
+  epithelial_wnn_background <- as.data.frame(
+    Embeddings(multiome, "wnn.umap")[, 1:2, drop = FALSE]
+  )
+  colnames(epithelial_wnn_background) <- c("wnn_1", "wnn_2")
+  epithelial_wnn_background$cell_barcode <- rownames(
+    epithelial_wnn_background
+  )
+
+  epithelial_wnn_background <- epithelial_wnn_background |>
+    dplyr::inner_join(
+      metadata |>
+        dplyr::filter(broad_compartment == "epithelial") |>
+        dplyr::select(
+          cell_barcode,
+          analysis_unit,
+          cell_state,
+          cell_state_full
+        ),
+      by = "cell_barcode"
+    )
+} else {
+  warning(
+    "The Step 6 object lacks wnn.umap; epithelial WNN context plots will ",
+    "be skipped. Slingshot fitting and RNA trajectory plots are unaffected."
+  )
+}
+
+step7_rna_candidates_path <- file.path(
+  STEP7_DIR,
+  "tables",
+  "RNA_top_diet_associated_candidates.csv"
+)
+
+step7_rna_candidates <- if (file.exists(step7_rna_candidates_path)) {
+  suppressMessages(
+    readr::read_csv(
+      step7_rna_candidates_path,
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+  )
+} else {
+  data.frame()
+}
+
+for (decision_index in seq_len(nrow(approved_trajectories))) {
+  trajectory_id <- approved_trajectories$trajectory_id[[decision_index]]
+  included_units <- split_units(
+    approved_trajectories$analysis_units[[decision_index]]
+  )
+  root_unit <- trimws(
+    approved_trajectories$root_unit[[decision_index]]
+  )
+  terminal_units <- split_units(
+    approved_trajectories$terminal_units[[decision_index]]
+  )
+
+  trajectory_cells <- metadata$cell_barcode[
+    metadata$analysis_unit %in% included_units
+  ]
+
+  trajectory_object <- subset(
+    multiome,
+    cells = trajectory_cells
+  )
+
+  DefaultAssay(trajectory_object) <- "RNA"
+
+  trajectory_object <- NormalizeData(
+    trajectory_object,
+    verbose = FALSE
+  )
+
+  trajectory_object <- FindVariableFeatures(
+    trajectory_object,
+    selection.method = "vst",
+    nfeatures = N_VARIABLE_FEATURES,
+    verbose = FALSE
+  )
+
+  trajectory_features <- VariableFeatures(trajectory_object)
+  trajectory_features <- trajectory_features[
+    !grepl("^mt-|^Rpl|^Rps", trajectory_features)
+  ]
+
+  VariableFeatures(trajectory_object) <- trajectory_features
+
+  trajectory_object <- ScaleData(
+    trajectory_object,
+    features = trajectory_features,
+    verbose = FALSE
+  )
+
+  trajectory_object <- RunPCA(
+    trajectory_object,
+    features = trajectory_features,
+    npcs = N_RNA_PCS,
+    reduction.name = "trajectory.pca",
+    reduction.key = "trajPC_",
+    verbose = FALSE
+  )
+
+  trajectory_object <- RunUMAP(
+    trajectory_object,
+    reduction = "trajectory.pca",
+    dims = RNA_DIMS_TRAJECTORY,
+    reduction.name = "trajectory.umap",
+    reduction.key = "trajUMAP_",
+    seed.use = 20260904 + decision_index,
+    verbose = FALSE
+  )
+
+  trajectory_full_log_data <- SeuratObject::LayerData(
+    trajectory_object[["RNA"]],
+    layer = "data"
+  )
+
+  trajectory_log_data <- trajectory_full_log_data[
+    trajectory_features,
+    ,
+    drop = FALSE
+  ]
+
+  trajectory_coldata <- trajectory_object[[]]
+  trajectory_coldata$analysis_unit <- factor(
+    as.character(
+      trajectory_coldata[[ANALYSIS_UNIT_COLUMN]]
+    ),
+    levels = included_units
+  )
+
+  trajectory_sce <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(logcounts = trajectory_log_data),
+    colData = S4Vectors::DataFrame(trajectory_coldata),
+    reducedDims = list(
+      PCA = Embeddings(trajectory_object, "trajectory.pca")
+    )
+  )
+
+  trajectory_sce <- slingshot::slingshot(
+    trajectory_sce,
+    clusterLabels = "analysis_unit",
+    reducedDim = "PCA",
+    start.clus = root_unit,
+    end.clus = terminal_units
+  )
+
+  pseudotime_matrix <- slingshot::slingPseudotime(
+    trajectory_sce,
+    na = TRUE
+  )
+
+  curve_weight_matrix <- slingshot::slingCurveWeights(
+    trajectory_sce
+  )
+
+  inferred_lineages <- slingshot::slingLineages(
+    trajectory_sce
+  )
+
+  if (
+    length(inferred_lineages) != ncol(pseudotime_matrix) ||
+      ncol(curve_weight_matrix) != ncol(pseudotime_matrix)
+  ) {
+    stop(
+      "Slingshot lineage, pseudotime, and curve-weight counts disagree for ",
+      trajectory_id,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  lineage_ids <- names(inferred_lineages)
+
+  if (
+    is.null(lineage_ids) ||
+      any(is.na(lineage_ids) | !nzchar(lineage_ids))
+  ) {
+    lineage_ids <- paste0(
+      "Lineage",
+      seq_along(inferred_lineages)
+    )
+  }
+
+  lineage_mapping <- data.frame(
+    trajectory_id = trajectory_id,
+    lineage_index = seq_along(inferred_lineages),
+    lineage_id = lineage_ids,
+    cluster_path = vapply(
+      inferred_lineages,
+      function(lineage_path) {
+        paste(as.character(lineage_path), collapse = ";")
+      },
+      FUN.VALUE = character(1)
+    ),
+    terminal_unit = vapply(
+      inferred_lineages,
+      function(lineage_path) {
+        tail(as.character(lineage_path), 1L)
+      },
+      FUN.VALUE = character(1)
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  lineage_mapping$root_unit <- root_unit
+  lineage_mapping$root_cell_state <- lookup_annotation(
+    root_unit,
+    "cell_state"
+  )
+  lineage_mapping$terminal_cell_state <- lookup_annotation(
+    lineage_mapping$terminal_unit,
+    "cell_state"
+  )
+  lineage_mapping$cell_state_path <- vapply(
+    lineage_mapping$cluster_path,
+    annotate_unit_path,
+    annotation_column = "cell_state",
+    FUN.VALUE = character(1)
+  )
+  lineage_mapping$cell_state_full_path <- vapply(
+    lineage_mapping$cluster_path,
+    annotate_unit_path,
+    annotation_column = "cell_state_full",
+    FUN.VALUE = character(1)
+  )
+
+  trajectory_lineage_tables[[trajectory_id]] <- lineage_mapping
+
+  inferred_terminal_units <- unique(
+    lineage_mapping$terminal_unit
+  )
+
+  if (!setequal(inferred_terminal_units, terminal_units)) {
+    stop(
+      "Slingshot inferred terminal unit(s) ",
+      paste(inferred_terminal_units, collapse = ", "),
+      " for ",
+      trajectory_id,
+      ", but the approved terminal unit(s) are ",
+      paste(terminal_units, collapse = ", "),
+      ". Revise the included units or decision table before interpreting ",
+      "pseudotime.",
+      call. = FALSE
+    )
+  }
+
+  assignment_table <- data.frame(
+    cell_barcode = colnames(trajectory_sce),
+    trajectory_id = trajectory_id,
+    sample_id = as.character(trajectory_coldata$sample_id),
+    diet = as.character(trajectory_coldata$diet),
+    analysis_unit = as.character(
+      trajectory_coldata$analysis_unit
+    ),
+    broad_compartment = as.character(
+      trajectory_coldata$broad_compartment
+    ),
+    cell_state = as.character(trajectory_coldata$cell_state),
+    cell_state_full = as.character(
+      trajectory_coldata$cell_state_full
+    ),
+    annotation_confidence = as.character(
+      trajectory_coldata$annotation_confidence
+    ),
+    Phase = as.character(trajectory_coldata$Phase),
+    stringsAsFactors = FALSE
+  )
+
+  pseudotime_names <- paste0(
+    "pseudotime_",
+    seq_len(ncol(pseudotime_matrix))
+  )
+
+  weight_names <- paste0(
+    "curve_weight_",
+    seq_len(ncol(curve_weight_matrix))
+  )
+
+  colnames(pseudotime_matrix) <- pseudotime_names
+  colnames(curve_weight_matrix) <- weight_names
+
+  assignment_table <- cbind(
+    assignment_table,
+    as.data.frame(pseudotime_matrix),
+    as.data.frame(curve_weight_matrix)
+  )
+
+  trajectory_assignment_tables[[trajectory_id]] <- assignment_table
+
+  pseudotime_long <- assignment_table |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(pseudotime_names),
+      names_to = "pseudotime_column",
+      values_to = "pseudotime"
+    ) |>
+    dplyr::mutate(
+      lineage_index = as.integer(sub(
+        "pseudotime_",
+        "",
+        pseudotime_column
+      ))
+    )
+
+  curve_weight_long <- assignment_table |>
+    dplyr::select(
+      cell_barcode,
+      dplyr::all_of(weight_names)
+    ) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(weight_names),
+      names_to = "weight_column",
+      values_to = "curve_weight"
+    ) |>
+    dplyr::mutate(
+      lineage_index = as.integer(sub(
+        "curve_weight_",
+        "",
+        weight_column
+      ))
+    ) |>
+    dplyr::select(
+      cell_barcode,
+      lineage_index,
+      curve_weight
+    )
+
+  assignment_long <- pseudotime_long |>
+    dplyr::left_join(
+      curve_weight_long,
+      by = c("cell_barcode", "lineage_index")
+    ) |>
+    dplyr::left_join(
+      lineage_mapping,
+      by = c("trajectory_id", "lineage_index")
+    )
+
+  trajectory_summary_tables[[trajectory_id]] <- assignment_long |>
+    dplyr::filter(
+      !is.na(pseudotime),
+      curve_weight >= MINIMUM_CURVE_WEIGHT
+    ) |>
+    dplyr::group_by(
+      trajectory_id,
+      lineage_id,
+      terminal_unit,
+      analysis_unit,
+      cell_state,
+      cell_state_full,
+      diet
+    ) |>
+    dplyr::summarise(
+      nuclei = dplyr::n(),
+      median_pseudotime = stats::median(pseudotime),
+      pseudotime_q25 = stats::quantile(pseudotime, 0.25),
+      pseudotime_q75 = stats::quantile(pseudotime, 0.75),
+      .groups = "drop"
+    )
+
+  trajectory_umap <- as.data.frame(
+    Embeddings(trajectory_object, "trajectory.umap")
+  )
+  trajectory_umap$cell_barcode <- rownames(trajectory_umap)
+
+  trajectory_state_plot_data <- assignment_table |>
+    dplyr::select(
+      cell_barcode,
+      analysis_unit,
+      cell_state,
+      cell_state_full
+    ) |>
+    dplyr::distinct() |>
+    dplyr::left_join(
+      trajectory_umap,
+      by = "cell_barcode"
+    ) |>
+    dplyr::mutate(
+      state_display = paste0(analysis_unit, ": ", cell_state)
+    )
+
+  trajectory_state_centroids <- trajectory_state_plot_data |>
+    dplyr::group_by(analysis_unit, cell_state, state_display) |>
+    dplyr::summarise(
+      trajUMAP_1 = stats::median(trajUMAP_1),
+      trajUMAP_2 = stats::median(trajUMAP_2),
+      .groups = "drop"
+    )
+
+  p_trajectory_states <- ggplot2::ggplot(
+    trajectory_state_plot_data,
+    ggplot2::aes(
+      x = trajUMAP_1,
+      y = trajUMAP_2,
+      color = state_display
+    )
+  ) +
+    ggplot2::geom_point(size = 0.35, alpha = 0.65) +
+    ggplot2::geom_label(
+      data = trajectory_state_centroids,
+      ggplot2::aes(
+        x = trajUMAP_1,
+        y = trajUMAP_2,
+        label = state_display
+      ),
+      inherit.aes = FALSE,
+      size = 2.5,
+      label.size = 0.15,
+      fill = "white",
+      alpha = 0.90
+    ) +
+    ggplot2::labs(
+      title = paste("Annotated RNA topology:", trajectory_id),
+      subtitle = paste(
+        "State labels come from Step 6; this UMAP is a display of the",
+        "trajectory-specific RNA PCA neighborhood."
+      ),
+      x = "Trajectory UMAP 1",
+      y = "Trajectory UMAP 2",
+      color = "Annotation unit"
+    ) +
+    theme_multiome(base_size = 9) +
+    ggplot2::theme(legend.position = "none")
+
+  pseudotime_plot_data <- assignment_long |>
+    dplyr::left_join(
+      trajectory_umap,
+      by = "cell_barcode"
+    )
+
+  p_trajectory_pseudotime <- ggplot2::ggplot(
+    pseudotime_plot_data,
+    ggplot2::aes(
+      x = trajUMAP_1,
+      y = trajUMAP_2,
+      color = pseudotime
+    )
+  ) +
+    ggplot2::geom_point(size = 0.35) +
+    ggplot2::facet_wrap(~ lineage_id) +
+    ggplot2::scale_color_viridis_c(na.value = "grey85") +
+    ggplot2::labs(
+      title = paste("Descriptive RNA pseudotime:", trajectory_id),
+      subtitle = paste(
+        "Slingshot fitted in RNA PCA space; root and endpoints",
+        "were manually approved."
+      ),
+      x = "Trajectory UMAP 1",
+      y = "Trajectory UMAP 2",
+      color = "Pseudotime"
+    ) +
+    theme_multiome(base_size = 9)
+
+  print(p_trajectory_pseudotime)
+
+  ggplot2::ggsave(
+    file.path(
+      TRAJECTORY_PLOT_DIR,
+      paste0("04_", trajectory_id, "_pseudotime.pdf")
+    ),
+    p_trajectory_pseudotime,
+    width = 11,
+    height = 7
+  )
+
+  p_annotated_trajectory_overview <-
+    p_trajectory_states /
+    p_trajectory_pseudotime +
+    patchwork::plot_layout(heights = c(0.9, 1.1))
+
+  print(p_annotated_trajectory_overview)
+
+  ggplot2::ggsave(
+    file.path(
+      TRAJECTORY_PLOT_DIR,
+      paste0("05_", trajectory_id, "_annotated_trajectory_overview.pdf")
+    ),
+    p_annotated_trajectory_overview,
+    width = 12,
+    height = 12
+  )
+
+  trajectory_pca <- as.data.frame(
+    Embeddings(trajectory_object, "trajectory.pca")[, 1:2, drop = FALSE]
+  )
+  colnames(trajectory_pca) <- c("trajectory_PC1", "trajectory_PC2")
+  trajectory_pca$cell_barcode <- rownames(trajectory_pca)
+
+  trajectory_pca_plot_data <- assignment_table |>
+    dplyr::select(
+      cell_barcode,
+      analysis_unit,
+      cell_state,
+      cell_state_full
+    ) |>
+    dplyr::distinct() |>
+    dplyr::left_join(
+      trajectory_pca,
+      by = "cell_barcode"
+    ) |>
+    dplyr::mutate(
+      state_display = paste0(analysis_unit, ": ", cell_state)
+    )
+
+  trajectory_pca_centroids <- trajectory_pca_plot_data |>
+    dplyr::group_by(analysis_unit, cell_state, state_display) |>
+    dplyr::summarise(
+      trajectory_PC1 = stats::median(trajectory_PC1),
+      trajectory_PC2 = stats::median(trajectory_PC2),
+      .groups = "drop"
+    )
+
+  fitted_curves <- slingshot::slingCurves(trajectory_sce)
+
+  curve_plot_data <- dplyr::bind_rows(
+    lapply(
+      seq_along(fitted_curves),
+      function(lineage_index) {
+        fitted_curve <- fitted_curves[[lineage_index]]
+        curve_coordinates <- fitted_curve$s[
+          fitted_curve$ord,
+          1:2,
+          drop = FALSE
+        ]
+
+        data.frame(
+          lineage_id = lineage_ids[[lineage_index]],
+          curve_order = seq_len(nrow(curve_coordinates)),
+          trajectory_PC1 = curve_coordinates[, 1],
+          trajectory_PC2 = curve_coordinates[, 2],
+          stringsAsFactors = FALSE
+        )
+      }
+    )
+  )
+
+  p_slingshot_curves <- ggplot2::ggplot(
+    trajectory_pca_plot_data,
+    ggplot2::aes(
+      x = trajectory_PC1,
+      y = trajectory_PC2,
+      color = state_display
+    )
+  ) +
+    ggplot2::geom_point(size = 0.30, alpha = 0.45) +
+    ggplot2::geom_path(
+      data = curve_plot_data,
+      ggplot2::aes(
+        x = trajectory_PC1,
+        y = trajectory_PC2,
+        group = lineage_id
+      ),
+      inherit.aes = FALSE,
+      color = "black",
+      linewidth = 0.8,
+      arrow = grid::arrow(
+        length = grid::unit(0.10, "inches"),
+        type = "closed"
+      )
+    ) +
+    ggplot2::geom_label(
+      data = trajectory_pca_centroids,
+      ggplot2::aes(
+        x = trajectory_PC1,
+        y = trajectory_PC2,
+        label = state_display
+      ),
+      inherit.aes = FALSE,
+      size = 2.5,
+      label.size = 0.15,
+      fill = "white",
+      alpha = 0.90
+    ) +
+    ggplot2::labs(
+      title = paste("Slingshot RNA-PCA curves:", trajectory_id),
+      subtitle = paste(
+        "Arrows project the fitted 20-dimensional RNA-PCA curves onto",
+        "PC1/PC2 from the approved root toward the terminal state(s)."
+      ),
+      x = "Trajectory PC 1",
+      y = "Trajectory PC 2",
+      color = "Annotation unit"
+    ) +
+    theme_multiome(base_size = 9) +
+    ggplot2::theme(legend.position = "none")
+
+  print(p_slingshot_curves)
+
+  ggplot2::ggsave(
+    file.path(
+      TRAJECTORY_PLOT_DIR,
+      paste0("06_", trajectory_id, "_RNA_PCA_slingshot_curves.pdf")
+    ),
+    p_slingshot_curves,
+    width = 10,
+    height = 8
+  )
+
+  if (wnn_context_available) {
+    trajectory_wnn_coordinates <- epithelial_wnn_background |>
+      dplyr::filter(cell_barcode %in% trajectory_cells) |>
+      dplyr::select(cell_barcode, wnn_1, wnn_2)
+
+    wnn_pseudotime_plot_data <- assignment_long |>
+      dplyr::filter(
+        !is.na(pseudotime),
+        curve_weight >= MINIMUM_CURVE_WEIGHT
+      ) |>
+      dplyr::left_join(
+        trajectory_wnn_coordinates,
+        by = "cell_barcode"
+      )
+
+    trajectory_wnn_centroids <- trajectory_state_plot_data |>
+      dplyr::select(
+        cell_barcode,
+        analysis_unit,
+        cell_state,
+        state_display
+      ) |>
+      dplyr::left_join(
+        trajectory_wnn_coordinates,
+        by = "cell_barcode"
+      ) |>
+      dplyr::group_by(analysis_unit, cell_state, state_display) |>
+      dplyr::summarise(
+        wnn_1 = stats::median(wnn_1),
+        wnn_2 = stats::median(wnn_2),
+        .groups = "drop"
+      )
+
+    p_wnn_pseudotime_context <- ggplot2::ggplot() +
+      ggplot2::geom_point(
+        data = epithelial_wnn_background,
+        ggplot2::aes(x = wnn_1, y = wnn_2),
+        color = "grey88",
+        size = 0.20
+      ) +
+      ggplot2::geom_point(
+        data = wnn_pseudotime_plot_data,
+        ggplot2::aes(
+          x = wnn_1,
+          y = wnn_2,
+          color = pseudotime
+        ),
+        size = 0.35
+      ) +
+      ggplot2::geom_label(
+        data = trajectory_wnn_centroids,
+        ggplot2::aes(
+          x = wnn_1,
+          y = wnn_2,
+          label = state_display
+        ),
+        inherit.aes = FALSE,
+        size = 2.2,
+        label.size = 0.12,
+        fill = "white",
+        alpha = 0.88
+      ) +
+      ggplot2::facet_wrap(~ lineage_id) +
+      ggplot2::scale_color_viridis_c() +
+      ggplot2::labs(
+        title = paste("WT epithelial WNN context:", trajectory_id),
+        subtitle = paste(
+          "Pseudotime was inferred in trajectory-specific RNA PCA space;",
+          "WNN coordinates are shown only for multimodal anatomical context."
+        ),
+        x = "WNN UMAP 1",
+        y = "WNN UMAP 2",
+        color = "Pseudotime"
+      ) +
+      theme_multiome(base_size = 9)
+
+    print(p_wnn_pseudotime_context)
+
+    ggplot2::ggsave(
+      file.path(
+        TRAJECTORY_PLOT_DIR,
+        paste0("07_", trajectory_id, "_epithelial_WNN_context.pdf")
+      ),
+      p_wnn_pseudotime_context,
+      width = 12,
+      height = 8
+    )
+  }
+
+  pseudotime_density_data <- assignment_long |>
+    dplyr::filter(
+      !is.na(pseudotime),
+      curve_weight >= MINIMUM_CURVE_WEIGHT
+    )
+
+  p_pseudotime_by_diet <- ggplot2::ggplot(
+    pseudotime_density_data,
+    ggplot2::aes(
+      x = pseudotime,
+      color = diet,
+      fill = diet
+    )
+  ) +
+    ggplot2::geom_density(alpha = 0.18, linewidth = 0.7) +
+    ggplot2::facet_wrap(~ lineage_id, scales = "free_x") +
+    ggplot2::scale_color_manual(values = DIET_COLORS) +
+    ggplot2::scale_fill_manual(values = DIET_COLORS) +
+    ggplot2::labs(
+      title = paste("Descriptive pseudotime occupancy:", trajectory_id),
+      subtitle = paste(
+        "One pooled library per diet; density differences describe library",
+        "occupancy and are not replicated diet-effect estimates."
+      ),
+      x = "Pseudotime",
+      y = "Density",
+      color = NULL,
+      fill = NULL
+    ) +
+    theme_multiome(base_size = 9)
+
+  print(p_pseudotime_by_diet)
+
+  ggplot2::ggsave(
+    file.path(
+      TRAJECTORY_PLOT_DIR,
+      paste0("08_", trajectory_id, "_pseudotime_by_diet.pdf")
+    ),
+    p_pseudotime_by_diet,
+    width = 10,
+    height = 7
+  )
+
+  trend_genes <- unique(unlist(trajectory_programs))
+
+  if (nrow(step7_rna_candidates) > 0L) {
+    diet_candidate_genes <- step7_rna_candidates |>
+      dplyr::filter(analysis_unit %in% included_units) |>
+      dplyr::group_by(analysis_unit) |>
+      dplyr::slice_max(
+        order_by = abs(log2FC_comparison_vs_reference),
+        n = 25L,
+        with_ties = FALSE
+      ) |>
+      dplyr::ungroup() |>
+      dplyr::pull(feature)
+
+    trend_genes <- unique(c(trend_genes, diet_candidate_genes))
+  }
+
+  trend_genes <- intersect(
+    trend_genes,
+    rownames(trajectory_full_log_data)
+  )
+
+  trend_results <- list()
+  trend_index <- 1L
+
+  for (lineage_name in unique(assignment_long$lineage_id)) {
+    lineage_cells <- assignment_long |>
+      dplyr::filter(
+        lineage_id == lineage_name,
+        !is.na(pseudotime),
+        curve_weight >= MINIMUM_CURVE_WEIGHT
+      ) |>
+      dplyr::group_by(diet) |>
+      dplyr::mutate(
+        pseudotime_bin = dplyr::ntile(
+          pseudotime,
+          N_PSEUDOTIME_BINS
+        )
+      ) |>
+      dplyr::ungroup()
+
+    for (diet_value in expected_diets) {
+      for (bin_value in seq_len(N_PSEUDOTIME_BINS)) {
+        selected_cells <- lineage_cells$cell_barcode[
+          lineage_cells$diet == diet_value &
+            lineage_cells$pseudotime_bin == bin_value
+        ]
+
+        if (length(selected_cells) == 0L) {
+          next
+        }
+
+        mean_expression <- Matrix::rowMeans(
+          trajectory_full_log_data[
+            trend_genes,
+            selected_cells,
+            drop = FALSE
+          ]
+        )
+
+        trend_results[[trend_index]] <- data.frame(
+          trajectory_id = trajectory_id,
+          lineage_id = lineage_name,
+          terminal_unit = lineage_cells$terminal_unit[[1]],
+          diet = diet_value,
+          pseudotime_bin = bin_value,
+          nuclei = length(selected_cells),
+          median_pseudotime = stats::median(
+            lineage_cells$pseudotime[
+              lineage_cells$diet == diet_value &
+                lineage_cells$pseudotime_bin == bin_value
+            ]
+          ),
+          gene = trend_genes,
+          mean_log_normalized_expression = mean_expression,
+          stringsAsFactors = FALSE
+        )
+
+        trend_index <- trend_index + 1L
+      }
+    }
+  }
+
+  trajectory_trend_tables[[trajectory_id]] <- dplyr::bind_rows(
+    trend_results
+  )
+
+  model_path <- file.path(
+    TRAJECTORY_DIR,
+    paste0(trajectory_id, "_slingshot_model.rds")
+  )
+
+  saveRDS(
+    trajectory_sce,
+    model_path,
+    compress = FALSE
+  )
+
+  trajectory_model_paths <- c(
+    trajectory_model_paths,
+    model_path
+  )
+}
+```
+
+# 10. Save trajectory assignments and summaries
+
+```{r save-trajectory-outputs}
+trajectory_assignments <- dplyr::bind_rows(
+  trajectory_assignment_tables
+)
+
+trajectory_pseudotime_summary <- dplyr::bind_rows(
+  trajectory_summary_tables
+)
+
+trajectory_gene_trends <- dplyr::bind_rows(
+  trajectory_trend_tables
+)
+
+trajectory_lineage_definitions <- dplyr::bind_rows(
+  trajectory_lineage_tables
+)
+
+readr::write_csv(
+  trajectory_assignments,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "approved_trajectory_pseudotime_assignments.csv.gz"
+  )
+)
+
+readr::write_csv(
+  trajectory_pseudotime_summary,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "pseudotime_summary_by_unit_and_diet.csv"
+  )
+)
+
+readr::write_csv(
+  trajectory_gene_trends,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "descriptive_gene_trends_by_pseudotime_and_diet.csv.gz"
+  )
+)
+
+readr::write_csv(
+  trajectory_lineage_definitions,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "trajectory_lineage_definitions.csv"
+  )
+)
+
+readr::write_csv(
+  trajectory_annotation_key,
+  file.path(
+    TRAJECTORY_TABLE_DIR,
+    "trajectory_annotation_key.csv"
+  )
+)
+
+readr::write_csv(
+  approved_trajectories,
+  file.path(
+    TRAJECTORY_DIR,
+    "trajectory_decision_applied.csv"
+  )
+)
+
+writeLines(
+  c(
+    paste("Step 7B completed:", format(Sys.time())),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste(
+      "Approved trajectories:",
+      paste(approved_trajectories$trajectory_id, collapse = ",")
+    ),
+    paste(
+      "Proposed root annotation unit:",
+      paste(unique(approved_trajectories$root_unit), collapse = ",")
+    ),
+    paste(
+      "Slingshot model files:",
+      paste(basename(trajectory_model_paths), collapse = ",")
+    ),
+    paste(
+      "Annotated lineage definitions:",
+      file.path(
+        TRAJECTORY_TABLE_DIR,
+        "trajectory_lineage_definitions.csv"
+      )
+    ),
+    paste(
+      "Trajectory annotation key:",
+      file.path(
+        TRAJECTORY_TABLE_DIR,
+        "trajectory_annotation_key.csv"
+      )
+    ),
+    "Cell-cycle scores regressed from primary topology: FALSE",
+    "Biological-replicate diet inference performed: FALSE",
+    paste(
+      "Interpretation:",
+      "exploratory RNA trajectories and pooled-library trends"
+    )
+  ),
+  TRAJECTORY_COMPLETE_MARKER
+)
+```
+
+# Interpretation checkpoint
+
+For each approved trajectory, answer:
+
+1. Is the proposed root supported by stem/crypt markers in both libraries?
+2. Does the inferred ordering agree with the approved biological labels?
+3. Is topology dominated by S/G2M separation rather than lineage identity?
+4. Where are absorptive and secretory programs co-detected, and is that pattern
+   compatible with a transition or more consistent with d21 transcriptional
+   infidelity?
+5. Do CON and HFD occupy different pseudotime ranges because of composition,
+   or do expression trends differ within overlapping pseudotime?
+6. Which trajectory-associated RNA genes also have stable Step 7 ATAC effects?
+7. Would a later timepoint or lineage-tracing experiment be required before
+   assigning developmental direction?
+
+The fitted arrows are displayed only in trajectory-specific RNA PCA space,
+where Slingshot was fit. The epithelial WNN panels are contextual overlays and
+must not be interpreted as independently fitted WNN trajectories.
+
+# What comes next?
+
+The WT Step 7 and approved Step 7B results provide a descriptive baseline for
+matching biological states across WT, PPAR, and IL17. Cross-genotype work
+should compare marker-supported states and effect directions, not cluster
+numbers or unqualified pseudotime values.

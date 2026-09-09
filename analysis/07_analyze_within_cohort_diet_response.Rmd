@@ -1,0 +1,1968 @@
+---
+title: "Step 7 - Characterize within-cohort diet response"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 6 assigned reviewed biological labels while preserving the global WNN
+clusters and any approved focused annotation units. Step 7 asks where CON and
+HFD differ within one genotype cohort.
+
+This notebook deliberately separates three questions:
+
+1. Does the representation of an annotated population differ between the two
+   pooled libraries?
+2. Within a matched population, which RNA-expression and chromatin-accessibility
+   effect sizes are most different between HFD and CON?
+3. Are the strongest RNA and ATAC changes directionally concordant near the
+   same genes?
+
+The notebook is cohort-parameterized and can later be run without changing its
+logic for WT, PPAR, and IL17. The first benchmark analysis should use WT.
+
+## Statistical limitation
+
+Each cohort currently contains one pooled CON library and one pooled HFD
+library. Mouse identities are not recoverable after pooling, so diet and
+library are perfectly confounded. Nuclei are observations, not independent
+biological replicates.
+
+Accordingly, this notebook reports:
+
+- descriptive composition;
+- pseudobulk log-fold changes between the two pooled libraries;
+- within-cluster detection differences; and
+- repeated balanced downsampling as a cell-sampling stability analysis.
+
+It does **not** report barcode-level P values as evidence of a replicated diet
+effect. Downsampling cannot create biological replication.
+
+A practical first-pass allocation is **4 CPU cores, 96--128 GiB memory, and
+12--24 hours**. The full ATAC effect table and repeated downsampling are the
+most memory- and time-intensive sections.
+
+# 1. Setup
+
+Set the active dataset and cohort before running the notebook. For the WT
+benchmark:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+  library(Matrix)
+  library(patchwork)
+})
+
+ggplot2::theme_set(theme_multiome())
+
+sample_sheet <- read_sample_sheet()
+
+set.seed(20260904)
+future::plan(future::sequential)
+```
+
+# 2. Define inputs, outputs, and analysis parameters
+
+The preferred analysis unit is `annotation_unit`. Older Step 6 checkpoints
+created before focused annotation units were introduced may not contain that
+column. When no approved focused-subclustering decision exists, the notebook
+safely falls back to the equivalent global `wnn_cluster`. For IL17 and any
+future cohort with an approved focused refinement, `annotation_unit` remains
+mandatory so that a child such as `11_tuft` cannot be silently collapsed.
+
+Tier A requires at least 200 nuclei from each diet. Tier B requires at least
+100. Tier C remains available for composition and exploratory visualization,
+but is not promoted into the primary RNA/ATAC effect-size tables.
+
+```{r define-inputs-and-parameters}
+STEP6_DIR <- file.path(OUTPUT_DIR, "06_annotation")
+STEP7_DIR <- file.path(OUTPUT_DIR, "07_diet_response")
+STEP7_TABLE_DIR <- file.path(STEP7_DIR, "tables")
+STEP7_PLOT_DIR <- file.path(STEP7_DIR, "plots")
+
+STEP6_OBJECT_PATH <- file.path(
+  STEP6_DIR,
+  "multiome_annotated.rds"
+)
+
+STEP6_COMPLETE_MARKER <- file.path(
+  STEP6_DIR,
+  "STEP_06_COMPLETE.txt"
+)
+
+STEP7_COMPLETE_MARKER <- file.path(
+  STEP7_DIR,
+  "STEP_07_COMPLETE.txt"
+)
+
+dir.create(STEP7_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP7_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP7_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+assert_file(STEP6_OBJECT_PATH, "Step 6 annotated multimodal object")
+assert_file(STEP6_COMPLETE_MARKER, "Step 6 completion marker")
+
+PREFERRED_ANALYSIS_UNIT_COLUMN <- "annotation_unit"
+LEGACY_ANALYSIS_UNIT_COLUMN <- "wnn_cluster"
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+
+TIER_A_MIN_NUCLEI_PER_DIET <- 200L
+TIER_B_MIN_NUCLEI_PER_DIET <- 100L
+
+RNA_MIN_TOTAL_COUNTS <- 20L
+RNA_MIN_DETECTION_PERCENT <- 5
+RNA_EFFECT_LOG2FC_THRESHOLD <- 0.50
+RNA_EFFECT_DETECTION_DELTA_THRESHOLD <- 5
+RNA_TOP_FEATURES_PER_DIRECTION <- 250L
+
+ATAC_MIN_TOTAL_COUNTS <- 30L
+ATAC_MIN_DETECTION_PERCENT <- 1
+ATAC_EFFECT_LOG2FC_THRESHOLD <- 0.50
+ATAC_TOP_FEATURES_PER_DIRECTION <- 500L
+
+CPM_PSEUDOCOUNT <- 0.10
+
+RUN_BALANCED_DOWNSAMPLING <- TRUE
+DOWNSAMPLING_ITERATIONS <- 25L
+DOWNSAMPLING_MAX_CELLS_PER_DIET <- 500L
+DOWNSAMPLING_MAX_FEATURES_PER_UNIT <- 1000L
+
+REQUEST_MOTIF_ENRICHMENT <- FALSE
+
+regional_audit_programs <- list(
+  candidate_proximal_crypt = c(
+    "Cftr", "Htr4", "Slc12a2", "Kcnq1", "Dmbt1"
+  ),
+  candidate_mid_distal_secretory = c(
+    "Fcgbp", "Clca1", "Zg16", "Bcas1", "Tff3"
+  ),
+  mature_surface_absorptive = c(
+    "Car4", "Aqp8", "Slc26a3", "Krt20", "Tgm3"
+  )
+)
+
+analysis_parameters <- data.frame(
+  parameter = c(
+    "preferred analysis unit column",
+    "reference diet",
+    "comparison diet",
+    "Tier A minimum nuclei per diet",
+    "Tier B minimum nuclei per diet",
+    "RNA minimum total counts",
+    "RNA minimum detection percent",
+    "RNA candidate absolute log2 fold change",
+    "ATAC minimum total counts",
+    "ATAC minimum detection percent",
+    "ATAC candidate absolute log2 fold change",
+    "balanced downsampling performed",
+    "balanced downsampling iterations",
+    "maximum sampled cells per diet",
+    "motif enrichment requested"
+  ),
+  value = c(
+    PREFERRED_ANALYSIS_UNIT_COLUMN,
+    REFERENCE_DIET,
+    COMPARISON_DIET,
+    TIER_A_MIN_NUCLEI_PER_DIET,
+    TIER_B_MIN_NUCLEI_PER_DIET,
+    RNA_MIN_TOTAL_COUNTS,
+    RNA_MIN_DETECTION_PERCENT,
+    RNA_EFFECT_LOG2FC_THRESHOLD,
+    ATAC_MIN_TOTAL_COUNTS,
+    ATAC_MIN_DETECTION_PERCENT,
+    ATAC_EFFECT_LOG2FC_THRESHOLD,
+    RUN_BALANCED_DOWNSAMPLING,
+    DOWNSAMPLING_ITERATIONS,
+    DOWNSAMPLING_MAX_CELLS_PER_DIET,
+    REQUEST_MOTIF_ENRICHMENT
+  ),
+  stringsAsFactors = FALSE
+)
+
+```
+
+# 3. Load and validate the annotated object
+
+```{r load-and-validate-object}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+metadata <- multiome[[]]
+
+resolve_analysis_unit_column <- function(metadata) {
+  if (PREFERRED_ANALYSIS_UNIT_COLUMN %in% colnames(metadata)) {
+    return(PREFERRED_ANALYSIS_UNIT_COLUMN)
+  }
+
+  if (!LEGACY_ANALYSIS_UNIT_COLUMN %in% colnames(metadata)) {
+    stop(
+      "The Step 6 object contains neither '",
+      PREFERRED_ANALYSIS_UNIT_COLUMN,
+      "' nor '",
+      LEGACY_ANALYSIS_UNIT_COLUMN,
+      "'.",
+      call. = FALSE
+    )
+  }
+
+  focused_decision_path <- file.path(
+    COHORT_CONFIG_DIR,
+    "subclustering_decision.csv"
+  )
+
+  if (file.exists(focused_decision_path)) {
+    focused_decision <- suppressMessages(
+      readr::read_csv(
+        focused_decision_path,
+        show_col_types = FALSE,
+        progress = FALSE
+      )
+    )
+
+    if (!"approved" %in% colnames(focused_decision)) {
+      stop(
+        "The focused-subclustering decision table has no approved column: ",
+        focused_decision_path,
+        call. = FALSE
+      )
+    }
+
+    approved_focused_decision <- tolower(
+      trimws(as.character(focused_decision$approved))
+    ) %in% c("true", "t", "1", "yes", "y")
+
+    if (any(approved_focused_decision)) {
+      stop(
+        "This cohort has an approved focused-subclustering decision, but ",
+        "the Step 6 object lacks annotation_unit. Rerun Step 6 so the ",
+        "approved focused annotation units are retained.",
+        call. = FALSE
+      )
+    }
+  }
+
+  message(
+    "Legacy Step 6 object detected without annotation_unit; using ",
+    "wnn_cluster because this cohort has no approved focused refinement."
+  )
+
+  LEGACY_ANALYSIS_UNIT_COLUMN
+}
+
+ANALYSIS_UNIT_COLUMN <- resolve_analysis_unit_column(metadata)
+
+analysis_unit_resolution <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  preferred_column = PREFERRED_ANALYSIS_UNIT_COLUMN,
+  resolved_column = ANALYSIS_UNIT_COLUMN,
+  legacy_fallback_used = !identical(
+    ANALYSIS_UNIT_COLUMN,
+    PREFERRED_ANALYSIS_UNIT_COLUMN
+  ),
+  stringsAsFactors = FALSE
+)
+
+analysis_parameters <- dplyr::bind_rows(
+  analysis_parameters,
+  data.frame(
+    parameter = "resolved analysis unit column",
+    value = ANALYSIS_UNIT_COLUMN,
+    stringsAsFactors = FALSE
+  )
+)
+
+readr::write_csv(
+  analysis_parameters,
+  file.path(STEP7_DIR, "diet_response_parameters.csv")
+)
+
+readr::write_csv(
+  analysis_unit_resolution,
+  file.path(STEP7_DIR, "analysis_unit_resolution.csv")
+)
+
+required_assays <- c("RNA", "ATAC")
+missing_assays <- setdiff(required_assays, names(multiome))
+
+if (length(missing_assays) > 0L) {
+  stop(
+    "The Step 6 object is missing assay(s): ",
+    paste(missing_assays, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+required_metadata <- c(
+  "sample_id",
+  "diet",
+  "wnn_cluster",
+  ANALYSIS_UNIT_COLUMN,
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence",
+  "nCount_RNA",
+  "percent.mt",
+  "TSS.enrichment",
+  "frip_cr",
+  "scDblFinder.score"
+)
+
+missing_metadata <- setdiff(required_metadata, colnames(metadata))
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "The Step 6 object is missing metadata column(s): ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+atac_depth_column <- if (
+  "nCount_ATAC_common" %in% colnames(metadata)
+) {
+  "nCount_ATAC_common"
+} else if (
+  "nCount_ATAC" %in% colnames(metadata)
+) {
+  "nCount_ATAC"
+} else {
+  stop(
+    "No ATAC depth column was found in the Step 6 metadata.",
+    call. = FALSE
+  )
+}
+
+metadata$cell_barcode <- rownames(metadata)
+metadata$sample_id <- as.character(metadata$sample_id)
+metadata$diet <- as.character(metadata$diet)
+metadata$analysis_unit <- as.character(
+  metadata[[ANALYSIS_UNIT_COLUMN]]
+)
+metadata$wnn_cluster <- as.character(metadata$wnn_cluster)
+metadata$broad_compartment <- as.character(
+  metadata$broad_compartment
+)
+metadata$cell_state <- as.character(metadata$cell_state)
+metadata$cell_state_full <- as.character(metadata$cell_state_full)
+metadata$annotation_confidence <- tolower(
+  as.character(metadata$annotation_confidence)
+)
+
+expected_diets <- c(REFERENCE_DIET, COMPARISON_DIET)
+observed_diets <- sort(unique(metadata$diet))
+
+if (!setequal(observed_diets, expected_diets)) {
+  stop(
+    "Expected exactly CON and HFD. Observed diet values: ",
+    paste(observed_diets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_diet_map <- metadata |>
+  dplyr::distinct(sample_id, diet)
+
+if (anyDuplicated(sample_diet_map$sample_id) > 0L) {
+  stop(
+    "At least one sample_id maps to more than one diet.",
+    call. = FALSE
+  )
+}
+
+libraries_per_diet <- sample_diet_map |>
+  dplyr::count(diet, name = "libraries")
+
+replicated_design <- all(libraries_per_diet$libraries >= 2L)
+
+if (!replicated_design) {
+  message(
+    "No replicated diet inference will be performed: one or both diets ",
+    "have fewer than two independent libraries."
+  )
+}
+
+rna_layers <- SeuratObject::Layers(multiome[["RNA"]])
+atac_layers <- SeuratObject::Layers(multiome[["ATAC"]])
+
+if (!"counts" %in% rna_layers || !"data" %in% rna_layers) {
+  stop(
+    "The RNA assay must contain joined counts and data layers.",
+    call. = FALSE
+  )
+}
+
+if (!"counts" %in% atac_layers) {
+  stop(
+    "The ATAC assay must contain a counts layer.",
+    call. = FALSE
+  )
+}
+
+rna_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+
+rna_data <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "data"
+)
+
+atac_counts <- SeuratObject::LayerData(
+  multiome[["ATAC"]],
+  layer = "counts"
+)
+
+metadata_cells <- rownames(metadata)
+
+align_matrix_to_metadata <- function(
+    feature_matrix,
+    metadata_cells,
+    matrix_label
+) {
+  matrix_cells <- colnames(feature_matrix)
+
+  if (is.null(matrix_cells)) {
+    stop(matrix_label, " has no cell names.", call. = FALSE)
+  }
+
+  if (anyDuplicated(matrix_cells) > 0L) {
+    stop(matrix_label, " contains duplicate cell names.", call. = FALSE)
+  }
+
+  if (anyDuplicated(metadata_cells) > 0L) {
+    stop("The Step 6 metadata contains duplicate cell names.", call. = FALSE)
+  }
+
+  missing_from_matrix <- setdiff(metadata_cells, matrix_cells)
+  extra_in_matrix <- setdiff(matrix_cells, metadata_cells)
+
+  if (
+    length(missing_from_matrix) > 0L ||
+      length(extra_in_matrix) > 0L
+  ) {
+    stop(
+      matrix_label,
+      " and the Step 6 metadata contain different cell sets. ",
+      "Missing from matrix: ",
+      length(missing_from_matrix),
+      "; extra in matrix: ",
+      length(extra_in_matrix),
+      ". Example missing cells: ",
+      paste(utils::head(missing_from_matrix, 5L), collapse = ", "),
+      ". Example extra cells: ",
+      paste(utils::head(extra_in_matrix, 5L), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+  }
+
+  if (!identical(matrix_cells, metadata_cells)) {
+    message(
+      matrix_label,
+      " contains the correct cells in a different order; ",
+      "reordering its columns to match the Step 6 metadata."
+    )
+
+    feature_matrix <- feature_matrix[
+      ,
+      metadata_cells,
+      drop = FALSE
+    ]
+  }
+
+  if (!identical(colnames(feature_matrix), metadata_cells)) {
+    stop(
+      "Failed to align ",
+      matrix_label,
+      " to the Step 6 metadata.",
+      call. = FALSE
+    )
+  }
+
+  feature_matrix
+}
+
+matrix_alignment_audit <- data.frame(
+  matrix = c("RNA counts", "RNA data", "ATAC counts"),
+  matrix_cells = c(
+    ncol(rna_counts),
+    ncol(rna_data),
+    ncol(atac_counts)
+  ),
+  metadata_cells = length(metadata_cells),
+  same_cell_set = c(
+    setequal(colnames(rna_counts), metadata_cells),
+    setequal(colnames(rna_data), metadata_cells),
+    setequal(colnames(atac_counts), metadata_cells)
+  ),
+  identical_order_before_alignment = c(
+    identical(colnames(rna_counts), metadata_cells),
+    identical(colnames(rna_data), metadata_cells),
+    identical(colnames(atac_counts), metadata_cells)
+  ),
+  stringsAsFactors = FALSE
+)
+
+rna_counts <- align_matrix_to_metadata(
+  rna_counts,
+  metadata_cells,
+  "RNA counts"
+)
+
+rna_data <- align_matrix_to_metadata(
+  rna_data,
+  metadata_cells,
+  "RNA data"
+)
+
+atac_counts <- align_matrix_to_metadata(
+  atac_counts,
+  metadata_cells,
+  "ATAC counts"
+)
+
+readr::write_csv(
+  matrix_alignment_audit,
+  file.path(STEP7_DIR, "matrix_cell_alignment_audit.csv")
+)
+
+run_inventory <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  cohort_group = COHORT_GROUP,
+  nuclei = nrow(metadata),
+  RNA_features = nrow(rna_counts),
+  ATAC_features = nrow(atac_counts),
+  independent_libraries = nrow(sample_diet_map),
+  replicated_diet_design = replicated_design,
+  stringsAsFactors = FALSE
+)
+
+run_inventory
+
+readr::write_csv(
+  run_inventory,
+  file.path(STEP7_DIR, "diet_response_run_inventory.csv")
+)
+```
+
+# 4. Define cell-state lineages and analysis eligibility
+
+Eligibility is determined before looking at diet-associated RNA or ATAC effect
+sizes. Low-confidence annotations are retained in the object and composition
+tables but excluded from the primary molecular analysis.
+
+```{r define-analysis-eligibility}
+annotate_lineage <- function(cell_state, broad_compartment) {
+  dplyr::case_when(
+    broad_compartment != "epithelial" ~ broad_compartment,
+    grepl(
+      "ISC|crypt|transit",
+      cell_state,
+      ignore.case = TRUE
+    ) ~ "crypt",
+    grepl(
+      "absorptive|colonocyte",
+      cell_state,
+      ignore.case = TRUE
+    ) ~ "absorptive",
+    grepl(
+      "goblet|Reg4|secretory",
+      cell_state,
+      ignore.case = TRUE
+    ) ~ "secretory",
+    grepl(
+      "Enterochromaffin|L cell",
+      cell_state,
+      ignore.case = TRUE
+    ) ~ "enteroendocrine",
+    grepl("Tuft", cell_state, ignore.case = TRUE) ~ "tuft",
+    TRUE ~ "other_epithelial"
+  )
+}
+
+metadata$analysis_lineage <- annotate_lineage(
+  metadata$cell_state,
+  metadata$broad_compartment
+)
+
+unit_annotation <- metadata |>
+  dplyr::distinct(
+    analysis_unit,
+    wnn_cluster,
+    broad_compartment,
+    analysis_lineage,
+    cell_state,
+    cell_state_full,
+    annotation_confidence
+  )
+
+duplicate_unit_annotations <- unit_annotation |>
+  dplyr::count(analysis_unit, name = "annotation_rows") |>
+  dplyr::filter(annotation_rows != 1L)
+
+if (nrow(duplicate_unit_annotations) > 0L) {
+  stop(
+    "At least one annotation unit maps to multiple biological labels.",
+    call. = FALSE
+  )
+}
+
+unit_counts <- metadata |>
+  dplyr::count(analysis_unit, diet, name = "nuclei") |>
+  tidyr::complete(
+    analysis_unit,
+    diet = expected_diets,
+    fill = list(nuclei = 0L)
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = nuclei,
+    names_prefix = "nuclei_"
+  )
+
+eligibility <- unit_annotation |>
+  dplyr::left_join(unit_counts, by = "analysis_unit") |>
+  dplyr::mutate(
+    minimum_nuclei_per_diet = pmin(
+      .data[[paste0("nuclei_", REFERENCE_DIET)]],
+      .data[[paste0("nuclei_", COMPARISON_DIET)]]
+    ),
+    eligibility_tier = dplyr::case_when(
+      annotation_confidence == "low" ~ "exclude_primary",
+      broad_compartment != "epithelial" ~ "secondary_compartment",
+      minimum_nuclei_per_diet >= TIER_A_MIN_NUCLEI_PER_DIET ~
+        "Tier_A",
+      minimum_nuclei_per_diet >= TIER_B_MIN_NUCLEI_PER_DIET ~
+        "Tier_B",
+      TRUE ~ "Tier_C"
+    ),
+    primary_RNA_ATAC = eligibility_tier %in% c("Tier_A", "Tier_B"),
+    interpretation = dplyr::case_when(
+      eligibility_tier == "Tier_A" ~
+        "Primary descriptive RNA and ATAC comparison",
+      eligibility_tier == "Tier_B" ~
+        "Biologically prioritized comparison with reduced cell support",
+      eligibility_tier == "Tier_C" ~
+        "Composition and exploratory marker review only",
+      eligibility_tier == "secondary_compartment" ~
+        "Analyze separately from the epithelial benchmark",
+      TRUE ~
+        "Retain for sensitivity analysis; exclude from primary inference"
+    )
+  ) |>
+  dplyr::arrange(
+    factor(
+      eligibility_tier,
+      levels = c(
+        "Tier_A",
+        "Tier_B",
+        "Tier_C",
+        "secondary_compartment",
+        "exclude_primary"
+      )
+    ),
+    analysis_unit
+  )
+
+eligibility
+
+readr::write_csv(
+  eligibility,
+  file.path(STEP7_TABLE_DIR, "analysis_population_eligibility.csv")
+)
+
+primary_units <- eligibility |>
+  dplyr::filter(primary_RNA_ATAC) |>
+  dplyr::pull(analysis_unit)
+
+if (length(primary_units) == 0L) {
+  stop(
+    "No annotation unit meets the primary Tier A or Tier B criteria.",
+    call. = FALSE
+  )
+}
+
+cat(
+  "Primary RNA/ATAC analysis units:",
+  paste(primary_units, collapse = ", "),
+  "\n"
+)
+```
+
+## Cluster-level QC sensitivity
+
+```{r cluster-qc-sensitivity}
+qc_metrics <- c(
+  "nCount_RNA",
+  atac_depth_column,
+  "percent.mt",
+  "TSS.enrichment",
+  "frip_cr",
+  "scDblFinder.score"
+)
+
+if ("RNA.weight" %in% colnames(metadata)) {
+  qc_metrics <- c(qc_metrics, "RNA.weight")
+}
+
+cluster_qc_summary <- metadata |>
+  dplyr::group_by(analysis_unit, diet) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    dplyr::across(
+      dplyr::all_of(qc_metrics),
+      list(
+        median = ~ stats::median(.x, na.rm = TRUE),
+        q25 = ~ stats::quantile(.x, 0.25, na.rm = TRUE),
+        q75 = ~ stats::quantile(.x, 0.75, na.rm = TRUE)
+      )
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    eligibility |>
+      dplyr::select(
+        analysis_unit,
+        cell_state,
+        annotation_confidence,
+        eligibility_tier
+      ),
+    by = "analysis_unit"
+  )
+
+readr::write_csv(
+  cluster_qc_summary,
+  file.path(STEP7_TABLE_DIR, "analysis_unit_QC_by_diet.csv")
+)
+```
+
+# 5. Describe composition using explicit denominators
+
+Composition is reported three ways because a change in captured stromal,
+immune, or low-confidence nuclei can alter the percentage of every epithelial
+population even when the epithelial biology is unchanged.
+
+```{r composition-summaries}
+composition_all_nuclei <- metadata |>
+  dplyr::count(sample_id, diet, analysis_unit, name = "nuclei") |>
+  dplyr::group_by(sample_id) |>
+  dplyr::mutate(
+    denominator = sum(nuclei),
+    percent = 100 * nuclei / denominator,
+    denominator_definition = "all_retained_nuclei"
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    unit_annotation |>
+      dplyr::select(
+        analysis_unit,
+        broad_compartment,
+        analysis_lineage,
+        cell_state,
+        annotation_confidence
+      ),
+    by = "analysis_unit"
+  )
+
+curated_epithelial_metadata <- metadata |>
+  dplyr::filter(
+    broad_compartment == "epithelial",
+    annotation_confidence != "low"
+  )
+
+composition_curated_epithelium <- curated_epithelial_metadata |>
+  dplyr::count(sample_id, diet, analysis_unit, name = "nuclei") |>
+  dplyr::group_by(sample_id) |>
+  dplyr::mutate(
+    denominator = sum(nuclei),
+    percent = 100 * nuclei / denominator,
+    denominator_definition = "high_or_moderate_confidence_epithelium"
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    unit_annotation |>
+      dplyr::select(
+        analysis_unit,
+        broad_compartment,
+        analysis_lineage,
+        cell_state,
+        annotation_confidence
+      ),
+    by = "analysis_unit"
+  )
+
+composition_by_lineage <- curated_epithelial_metadata |>
+  dplyr::count(
+    sample_id,
+    diet,
+    analysis_lineage,
+    analysis_unit,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(sample_id, analysis_lineage) |>
+  dplyr::mutate(
+    denominator = sum(nuclei),
+    percent = 100 * nuclei / denominator,
+    denominator_definition = paste0(
+      "within_",
+      analysis_lineage
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    unit_annotation |>
+      dplyr::select(
+        analysis_unit,
+        cell_state,
+        annotation_confidence
+      ),
+    by = "analysis_unit"
+  )
+
+lineage_composition <- curated_epithelial_metadata |>
+  dplyr::count(
+    sample_id,
+    diet,
+    analysis_lineage,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(sample_id) |>
+  dplyr::mutate(
+    epithelial_denominator = sum(nuclei),
+    percent_of_curated_epithelium =
+      100 * nuclei / epithelial_denominator
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  composition_all_nuclei,
+  file.path(STEP7_TABLE_DIR, "composition_all_retained_nuclei.csv")
+)
+
+readr::write_csv(
+  composition_curated_epithelium,
+  file.path(
+    STEP7_TABLE_DIR,
+    "composition_curated_epithelial_nuclei.csv"
+  )
+)
+
+readr::write_csv(
+  composition_by_lineage,
+  file.path(STEP7_TABLE_DIR, "composition_within_lineage.csv")
+)
+
+readr::write_csv(
+  lineage_composition,
+  file.path(STEP7_TABLE_DIR, "lineage_composition.csv")
+)
+```
+
+## Composition effect-size plot
+
+```{r plot-composition-effect-sizes}
+composition_effects <- composition_all_nuclei |>
+  dplyr::select(
+    analysis_unit,
+    cell_state,
+    diet,
+    percent
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = percent,
+    values_fill = 0
+  ) |>
+  dplyr::mutate(
+    difference_percentage_points =
+      .data[[COMPARISON_DIET]] - .data[[REFERENCE_DIET]],
+    abundance_ratio =
+      (.data[[COMPARISON_DIET]] + 0.01) /
+      (.data[[REFERENCE_DIET]] + 0.01),
+    display_label = paste0(analysis_unit, ": ", cell_state)
+  ) |>
+  dplyr::left_join(
+    eligibility |>
+      dplyr::select(analysis_unit, eligibility_tier),
+    by = "analysis_unit"
+  ) |>
+  dplyr::arrange(difference_percentage_points)
+
+readr::write_csv(
+  composition_effects,
+  file.path(STEP7_TABLE_DIR, "composition_effect_sizes.csv")
+)
+
+composition_effects$display_label <- factor(
+  composition_effects$display_label,
+  levels = composition_effects$display_label
+)
+
+p_composition_effects <- ggplot2::ggplot(
+  composition_effects,
+  ggplot2::aes(
+    x = difference_percentage_points,
+    y = display_label,
+    color = eligibility_tier
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey60",
+    linewidth = 0.4
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      xend = difference_percentage_points,
+      yend = display_label
+    ),
+    linewidth = 0.7
+  ) +
+  ggplot2::geom_point(size = 2.4) +
+  ggplot2::labs(
+    title = paste0(
+      COHORT_GROUP,
+      ": descriptive cell-state composition difference"
+    ),
+    subtitle = paste0(
+      COMPARISON_DIET,
+      " minus ",
+      REFERENCE_DIET,
+      "; one pooled library per diet is not a replicated test"
+    ),
+    x = "Difference in percentage points",
+    y = NULL,
+    color = "Analysis tier"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_composition_effects)
+
+ggplot2::ggsave(
+  file.path(
+    STEP7_PLOT_DIR,
+    "01_composition_effect_sizes_all_nuclei.pdf"
+  ),
+  p_composition_effects,
+  width = 10,
+  height = 8
+)
+```
+
+# 6. Audit candidate regional programs within matched states
+
+These feature groups are an exploratory audit, not approved regional labels.
+They intentionally remain separate from `cell_state`. Because many regional
+markers also change during differentiation, comparisons should be interpreted
+within the same annotation unit rather than across unrelated clusters.
+
+```{r regional-program-audit}
+regional_feature_key <- dplyr::bind_rows(
+  lapply(
+    names(regional_audit_programs),
+    function(program_name) {
+      data.frame(
+        program = program_name,
+        gene = regional_audit_programs[[program_name]],
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+)
+
+regional_feature_key$present_in_RNA <-
+  regional_feature_key$gene %in% rownames(rna_counts)
+
+readr::write_csv(
+  regional_feature_key,
+  file.path(STEP7_TABLE_DIR, "regional_feature_audit.csv")
+)
+
+regional_feature_summary <- list()
+regional_summary_index <- 1L
+
+for (feature_index in seq_len(nrow(regional_feature_key))) {
+  gene <- regional_feature_key$gene[[feature_index]]
+
+  if (!gene %in% rownames(rna_counts)) {
+    next
+  }
+
+  for (analysis_unit_value in unique(metadata$analysis_unit)) {
+    for (diet_value in expected_diets) {
+      selected_cells <- metadata$cell_barcode[
+        metadata$analysis_unit == analysis_unit_value &
+          metadata$diet == diet_value
+      ]
+
+      if (length(selected_cells) == 0L) {
+        next
+      }
+
+      count_values <- rna_counts[gene, selected_cells, drop = TRUE]
+      normalized_values <- rna_data[
+        gene,
+        selected_cells,
+        drop = TRUE
+      ]
+
+      regional_feature_summary[[regional_summary_index]] <- data.frame(
+        analysis_unit = analysis_unit_value,
+        diet = diet_value,
+        program = regional_feature_key$program[[feature_index]],
+        gene = gene,
+        nuclei = length(selected_cells),
+        percent_detected = 100 * mean(count_values > 0),
+        average_log_normalized_expression = mean(normalized_values),
+        stringsAsFactors = FALSE
+      )
+
+      regional_summary_index <- regional_summary_index + 1L
+    }
+  }
+}
+
+regional_feature_summary <- dplyr::bind_rows(
+  regional_feature_summary
+) |>
+  dplyr::left_join(
+    unit_annotation |>
+      dplyr::select(analysis_unit, cell_state),
+    by = "analysis_unit"
+  )
+
+readr::write_csv(
+  regional_feature_summary,
+  file.path(
+    STEP7_TABLE_DIR,
+    "regional_feature_expression_by_unit_and_diet.csv"
+  )
+)
+
+p_regional_audit <- regional_feature_summary |>
+  dplyr::filter(analysis_unit %in% primary_units) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = analysis_unit,
+      y = gene,
+      size = percent_detected,
+      color = average_log_normalized_expression
+    )
+  ) +
+  ggplot2::geom_point() +
+  ggplot2::facet_grid(
+    program ~ diet,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  ggplot2::scale_color_gradientn(
+    colors = c("#2C7BB6", "#F7F7F7", "#D7191C")
+  ) +
+  ggplot2::labs(
+    title = "Candidate regional-axis audit within annotation units",
+    subtitle = "Use within-state differences; these are not regional labels.",
+    x = "Annotation unit",
+    y = NULL,
+    size = "Percent detected",
+    color = "Average log-normalized expression"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_regional_audit)
+
+ggplot2::ggsave(
+  file.path(STEP7_PLOT_DIR, "02_regional_feature_audit.pdf"),
+  p_regional_audit,
+  width = 12,
+  height = 8
+)
+```
+
+# 7. Calculate descriptive RNA pseudobulk effects
+
+Each annotation unit and diet is collapsed into one pooled count vector. The
+reported log2 fold change is therefore a contrast between pooled libraries,
+not a DESeq2-style estimate with biological variance.
+
+```{r descriptive-effect-functions}
+summarize_pooled_effect <- function(
+  count_matrix,
+  feature_label,
+  metadata,
+  analysis_unit_value,
+  reference_diet,
+  comparison_diet,
+  minimum_total_counts,
+  minimum_detection_percent,
+  cpm_pseudocount
+) {
+  reference_cells <- metadata$cell_barcode[
+    metadata$analysis_unit == analysis_unit_value &
+      metadata$diet == reference_diet
+  ]
+
+  comparison_cells <- metadata$cell_barcode[
+    metadata$analysis_unit == analysis_unit_value &
+      metadata$diet == comparison_diet
+  ]
+
+  if (
+    length(reference_cells) == 0L ||
+      length(comparison_cells) == 0L
+  ) {
+    return(NULL)
+  }
+
+  reference_counts <- Matrix::rowSums(
+    count_matrix[, reference_cells, drop = FALSE]
+  )
+
+  comparison_counts <- Matrix::rowSums(
+    count_matrix[, comparison_cells, drop = FALSE]
+  )
+
+  reference_detected <- Matrix::rowSums(
+    count_matrix[, reference_cells, drop = FALSE] > 0
+  )
+
+  comparison_detected <- Matrix::rowSums(
+    count_matrix[, comparison_cells, drop = FALSE] > 0
+  )
+
+  reference_library_size <- sum(reference_counts)
+  comparison_library_size <- sum(comparison_counts)
+
+  if (
+    reference_library_size <= 0 ||
+      comparison_library_size <= 0
+  ) {
+    warning(
+      "Skipping analysis unit ",
+      analysis_unit_value,
+      " because at least one pooled library has zero total counts."
+    )
+    return(NULL)
+  }
+
+  reference_cpm <- 1e6 * reference_counts / reference_library_size
+  comparison_cpm <- 1e6 * comparison_counts / comparison_library_size
+
+  reference_percent <-
+    100 * reference_detected / length(reference_cells)
+  comparison_percent <-
+    100 * comparison_detected / length(comparison_cells)
+
+  result <- data.frame(
+    analysis_unit = analysis_unit_value,
+    feature = rownames(count_matrix),
+    feature_type = feature_label,
+    reference_diet = reference_diet,
+    comparison_diet = comparison_diet,
+    reference_nuclei = length(reference_cells),
+    comparison_nuclei = length(comparison_cells),
+    reference_counts = reference_counts,
+    comparison_counts = comparison_counts,
+    total_counts = reference_counts + comparison_counts,
+    reference_CPM = reference_cpm,
+    comparison_CPM = comparison_cpm,
+    log2FC_comparison_vs_reference = log2(
+      (comparison_cpm + cpm_pseudocount) /
+        (reference_cpm + cpm_pseudocount)
+    ),
+    reference_percent_detected = reference_percent,
+    comparison_percent_detected = comparison_percent,
+    detection_difference_percentage_points =
+      comparison_percent - reference_percent,
+    stringsAsFactors = FALSE
+  )
+
+  result |>
+    dplyr::filter(
+      total_counts >= minimum_total_counts,
+      pmax(
+        reference_percent_detected,
+        comparison_percent_detected
+      ) >= minimum_detection_percent
+    )
+}
+
+select_top_effects <- function(
+  effects,
+  absolute_log2fc_threshold,
+  top_features_per_direction,
+  detection_delta_threshold = NULL
+) {
+  selected <- effects |>
+    dplyr::filter(
+      abs(log2FC_comparison_vs_reference) >=
+        absolute_log2fc_threshold
+    )
+
+  if (!is.null(detection_delta_threshold)) {
+    selected <- selected |>
+      dplyr::filter(
+        abs(detection_difference_percentage_points) >=
+          detection_delta_threshold
+      )
+  }
+
+  selected |>
+    dplyr::mutate(
+      direction = dplyr::if_else(
+        log2FC_comparison_vs_reference > 0,
+        paste0(COMPARISON_DIET, "_higher"),
+        paste0(REFERENCE_DIET, "_higher")
+      )
+    ) |>
+    dplyr::group_by(analysis_unit, direction) |>
+    dplyr::slice_max(
+      order_by = abs(log2FC_comparison_vs_reference),
+      n = top_features_per_direction,
+      with_ties = FALSE
+    ) |>
+    dplyr::ungroup()
+}
+```
+
+```{r calculate-rna-effects}
+rna_effects <- dplyr::bind_rows(
+  lapply(
+    primary_units,
+    function(analysis_unit_value) {
+      summarize_pooled_effect(
+        count_matrix = rna_counts,
+        feature_label = "gene",
+        metadata = metadata,
+        analysis_unit_value = analysis_unit_value,
+        reference_diet = REFERENCE_DIET,
+        comparison_diet = COMPARISON_DIET,
+        minimum_total_counts = RNA_MIN_TOTAL_COUNTS,
+        minimum_detection_percent =
+          RNA_MIN_DETECTION_PERCENT,
+        cpm_pseudocount = CPM_PSEUDOCOUNT
+      )
+    }
+  )
+) |>
+  dplyr::left_join(
+    eligibility |>
+      dplyr::select(
+        analysis_unit,
+        cell_state,
+        cell_state_full,
+        eligibility_tier
+      ),
+    by = "analysis_unit"
+  )
+
+rna_top_candidates <- select_top_effects(
+  effects = rna_effects,
+  absolute_log2fc_threshold = RNA_EFFECT_LOG2FC_THRESHOLD,
+  top_features_per_direction = RNA_TOP_FEATURES_PER_DIRECTION,
+  detection_delta_threshold =
+    RNA_EFFECT_DETECTION_DELTA_THRESHOLD
+)
+
+readr::write_csv(
+  rna_effects,
+  file.path(
+    STEP7_TABLE_DIR,
+    "RNA_pooled_library_effects_by_analysis_unit.csv.gz"
+  )
+)
+
+readr::write_csv(
+  rna_top_candidates,
+  file.path(
+    STEP7_TABLE_DIR,
+    "RNA_top_diet_associated_candidates.csv"
+  )
+)
+
+rna_top_candidates |>
+  dplyr::count(analysis_unit, cell_state, direction)
+```
+
+# 8. Calculate descriptive ATAC pseudobulk effects
+
+```{r calculate-atac-effects}
+atac_effects <- dplyr::bind_rows(
+  lapply(
+    primary_units,
+    function(analysis_unit_value) {
+      summarize_pooled_effect(
+        count_matrix = atac_counts,
+        feature_label = "peak",
+        metadata = metadata,
+        analysis_unit_value = analysis_unit_value,
+        reference_diet = REFERENCE_DIET,
+        comparison_diet = COMPARISON_DIET,
+        minimum_total_counts = ATAC_MIN_TOTAL_COUNTS,
+        minimum_detection_percent =
+          ATAC_MIN_DETECTION_PERCENT,
+        cpm_pseudocount = CPM_PSEUDOCOUNT
+      )
+    }
+  )
+) |>
+  dplyr::left_join(
+    eligibility |>
+      dplyr::select(
+        analysis_unit,
+        cell_state,
+        cell_state_full,
+        eligibility_tier
+      ),
+    by = "analysis_unit"
+  )
+
+atac_top_candidates <- select_top_effects(
+  effects = atac_effects,
+  absolute_log2fc_threshold = ATAC_EFFECT_LOG2FC_THRESHOLD,
+  top_features_per_direction = ATAC_TOP_FEATURES_PER_DIRECTION
+)
+
+readr::write_csv(
+  atac_effects,
+  file.path(
+    STEP7_TABLE_DIR,
+    "ATAC_pooled_library_effects_by_analysis_unit.csv.gz"
+  )
+)
+
+readr::write_csv(
+  atac_top_candidates,
+  file.path(
+    STEP7_TABLE_DIR,
+    "ATAC_top_diet_associated_candidates.csv"
+  )
+)
+
+atac_top_candidates |>
+  dplyr::count(analysis_unit, cell_state, direction)
+```
+
+# 9. Evaluate balanced cell-sampling stability
+
+This analysis repeatedly uses the same number of nuclei from each diet. It
+tests whether an effect is dominated by unequal cell numbers or a small set of
+nuclei. It does not measure mouse-to-mouse reproducibility.
+
+```{r balanced-downsampling-function}
+downsample_effect_stability <- function(
+  count_matrix,
+  metadata,
+  full_effects,
+  analysis_units,
+  iterations,
+  maximum_cells_per_diet,
+  maximum_features_per_unit,
+  cpm_pseudocount,
+  random_seed
+) {
+  set.seed(random_seed)
+  iteration_results <- list()
+  result_index <- 1L
+  cell_library_sizes <- Matrix::colSums(count_matrix)
+
+  for (analysis_unit_value in analysis_units) {
+    unit_effects <- full_effects |>
+      dplyr::filter(analysis_unit == analysis_unit_value) |>
+      dplyr::slice_max(
+        order_by = abs(log2FC_comparison_vs_reference),
+        n = maximum_features_per_unit,
+        with_ties = FALSE
+      )
+
+    if (nrow(unit_effects) == 0L) {
+      warning(
+        "Skipping downsampling for analysis unit ",
+        analysis_unit_value,
+        " because no features passed the pooled-effect filters."
+      )
+      next
+    }
+
+    feature_index <- match(
+      unit_effects$feature,
+      rownames(count_matrix)
+    )
+
+    valid_features <- !is.na(feature_index)
+    unit_effects <- unit_effects[valid_features, , drop = FALSE]
+    feature_index <- feature_index[valid_features]
+
+    reference_cells <- metadata$cell_barcode[
+      metadata$analysis_unit == analysis_unit_value &
+        metadata$diet == REFERENCE_DIET
+    ]
+
+    comparison_cells <- metadata$cell_barcode[
+      metadata$analysis_unit == analysis_unit_value &
+        metadata$diet == COMPARISON_DIET
+    ]
+
+    sampled_nuclei <- min(
+      length(reference_cells),
+      length(comparison_cells),
+      maximum_cells_per_diet
+    )
+
+    if (sampled_nuclei < 1L) {
+      warning(
+        "Skipping downsampling for analysis unit ",
+        analysis_unit_value,
+        " because one diet has no nuclei."
+      )
+      next
+    }
+
+    for (iteration in seq_len(iterations)) {
+      sampled_reference <- sample(
+        reference_cells,
+        sampled_nuclei,
+        replace = FALSE
+      )
+
+      sampled_comparison <- sample(
+        comparison_cells,
+        sampled_nuclei,
+        replace = FALSE
+      )
+
+      sampled_reference_counts <- Matrix::rowSums(
+        count_matrix[
+          feature_index,
+          sampled_reference,
+          drop = FALSE
+        ]
+      )
+
+      sampled_comparison_counts <- Matrix::rowSums(
+        count_matrix[
+          feature_index,
+          sampled_comparison,
+          drop = FALSE
+        ]
+      )
+
+      sampled_reference_cpm <-
+        1e6 * sampled_reference_counts /
+        sum(cell_library_sizes[sampled_reference])
+
+      sampled_comparison_cpm <-
+        1e6 * sampled_comparison_counts /
+        sum(cell_library_sizes[sampled_comparison])
+
+      iteration_results[[result_index]] <- data.frame(
+        analysis_unit = analysis_unit_value,
+        feature = unit_effects$feature,
+        iteration = iteration,
+        sampled_nuclei_per_diet = sampled_nuclei,
+        downsampled_log2FC = log2(
+          (sampled_comparison_cpm + cpm_pseudocount) /
+            (sampled_reference_cpm + cpm_pseudocount)
+        ),
+        full_log2FC =
+          unit_effects$log2FC_comparison_vs_reference,
+        stringsAsFactors = FALSE
+      )
+
+      result_index <- result_index + 1L
+    }
+  }
+
+  stability_iterations <- dplyr::bind_rows(iteration_results)
+
+  if (nrow(stability_iterations) == 0L) {
+    stop(
+      "Balanced downsampling produced no feature-level results.",
+      call. = FALSE
+    )
+  }
+
+  stability_iterations |>
+    dplyr::group_by(analysis_unit, feature) |>
+    dplyr::summarise(
+      sampled_nuclei_per_diet = dplyr::first(
+        sampled_nuclei_per_diet
+      ),
+      full_log2FC = dplyr::first(full_log2FC),
+      downsampled_log2FC_median = stats::median(
+        downsampled_log2FC
+      ),
+      downsampled_log2FC_q25 = stats::quantile(
+        downsampled_log2FC,
+        0.25
+      ),
+      downsampled_log2FC_q75 = stats::quantile(
+        downsampled_log2FC,
+        0.75
+      ),
+      sign_concordance_percent = 100 * mean(
+        sign(downsampled_log2FC) == sign(full_log2FC)
+      ),
+      .groups = "drop"
+    )
+}
+```
+
+```{r run-balanced-downsampling}
+if (RUN_BALANCED_DOWNSAMPLING) {
+  rna_downsampling_stability <- downsample_effect_stability(
+    count_matrix = rna_counts,
+    metadata = metadata,
+    full_effects = rna_effects,
+    analysis_units = primary_units,
+    iterations = DOWNSAMPLING_ITERATIONS,
+    maximum_cells_per_diet = DOWNSAMPLING_MAX_CELLS_PER_DIET,
+    maximum_features_per_unit =
+      DOWNSAMPLING_MAX_FEATURES_PER_UNIT,
+    cpm_pseudocount = CPM_PSEUDOCOUNT,
+    random_seed = 20260904
+  )
+
+  atac_downsampling_stability <- downsample_effect_stability(
+    count_matrix = atac_counts,
+    metadata = metadata,
+    full_effects = atac_effects,
+    analysis_units = primary_units,
+    iterations = DOWNSAMPLING_ITERATIONS,
+    maximum_cells_per_diet = DOWNSAMPLING_MAX_CELLS_PER_DIET,
+    maximum_features_per_unit =
+      DOWNSAMPLING_MAX_FEATURES_PER_UNIT,
+    cpm_pseudocount = CPM_PSEUDOCOUNT,
+    random_seed = 20260905
+  )
+
+  readr::write_csv(
+    rna_downsampling_stability,
+    file.path(
+      STEP7_TABLE_DIR,
+      "RNA_balanced_downsampling_stability.csv"
+    )
+  )
+
+  readr::write_csv(
+    atac_downsampling_stability,
+    file.path(
+      STEP7_TABLE_DIR,
+      "ATAC_balanced_downsampling_stability.csv"
+    )
+  )
+}
+```
+
+# 10. Add nearest genes to the top ATAC candidates
+
+Nearest-gene assignments are genomic context, not proof that a peak regulates
+that gene. They are used here to nominate RNA/ATAC pairs for later coverage,
+motif, and peak-to-gene review.
+
+```{r annotate-top-atac-peaks}
+annotate_nearest_gene <- function(object, peak_table) {
+  if (nrow(peak_table) == 0L) {
+    return(peak_table)
+  }
+
+  unique_peaks <- unique(peak_table$feature)
+
+  nearest_result <- tryCatch(
+    {
+      peak_index <- match(
+        unique_peaks,
+        rownames(object[["ATAC"]])
+      )
+
+      if (anyNA(peak_index)) {
+        stop("At least one candidate peak is absent from the ATAC assay.")
+      }
+
+      query_ranges <- GenomicRanges::granges(
+        object[["ATAC"]]
+      )[peak_index]
+
+      names(query_ranges) <- unique_peaks
+
+      gene_annotation <- Signac::Annotation(
+        object[["ATAC"]]
+      )
+
+      if (is.null(gene_annotation) || length(gene_annotation) == 0L) {
+        stop("The ATAC assay does not contain gene annotations.")
+      }
+
+      query_seqlevels <- as.character(
+        GenomeInfoDb::seqnames(query_ranges)
+      )
+
+      compatible_query <- query_seqlevels %in%
+        GenomeInfoDb::seqlevels(gene_annotation)
+
+      if (!any(compatible_query)) {
+        stop(
+          "Candidate peaks and gene annotations share no chromosome names."
+        )
+      }
+
+      query_ranges_compatible <- query_ranges[compatible_query]
+
+      nearest_hits <- GenomicRanges::distanceToNearest(
+        x = query_ranges_compatible,
+        subject = gene_annotation,
+        ignore.strand = TRUE
+      )
+
+      nearest <- as.data.frame(
+        S4Vectors::mcols(
+          gene_annotation[
+            S4Vectors::subjectHits(nearest_hits)
+          ]
+        )
+      )
+
+      nearest$feature <- names(query_ranges_compatible)[
+        S4Vectors::queryHits(nearest_hits)
+      ]
+
+      nearest$distance <- S4Vectors::mcols(
+        nearest_hits
+      )$distance
+
+      if (!"gene_name" %in% colnames(nearest)) {
+        nearest$gene_name <- NA_character_
+      }
+
+      nearest |>
+        dplyr::select(
+          feature,
+          dplyr::any_of(c(
+            "gene_name",
+            "gene_id",
+            "distance",
+            "gene_biotype"
+          ))
+        ) |>
+        dplyr::distinct(feature, .keep_all = TRUE)
+    },
+    error = function(error_condition) {
+      warning(
+        "Nearest-gene annotation was skipped: ",
+        conditionMessage(error_condition)
+      )
+
+      data.frame(
+        feature = unique_peaks,
+        gene_name = NA_character_,
+        distance = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+
+  peak_table |>
+    dplyr::left_join(nearest_result, by = "feature")
+}
+
+atac_top_annotated <- annotate_nearest_gene(
+  multiome,
+  atac_top_candidates
+)
+
+readr::write_csv(
+  atac_top_annotated,
+  file.path(
+    STEP7_TABLE_DIR,
+    "ATAC_top_candidates_with_nearest_gene.csv"
+  )
+)
+```
+
+# 11. Join directionally concordant RNA and ATAC candidates
+
+```{r rna-atac-concordance}
+rna_for_concordance <- rna_effects |>
+  dplyr::select(
+    analysis_unit,
+    gene = feature,
+    RNA_log2FC = log2FC_comparison_vs_reference,
+    RNA_detection_difference =
+      detection_difference_percentage_points,
+    RNA_reference_CPM = reference_CPM,
+    RNA_comparison_CPM = comparison_CPM
+  )
+
+rna_atac_concordance <- atac_top_annotated |>
+  dplyr::filter(!is.na(gene_name), nzchar(gene_name)) |>
+  dplyr::rename(
+    peak = feature,
+    nearest_gene = gene_name,
+    ATAC_log2FC = log2FC_comparison_vs_reference,
+    ATAC_detection_difference =
+      detection_difference_percentage_points,
+    ATAC_reference_CPM = reference_CPM,
+    ATAC_comparison_CPM = comparison_CPM
+  ) |>
+  dplyr::left_join(
+    rna_for_concordance,
+    by = c(
+      "analysis_unit",
+      "nearest_gene" = "gene"
+    )
+  ) |>
+  dplyr::mutate(
+    RNA_ATAC_direction = dplyr::case_when(
+      is.na(RNA_log2FC) ~ "RNA_not_tested_or_filtered",
+      sign(RNA_log2FC) == sign(ATAC_log2FC) ~ "concordant",
+      TRUE ~ "discordant"
+    ),
+    joint_effect_magnitude =
+      abs(ATAC_log2FC) + abs(RNA_log2FC)
+  ) |>
+  dplyr::arrange(
+    analysis_unit,
+    dplyr::desc(RNA_ATAC_direction == "concordant"),
+    dplyr::desc(joint_effect_magnitude)
+  )
+
+readr::write_csv(
+  rna_atac_concordance,
+  file.path(STEP7_TABLE_DIR, "RNA_ATAC_nearest_gene_concordance.csv")
+)
+
+concordance_plot_data <- rna_atac_concordance |>
+  dplyr::filter(
+    !is.na(RNA_log2FC),
+    is.finite(RNA_log2FC),
+    is.finite(ATAC_log2FC)
+  )
+
+if (nrow(concordance_plot_data) > 0L) {
+  p_rna_atac_concordance <- ggplot2::ggplot(
+    concordance_plot_data,
+    ggplot2::aes(
+      x = ATAC_log2FC,
+      y = RNA_log2FC,
+      color = RNA_ATAC_direction
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      color = "grey70",
+      linewidth = 0.3
+    ) +
+    ggplot2::geom_vline(
+      xintercept = 0,
+      color = "grey70",
+      linewidth = 0.3
+    ) +
+    ggplot2::geom_point(size = 0.7, alpha = 0.55) +
+    ggplot2::facet_wrap(~ analysis_unit, scales = "free") +
+    ggplot2::scale_color_manual(
+      values = c(
+        concordant = "#2A9D8F",
+        discordant = "#E76F51"
+      )
+    ) +
+    ggplot2::labs(
+      title = "Nearest-gene RNA and ATAC effect concordance",
+      subtitle = paste0(
+        COMPARISON_DIET,
+        " versus ",
+        REFERENCE_DIET,
+        "; nearest-gene context is not a regulatory link"
+      ),
+      x = "ATAC pooled-library log2 fold change",
+      y = "RNA pooled-library log2 fold change",
+      color = NULL
+    ) +
+    theme_multiome(base_size = 9)
+
+  print(p_rna_atac_concordance)
+
+  ggplot2::ggsave(
+    file.path(
+      STEP7_PLOT_DIR,
+      "03_RNA_ATAC_nearest_gene_concordance.pdf"
+    ),
+    p_rna_atac_concordance,
+    width = 13,
+    height = 9
+  )
+}
+```
+
+# 12. Optional motif-enrichment gate
+
+Motif enrichment requires a motif matrix compatible with the active GRCm39
+peak set. It is off by default so that Step 7 cannot silently substitute an
+incompatible genome build or motif annotation.
+
+```{r optional-motif-enrichment}
+motif_object_present <- !is.null(
+  tryCatch(
+    Signac::Motifs(multiome[["ATAC"]]),
+    error = function(error_condition) NULL
+  )
+)
+
+motif_status <- data.frame(
+  requested = REQUEST_MOTIF_ENRICHMENT,
+  motif_object_present = motif_object_present,
+  performed = FALSE,
+  note = if (REQUEST_MOTIF_ENRICHMENT && !motif_object_present) {
+    paste(
+      "Motif enrichment was requested, but the ATAC assay lacks a",
+      "compatible motif object. Add GRCm39-compatible motifs first."
+    )
+  } else if (!REQUEST_MOTIF_ENRICHMENT) {
+    "Motif enrichment is intentionally disabled for the first-pass benchmark."
+  } else {
+    paste(
+      "A motif object is present. Perform reviewed enrichment only after",
+      "the candidate peak lists have been inspected."
+    )
+  },
+  stringsAsFactors = FALSE
+)
+
+motif_status
+
+readr::write_csv(
+  motif_status,
+  file.path(STEP7_TABLE_DIR, "motif_analysis_status.csv")
+)
+```
+
+# 13. Save the Step 7 checkpoint
+
+```{r save-step-seven}
+step7_summary <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  cohort_group = COHORT_GROUP,
+  nuclei = nrow(metadata),
+  analysis_unit_source = ANALYSIS_UNIT_COLUMN,
+  annotation_units = dplyr::n_distinct(metadata$analysis_unit),
+  Tier_A_units = sum(eligibility$eligibility_tier == "Tier_A"),
+  Tier_B_units = sum(eligibility$eligibility_tier == "Tier_B"),
+  Tier_C_units = sum(eligibility$eligibility_tier == "Tier_C"),
+  secondary_compartment_units = sum(eligibility$eligibility_tier == "secondary_compartment"),
+  excluded_primary_units = sum(eligibility$eligibility_tier == "exclude_primary"),
+  primary_RNA_ATAC_units = length(primary_units),
+  RNA_effect_rows = nrow(rna_effects),
+  RNA_top_candidate_rows = nrow(rna_top_candidates),
+  ATAC_effect_rows = nrow(atac_effects),
+  ATAC_top_candidate_rows = nrow(atac_top_candidates),
+  replicated_diet_design = replicated_design,
+  biological_inference_performed = FALSE,
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  step7_summary,
+  file.path(STEP7_DIR, "step7_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 7 completed:", format(Sys.time())),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste("Cells:", nrow(metadata)),
+    paste("Analysis unit source:", ANALYSIS_UNIT_COLUMN),
+    paste(
+      "Annotation units:",
+      dplyr::n_distinct(metadata$analysis_unit)
+    ),
+    paste(
+      "Primary RNA/ATAC analysis units:",
+      length(primary_units)
+    ),
+    paste(
+      "Balanced cell downsampling performed:",
+      RUN_BALANCED_DOWNSAMPLING
+    ),
+    paste("Independent libraries per diet:", paste(
+      paste0(libraries_per_diet$diet, "=", libraries_per_diet$libraries),
+      collapse = ";"
+    )),
+    paste("Replicated diet design:", replicated_design),
+    "Biological-replicate differential inference performed: FALSE",
+    paste(
+      "Interpretation:",
+      "descriptive diet-associated effects between pooled libraries"
+    )
+  ),
+  STEP7_COMPLETE_MARKER
+)
+
+step7_summary
+```
+
+# Interpretation checkpoint
+
+Before moving to trajectories or cross-genotype comparison, answer:
+
+1. Which composition differences persist after restricting the denominator to
+   high- or moderate-confidence epithelial nuclei?
+2. Are crypt changes best described as expansion, or as redistribution among
+   ISC-like, cycling, and progenitor states?
+3. Do candidate regional features differ between diets within the same
+   annotation unit?
+4. Which RNA effects remain directionally stable after balanced downsampling?
+5. Which ATAC effects remain stable and have concordant nearby RNA changes?
+6. Are any conclusions driven by low-confidence clusters or rare populations?
+7. Which effects should be prioritized for coverage plots, motif analysis, and
+   later genotype comparison?
+
+# What comes next?
+
+Step 7B audits and, only after manual approval, models WT epithelial
+trajectories. Cross-genotype analysis should compare matched biological states
+and directionally stable effect sizes rather than matching cluster numbers.

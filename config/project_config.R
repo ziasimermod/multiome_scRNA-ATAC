@@ -164,6 +164,6 @@ RESULT_DIRS <- c(
   "04_reduction",
   "05_wnn",
   "06_annotation",
-  "07_composition",
-  "07_pseudobulk"
+  "07_diet_response",
+  "07b_trajectories"
 )
