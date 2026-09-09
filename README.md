@@ -28,12 +28,13 @@ Each numbered notebook has one job, reads documented inputs or completed checkpo
 | 4 | `analysis/04_merge_and_reduce_dimensions.Rmd` | Merge libraries, perform RNA log-normalization/PCA and ATAC TF-IDF/LSI, and inspect modality-specific structure | Ready |
 | 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready; added offshoot workflow for IL17 |
 | 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | Ready |
-| 7 | composition/pseudobulk workflow | Descriptive composition summaries and preparation of pseudobulk-ready downstream matrices | Planned |
+| 7 | `analysis/07_analyze_within_cohort_diet_response.Rmd` | Describe composition and within-state RNA/ATAC effects without treating nuclei as biological replicates | Draft; run WT benchmark |
+| 7B | `analysis/07b_model_wt_epithelial_trajectories.Rmd` | Audit d21 lineage fidelity, require manual root approval, and fit exploratory WT RNA trajectories | Draft; gated review |
 
-The PPAR development run is complete through Step 6. Steps 00-06 use shared
-code, but clustering and annotation decisions are stored separately for every
-dataset/cohort combination. WT and IL17 therefore generate their own Step 6
-proposals and cannot inherit PPAR cluster-number labels.
+PPAR, WT, and IL17 are complete through Step 6. Steps 00-07 use shared code,
+but clustering and annotation decisions are stored separately for every
+dataset/cohort combination. The WT cohort is the first Step 7 diet-response
+benchmark; cluster numbers are never transferred between cohorts.
 
 ## The short answer to "Is Multiome QC separate or together?"
 
