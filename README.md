@@ -7,7 +7,7 @@ library and one pooled HFD library:
 
 | Cohort ID | Group | CON sample | HFD sample | Pool metadata |
 |---|---|---|---|---|
-| `ppar` | PPAR | `Ppar-CON-1` | `Ppar-HFD-1` | CON: 6 mice (2F/4M); HFD: 10 mice (2F/8M) |
+| `ppar` | PPAR | `Ppar-CON-1` | `Ppar-HFD-1` | CON: 6 mice (2F/4M); HFD: 8 mice (1F/7M) |
 | `wt` | WT | `VilB-CON-1` | `VilB-HFD-1` | CON: 7 mice (4F/3M); HFD: 6 mice (3F/3M) |
 | `il17` | IL17 | `IL17-CON-1` | `IL17-HFD-1` | CON: 4 mice (2F/2M); HFD: 4 mice (3F/1M) |
 
