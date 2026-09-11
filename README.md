@@ -7,7 +7,7 @@ library and one pooled HFD library:
 
 | Cohort ID | Group | CON sample | HFD sample | Pool metadata |
 |---|---|---|---|---|
-| `ppar` | PPAR | `Ppar-CON-1` | `Ppar-HFD-1` | CON: 6 mice (2F/4M); HFD: 8 mice (1F/7M) |
+| `ppar` | PPAR | `Ppar-CON-1` | `Ppar-HFD-1` | CON: 6 mice (2F/4M); HFD: 10 mice (2F/8M) |
 | `wt` | WT | `VilB-CON-1` | `VilB-HFD-1` | CON: 7 mice (4F/3M); HFD: 6 mice (3F/3M) |
 | `il17` | IL17 | `IL17-CON-1` | `IL17-HFD-1` | CON: 4 mice (2F/2M); HFD: 4 mice (3F/1M) |
 
@@ -28,13 +28,16 @@ Each numbered notebook has one job, reads documented inputs or completed checkpo
 | 4 | `analysis/04_merge_and_reduce_dimensions.Rmd` | Merge libraries, perform RNA log-normalization/PCA and ATAC TF-IDF/LSI, and inspect modality-specific structure | Ready |
 | 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready; added offshoot workflow for IL17 |
 | 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | Ready |
-| 7 | `analysis/07_analyze_within_cohort_diet_response.Rmd` | Describe composition and within-state RNA/ATAC effects without treating nuclei as biological replicates | Draft; run WT benchmark |
-| 7B | `analysis/07b_model_wt_epithelial_trajectories.Rmd` | Audit d21 lineage fidelity, require manual root approval, and fit exploratory WT RNA trajectories | Draft; gated review |
+| 7 | `analysis/07_analyze_within_cohort_diet_response.Rmd` | Describe composition and within-state RNA/ATAC effects without treating nuclei as biological replicates | WT benchmark complete |
+| 7B | `analysis/07b_model_wt_epithelial_trajectories.Rmd` | Audit d21 lineage fidelity, require manual root approval, and fit exploratory WT RNA trajectories | WT trajectory modeling complete |
+| 7C | `analysis/07c_prioritize_wt_diet_response_candidates.Rmd` | Integrate RNA and ATAC effect sizes, balanced-sampling stability, multimodal concordance, and trajectory context into reviewable WT candidate lists | WT candidate prioritization complete |
 
-PPAR, WT, and IL17 are complete through Step 6. Steps 00-07 use shared code,
-but clustering and annotation decisions are stored separately for every
-dataset/cohort combination. The WT cohort is the first Step 7 diet-response
-benchmark; cluster numbers are never transferred between cohorts.
+PPAR, WT, and IL17 are complete through Step 6. The WT cohort is complete
+through Step 7C and provides the first descriptive diet-response benchmark,
+approved epithelial trajectory models, and prioritized RNA/ATAC candidate
+lists. Steps 00-07 use shared code, but clustering and annotation decisions are
+stored separately for every dataset/cohort combination. Steps 7B and 7C are
+currently WT-specific. Cluster numbers are never transferred between cohorts.
 
 ## The short answer to "Is Multiome QC separate or together?"
 
@@ -134,9 +137,14 @@ Current major checkpoint directories include:
 03_objects
 04_reduction
 05_wnn
+06_annotation
+07_diet_response
+07b_trajectories
+07c_candidate_prioritization
 ```
 
-Future annotation and downstream results will be written under `06_annotation` and `07_*` directories.
+Annotation and downstream results are written under `06_annotation` and
+`07_*` directories.
 
 See `docs/WORKFLOW_AND_CHECKPOINTS.md` for the exact input/output contract for each step.
 
