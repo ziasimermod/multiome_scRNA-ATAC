@@ -69,9 +69,11 @@ bioconductor_packages <- c(
   "ensembldb",
   "GenomeInfoDb",
   "GenomicRanges",
+  "S4Vectors",
   "SingleCellExperiment",
   "SummarizedExperiment",
   "scDblFinder",
+  "slingshot",
   "biovizBase"
 )
 

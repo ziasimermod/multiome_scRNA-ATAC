@@ -12,7 +12,9 @@ flowchart TD
     F --> G["Step 4: RNA PCA + ATAC LSI"]
     G --> H["Step 5: WNN + clustering review"]
     H --> I["Step 6: mouse-colon cell-state annotation"]
-    I --> J["Step 7: composition + pseudobulk preparation"]
+    I --> J["Step 7: composition + RNA/ATAC effects"]
+    J --> K{"Trajectory root review"}
+    K --> L["Step 7B: exploratory WT trajectories"]
 ```
 
 ## Checkpoint rules
@@ -605,32 +607,51 @@ Is each final cell-state label supported by:
 
 ---
 
-## Step 7 - Composition and pseudobulk preparation
+## Step 7 - Within-cohort diet-response characterization
 
 ### Status
 
-Planned.
+Draft notebook available; WT is the first benchmark cohort.
 
 ### Inputs
 
 - finalized Step 6 annotated Multiome object
+- approved annotation units and global WNN clusters
 
-### Planned outputs
+### Analysis contract
 
-Outputs will be separated into:
+Step 7 keeps composition, RNA, and ATAC questions distinct. It reports effect
+sizes between pooled libraries without treating individual nuclei as
+biological replicates. Eligibility is assigned before examining diet effects:
+
+- Tier A requires at least 200 nuclei from each diet;
+- Tier B requires at least 100 nuclei from each diet;
+- Tier C is reserved for composition and exploratory review;
+- low-confidence populations are excluded from primary molecular contrasts;
+- non-epithelial populations are analyzed separately from the epithelial
+  benchmark.
+
+Global composition, curated-epithelial composition, and within-lineage
+composition are all exported so that denominator changes are visible.
+
+### Outputs
+
+Outputs are written under:
 
 ```text
-07_composition/
-07_pseudobulk/
+07_diet_response/
 ```
 
-Potential outputs include:
+Outputs include:
 
-- descriptive cell-state composition tables;
-- per-library cell-state summaries;
-- pseudobulk-ready RNA matrices;
-- pseudobulk-ready ATAC matrices;
-- downstream metadata required for future replicated analyses.
+- analysis-unit eligibility and QC tables;
+- descriptive composition using multiple denominators;
+- candidate regional-axis audits within matched cell states;
+- pooled-library RNA and ATAC effect sizes;
+- balanced cell-downsampling stability summaries;
+- top accessibility candidates with nearest-gene context;
+- RNA/ATAC directional-concordance candidates; and
+- a Step 7 completion marker.
 
 ### Statistical limitation
 
@@ -651,6 +672,63 @@ Therefore, this workflow will not treat nuclei as independent replicates for for
 The current libraries can support descriptive and hypothesis-generating comparisons.
 
 Formal treatment inference requires additional independently measured biological replicates.
+
+---
+
+## Step 7B - WT epithelial trajectory audit and modeling
+
+### Status
+
+Draft notebook available; execution is paused at a manual root/topology gate.
+
+### Inputs
+
+- finalized WT Step 6 annotated object;
+- completed WT Step 7 diet-response benchmark;
+- reviewed WT trajectory decision table, if modeling is approved.
+
+### Review-first design
+
+The d21 epithelium may contain mixed or transcriptionally unstable states.
+Step 7B therefore audits stem, crypt, cycling, absorptive, and secretory
+programs before assigning developmental direction. It also visualizes the
+focused RNA topology by annotation unit, library, and cell-cycle phase.
+
+The notebook writes an unapproved proposal to:
+
+```text
+07b_trajectories/trajectory_decision_proposed.csv
+```
+
+After review, an approved decision belongs at:
+
+```text
+config/datasets/v2_resequenced/cohorts/wt/trajectory_decision.csv
+```
+
+Without that approved file, the modeling section stops intentionally.
+
+### Outputs
+
+Outputs are written under:
+
+```text
+07b_trajectories/
+```
+
+Outputs include:
+
+- candidate-state representation by library;
+- lineage-program co-detection and cell-cycle audits;
+- root-marker and focused RNA-topology plots;
+- approved Slingshot models;
+- inferred lineage paths and terminal-unit definitions;
+- barcode-level pseudotime and curve weights;
+- descriptive pseudotime summaries by state and diet; and
+- binned gene-expression trends along approved lineages.
+
+Pseudotime and trend differences remain descriptive because each diet has one
+pooled library.
 
 ---
 

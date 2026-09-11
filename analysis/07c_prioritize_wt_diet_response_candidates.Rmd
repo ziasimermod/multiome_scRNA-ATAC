@@ -1,0 +1,1261 @@
+---
+title: "Step 7C - Prioritize WT diet-associated RNA and ATAC candidates"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 7 produced descriptive HFD-versus-CON RNA and ATAC effect sizes within
+reviewed WT annotation units. Step 7B added exploratory epithelial RNA
+trajectories. Step 7C integrates those outputs into transparent review lists
+for experimental follow-up and later state-matched comparison with PPAR and
+IL17.
+
+The notebook creates four distinct products:
+
+1. RNA candidates ranked by effect size, detection change, and balanced
+   cell-sampling stability;
+2. ATAC candidates ranked by effect size, stability, and nearest-gene context;
+3. directionally concordant RNA/ATAC candidate pairs; and
+4. trajectory-aware RNA candidates whose annotation unit lies on an approved
+   epithelial lineage.
+
+These tables are intentionally called *candidate* tables rather than formal
+DEG or DAR tables. There is one pooled CON library and one pooled HFD library,
+so diet and library are perfectly confounded. Balanced downsampling measures
+cell-sampling stability; it does not create biological replication.
+
+# 1. Setup
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+  library(patchwork)
+})
+
+ggplot2::theme_set(theme_multiome())
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 7C currently defines the WT d21 benchmark. Set ",
+    "MULTIOME_DATASET_VERSION=v2_resequenced and MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+```
+
+# 2. Define inputs, outputs, and support rules
+
+The support labels below are review aids, not statistical significance tiers.
+An interval that excludes zero is the interquartile range across repeated
+balanced cell samples, not a biological confidence interval.
+
+```{r define-inputs-and-parameters}
+STEP7_DIR <- file.path(OUTPUT_DIR, "07_diet_response")
+STEP7_TABLE_DIR <- file.path(STEP7_DIR, "tables")
+STEP7B_DIR <- file.path(OUTPUT_DIR, "07b_trajectories")
+STEP7B_TABLE_DIR <- file.path(STEP7B_DIR, "tables")
+
+STEP7C_DIR <- file.path(OUTPUT_DIR, "07c_candidate_prioritization")
+STEP7C_TABLE_DIR <- file.path(STEP7C_DIR, "tables")
+STEP7C_PLOT_DIR <- file.path(STEP7C_DIR, "plots")
+
+dir.create(STEP7C_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP7C_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP7C_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+STEP7_COMPLETE_MARKER <- file.path(STEP7_DIR, "STEP_07_COMPLETE.txt")
+STEP7B_COMPLETE_MARKER <- file.path(STEP7B_DIR, "STEP_07B_COMPLETE.txt")
+STEP7C_COMPLETE_MARKER <- file.path(STEP7C_DIR, "STEP_07C_COMPLETE.txt")
+
+input_paths <- c(
+  eligibility = file.path(
+    STEP7_TABLE_DIR,
+    "analysis_population_eligibility.csv"
+  ),
+  RNA_candidates = file.path(
+    STEP7_TABLE_DIR,
+    "RNA_top_diet_associated_candidates.csv"
+  ),
+  RNA_stability = file.path(
+    STEP7_TABLE_DIR,
+    "RNA_balanced_downsampling_stability.csv"
+  ),
+  ATAC_candidates = file.path(
+    STEP7_TABLE_DIR,
+    "ATAC_top_candidates_with_nearest_gene.csv"
+  ),
+  ATAC_stability = file.path(
+    STEP7_TABLE_DIR,
+    "ATAC_balanced_downsampling_stability.csv"
+  ),
+  RNA_ATAC_concordance = file.path(
+    STEP7_TABLE_DIR,
+    "RNA_ATAC_nearest_gene_concordance.csv"
+  ),
+  lineage_definitions = file.path(
+    STEP7B_TABLE_DIR,
+    "trajectory_lineage_definitions.csv"
+  ),
+  pseudotime_summary = file.path(
+    STEP7B_TABLE_DIR,
+    "pseudotime_summary_by_unit_and_diet.csv"
+  ),
+  trajectory_gene_trends = file.path(
+    STEP7B_TABLE_DIR,
+    "descriptive_gene_trends_by_pseudotime_and_diet.csv.gz"
+  )
+)
+
+assert_file(STEP7_COMPLETE_MARKER, "Step 7 completion marker")
+assert_file(STEP7B_COMPLETE_MARKER, "Step 7B completion marker")
+
+for (input_label in names(input_paths)) {
+  assert_file(input_paths[[input_label]], input_label)
+}
+
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+
+MINIMUM_SIGN_CONCORDANCE_PERCENT <- 80
+NEAR_GENE_DISTANCE_BP <- 10000
+MINIMUM_PAIRED_PSEUDOTIME_BINS <- 5L
+TOP_RNA_CANDIDATES_PER_UNIT_AND_DIRECTION <- 25L
+TOP_ATAC_CANDIDATES_PER_UNIT_AND_DIRECTION <- 50L
+TOP_MULTIMODAL_PAIRS_PER_UNIT_AND_DIRECTION <- 25L
+TOP_TRAJECTORY_CANDIDATES_PER_LINEAGE <- 30L
+
+prioritization_parameters <- data.frame(
+  parameter = c(
+    "reference diet",
+    "comparison diet",
+    "minimum balanced-sampling sign concordance percent",
+    "near-gene distance threshold in bp",
+    "minimum paired pseudotime bins",
+    "top RNA candidates per unit and direction",
+    "top ATAC candidates per unit and direction",
+    "top multimodal pairs per unit and direction",
+    "top trajectory candidates per lineage"
+  ),
+  value = c(
+    REFERENCE_DIET,
+    COMPARISON_DIET,
+    MINIMUM_SIGN_CONCORDANCE_PERCENT,
+    NEAR_GENE_DISTANCE_BP,
+    MINIMUM_PAIRED_PSEUDOTIME_BINS,
+    TOP_RNA_CANDIDATES_PER_UNIT_AND_DIRECTION,
+    TOP_ATAC_CANDIDATES_PER_UNIT_AND_DIRECTION,
+    TOP_MULTIMODAL_PAIRS_PER_UNIT_AND_DIRECTION,
+    TOP_TRAJECTORY_CANDIDATES_PER_LINEAGE
+  ),
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  prioritization_parameters,
+  file.path(STEP7C_DIR, "candidate_prioritization_parameters.csv")
+)
+```
+
+# 3. Read and validate upstream tables
+
+```{r read-and-validate-upstream-tables}
+read_table_quietly <- function(path) {
+  suppressMessages(
+    readr::read_csv(
+      path,
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+  )
+}
+
+assert_columns <- function(data, required_columns, table_label) {
+  missing_columns <- setdiff(required_columns, colnames(data))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      table_label,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+eligibility <- read_table_quietly(input_paths[["eligibility"]])
+rna_candidates <- read_table_quietly(input_paths[["RNA_candidates"]])
+rna_stability <- read_table_quietly(input_paths[["RNA_stability"]])
+atac_candidates <- read_table_quietly(input_paths[["ATAC_candidates"]])
+atac_stability <- read_table_quietly(input_paths[["ATAC_stability"]])
+rna_atac_concordance <- read_table_quietly(
+  input_paths[["RNA_ATAC_concordance"]]
+)
+lineage_definitions <- read_table_quietly(
+  input_paths[["lineage_definitions"]]
+)
+pseudotime_summary <- read_table_quietly(
+  input_paths[["pseudotime_summary"]]
+)
+trajectory_gene_trends <- read_table_quietly(
+  input_paths[["trajectory_gene_trends"]]
+)
+
+eligibility$analysis_unit <- as.character(eligibility$analysis_unit)
+rna_candidates$analysis_unit <- as.character(rna_candidates$analysis_unit)
+rna_stability$analysis_unit <- as.character(rna_stability$analysis_unit)
+atac_candidates$analysis_unit <- as.character(atac_candidates$analysis_unit)
+atac_stability$analysis_unit <- as.character(atac_stability$analysis_unit)
+rna_atac_concordance$analysis_unit <- as.character(
+  rna_atac_concordance$analysis_unit
+)
+lineage_definitions$terminal_unit <- as.character(
+  lineage_definitions$terminal_unit
+)
+pseudotime_summary$analysis_unit <- as.character(
+  pseudotime_summary$analysis_unit
+)
+pseudotime_summary$terminal_unit <- as.character(
+  pseudotime_summary$terminal_unit
+)
+trajectory_gene_trends$terminal_unit <- as.character(
+  trajectory_gene_trends$terminal_unit
+)
+
+assert_columns(
+  eligibility,
+  c(
+    "analysis_unit", "broad_compartment", "analysis_lineage",
+    "cell_state", "cell_state_full", "annotation_confidence",
+    "nuclei_CON", "nuclei_HFD", "eligibility_tier",
+    "primary_RNA_ATAC"
+  ),
+  "analysis population eligibility"
+)
+
+effect_columns <- c(
+  "analysis_unit", "feature", "reference_diet", "comparison_diet",
+  "reference_nuclei", "comparison_nuclei", "total_counts",
+  "reference_CPM", "comparison_CPM",
+  "log2FC_comparison_vs_reference",
+  "reference_percent_detected", "comparison_percent_detected",
+  "detection_difference_percentage_points", "cell_state",
+  "cell_state_full", "eligibility_tier", "direction"
+)
+
+assert_columns(rna_candidates, effect_columns, "RNA candidate table")
+assert_columns(
+  atac_candidates,
+  c(effect_columns, "gene_name", "distance"),
+  "ATAC candidate table"
+)
+
+stability_columns <- c(
+  "analysis_unit", "feature", "sampled_nuclei_per_diet",
+  "full_log2FC", "downsampled_log2FC_median",
+  "downsampled_log2FC_q25", "downsampled_log2FC_q75",
+  "sign_concordance_percent"
+)
+
+assert_columns(rna_stability, stability_columns, "RNA stability table")
+assert_columns(atac_stability, stability_columns, "ATAC stability table")
+
+assert_columns(
+  lineage_definitions,
+  c(
+    "trajectory_id", "lineage_index", "lineage_id",
+    "cluster_path", "terminal_unit"
+  ),
+  "trajectory lineage definitions"
+)
+
+assert_columns(
+  pseudotime_summary,
+  c(
+    "trajectory_id", "lineage_id", "terminal_unit", "analysis_unit",
+    "cell_state", "diet", "nuclei", "median_pseudotime",
+    "pseudotime_q25", "pseudotime_q75"
+  ),
+  "pseudotime summary"
+)
+
+assert_columns(
+  trajectory_gene_trends,
+  c(
+    "trajectory_id", "lineage_id", "terminal_unit", "diet",
+    "pseudotime_bin", "nuclei", "median_pseudotime", "gene",
+    "mean_log_normalized_expression"
+  ),
+  "trajectory gene-trend table"
+)
+
+if (
+  any(rna_candidates$reference_diet != REFERENCE_DIET) ||
+    any(rna_candidates$comparison_diet != COMPARISON_DIET) ||
+    any(atac_candidates$reference_diet != REFERENCE_DIET) ||
+    any(atac_candidates$comparison_diet != COMPARISON_DIET)
+) {
+  stop("Upstream candidate tables do not encode CON as reference and HFD as comparison.")
+}
+
+input_inventory <- data.frame(
+  input = names(input_paths),
+  path = unname(input_paths),
+  rows = c(
+    nrow(eligibility),
+    nrow(rna_candidates),
+    nrow(rna_stability),
+    nrow(atac_candidates),
+    nrow(atac_stability),
+    nrow(rna_atac_concordance),
+    nrow(lineage_definitions),
+    nrow(pseudotime_summary),
+    nrow(trajectory_gene_trends)
+  ),
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  input_inventory,
+  file.path(STEP7C_DIR, "candidate_prioritization_input_inventory.csv")
+)
+```
+
+# 4. Create the WT state reference key
+
+This key is the starting scaffold for later cross-genotype matching. It does
+not claim that a PPAR or IL17 state matches a WT state merely because their
+short labels are similar. Matching must later incorporate de novo markers,
+full labels, broad lineage, and multimodal neighborhood evidence.
+
+```{r create-wt-state-reference-key}
+wt_state_reference_key <- eligibility |>
+  dplyr::mutate(
+    state_matching_priority = dplyr::case_when(
+      annotation_confidence == "high" &
+        eligibility_tier %in% c("Tier_A", "Tier_B") ~
+        "preferred WT reference state",
+      annotation_confidence == "moderate" &
+        eligibility_tier %in% c("Tier_A", "Tier_B") ~
+        "usable WT reference with marker revalidation",
+      eligibility_tier == "Tier_C" ~
+        "exploratory low-nucleus reference",
+      eligibility_tier == "secondary_compartment" ~
+        "match only within the same non-epithelial compartment",
+      TRUE ~
+        "exclude from primary state matching"
+    )
+  ) |>
+  dplyr::arrange(
+    broad_compartment,
+    analysis_lineage,
+    as.integer(analysis_unit)
+  )
+
+readr::write_csv(
+  wt_state_reference_key,
+  file.path(STEP7C_TABLE_DIR, "WT_state_reference_key.csv")
+)
+
+wt_state_reference_key |>
+  dplyr::count(
+    broad_compartment,
+    state_matching_priority,
+    name = "annotation_units"
+  )
+```
+
+# 5. Prioritize RNA candidates
+
+```{r prioritize-rna-candidates}
+prepare_stability <- function(stability_table, prefix) {
+  stability_table |>
+    dplyr::mutate(
+      direction_stable =
+        sign(full_log2FC) == sign(downsampled_log2FC_median) &
+        sign_concordance_percent >= MINIMUM_SIGN_CONCORDANCE_PERCENT,
+      downsampling_iqr_excludes_zero = dplyr::case_when(
+        full_log2FC > 0 ~ downsampled_log2FC_q25 > 0,
+        full_log2FC < 0 ~ downsampled_log2FC_q75 < 0,
+        TRUE ~ FALSE
+      )
+    ) |>
+    dplyr::rename_with(
+      ~ paste0(prefix, .x),
+      -dplyr::all_of(c("analysis_unit", "feature"))
+    )
+}
+
+rna_stability_prepared <- prepare_stability(rna_stability, "RNA_")
+
+rna_prioritized <- rna_candidates |>
+  dplyr::left_join(
+    rna_stability_prepared,
+    by = c("analysis_unit", "feature")
+  ) |>
+  dplyr::mutate(
+    RNA_stability_available = !is.na(RNA_sign_concordance_percent),
+    RNA_support_class = dplyr::case_when(
+      RNA_direction_stable & RNA_downsampling_iqr_excludes_zero ~
+        "Tier 1: stable direction and IQR excludes zero",
+      RNA_direction_stable ~
+        "Tier 2: stable direction",
+      RNA_stability_available ~
+        "Tier 3: unstable across balanced cell samples",
+      TRUE ~
+        "Tier 4: stability not evaluated"
+    ),
+    absolute_log2FC = abs(log2FC_comparison_vs_reference),
+    absolute_detection_difference = abs(
+      detection_difference_percentage_points
+    ),
+    support_order = dplyr::case_when(
+      grepl("^Tier 1", RNA_support_class) ~ 1L,
+      grepl("^Tier 2", RNA_support_class) ~ 2L,
+      grepl("^Tier 3", RNA_support_class) ~ 3L,
+      TRUE ~ 4L
+    )
+  ) |>
+  dplyr::group_by(analysis_unit, direction) |>
+  dplyr::arrange(
+    support_order,
+    dplyr::desc(absolute_log2FC),
+    dplyr::desc(absolute_detection_difference),
+    dplyr::desc(total_counts),
+    .by_group = TRUE
+  ) |>
+  dplyr::mutate(within_unit_direction_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+rna_review_shortlist <- rna_prioritized |>
+  dplyr::filter(
+    within_unit_direction_rank <=
+      TOP_RNA_CANDIDATES_PER_UNIT_AND_DIRECTION
+  )
+
+readr::write_csv(
+  rna_prioritized,
+  file.path(STEP7C_TABLE_DIR, "RNA_prioritized_diet_candidates.csv")
+)
+
+readr::write_csv(
+  rna_review_shortlist,
+  file.path(STEP7C_TABLE_DIR, "RNA_review_shortlist.csv")
+)
+```
+
+# 6. Prioritize ATAC candidates
+
+Nearest-gene assignments are retained as genomic context. Distance zero means
+the peak overlaps a gene annotation; it does not establish the target gene or
+whether accessibility is activating, repressive, or unrelated to that gene.
+
+```{r prioritize-atac-candidates}
+atac_stability_prepared <- prepare_stability(atac_stability, "ATAC_")
+
+atac_prioritized <- atac_candidates |>
+  dplyr::left_join(
+    atac_stability_prepared,
+    by = c("analysis_unit", "feature")
+  ) |>
+  dplyr::mutate(
+    ATAC_stability_available = !is.na(ATAC_sign_concordance_percent),
+    ATAC_support_class = dplyr::case_when(
+      ATAC_direction_stable & ATAC_downsampling_iqr_excludes_zero ~
+        "Tier 1: stable direction and IQR excludes zero",
+      ATAC_direction_stable ~
+        "Tier 2: stable direction",
+      ATAC_stability_available ~
+        "Tier 3: unstable across balanced cell samples",
+      TRUE ~
+        "Tier 4: stability not evaluated"
+    ),
+    nearest_gene_context = dplyr::case_when(
+      is.na(gene_name) | !nzchar(gene_name) ~ "nearest gene unavailable",
+      is.na(distance) ~ "distance unavailable",
+      distance == 0 ~ "overlaps gene annotation",
+      distance <= NEAR_GENE_DISTANCE_BP ~ "within 10 kb of nearest gene",
+      TRUE ~ "more than 10 kb from nearest gene"
+    ),
+    absolute_log2FC = abs(log2FC_comparison_vs_reference),
+    absolute_detection_difference = abs(
+      detection_difference_percentage_points
+    ),
+    support_order = dplyr::case_when(
+      grepl("^Tier 1", ATAC_support_class) ~ 1L,
+      grepl("^Tier 2", ATAC_support_class) ~ 2L,
+      grepl("^Tier 3", ATAC_support_class) ~ 3L,
+      TRUE ~ 4L
+    )
+  ) |>
+  dplyr::group_by(analysis_unit, direction) |>
+  dplyr::arrange(
+    support_order,
+    dplyr::desc(absolute_log2FC),
+    dplyr::desc(absolute_detection_difference),
+    dplyr::desc(total_counts),
+    .by_group = TRUE
+  ) |>
+  dplyr::mutate(within_unit_direction_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+atac_review_shortlist <- atac_prioritized |>
+  dplyr::filter(
+    within_unit_direction_rank <=
+      TOP_ATAC_CANDIDATES_PER_UNIT_AND_DIRECTION
+  )
+
+readr::write_csv(
+  atac_prioritized,
+  file.path(STEP7C_TABLE_DIR, "ATAC_prioritized_diet_candidates.csv")
+)
+
+readr::write_csv(
+  atac_review_shortlist,
+  file.path(STEP7C_TABLE_DIR, "ATAC_review_shortlist.csv")
+)
+```
+
+# 7. Prioritize directionally concordant RNA/ATAC pairs
+
+The concordance table asks whether an RNA effect and the accessibility effect
+of a peak assigned to that gene have the same sign. A concordant sign is
+supportive context, not proof of a peak-to-gene regulatory link.
+
+```{r prioritize-rna-atac-pairs}
+assert_columns(
+  rna_atac_concordance,
+  c(
+    "analysis_unit", "peak", "nearest_gene", "distance",
+    "ATAC_log2FC", "RNA_log2FC", "RNA_ATAC_direction",
+    "joint_effect_magnitude", "cell_state", "cell_state_full"
+  ),
+  "RNA/ATAC concordance table"
+)
+
+rna_top_key <- rna_candidates |>
+  dplyr::transmute(
+    analysis_unit,
+    nearest_gene = feature,
+    RNA_top_candidate = TRUE
+  ) |>
+  dplyr::distinct()
+
+rna_stability_for_pairs <- rna_stability_prepared |>
+  dplyr::rename(nearest_gene = feature)
+
+atac_stability_for_pairs <- atac_stability_prepared |>
+  dplyr::rename(peak = feature)
+
+multimodal_candidates <- rna_atac_concordance |>
+  dplyr::filter(
+    RNA_ATAC_direction == "concordant",
+    !is.na(RNA_log2FC),
+    is.finite(RNA_log2FC),
+    is.finite(ATAC_log2FC)
+  ) |>
+  dplyr::left_join(
+    rna_top_key,
+    by = c("analysis_unit", "nearest_gene")
+  ) |>
+  dplyr::left_join(
+    rna_stability_for_pairs,
+    by = c("analysis_unit", "nearest_gene")
+  ) |>
+  dplyr::left_join(
+    atac_stability_for_pairs,
+    by = c("analysis_unit", "peak")
+  ) |>
+  dplyr::mutate(
+    RNA_top_candidate = dplyr::coalesce(RNA_top_candidate, FALSE),
+    RNA_direction_stable = dplyr::coalesce(
+      RNA_direction_stable,
+      FALSE
+    ),
+    ATAC_direction_stable = dplyr::coalesce(
+      ATAC_direction_stable,
+      FALSE
+    ),
+    RNA_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      RNA_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    ATAC_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      ATAC_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    both_modalities_direction_stable =
+      RNA_direction_stable & ATAC_direction_stable,
+    both_downsampling_iqrs_exclude_zero =
+      RNA_downsampling_iqr_excludes_zero &
+      ATAC_downsampling_iqr_excludes_zero,
+    nearest_gene_context = dplyr::case_when(
+      is.na(distance) ~ "distance unavailable",
+      distance == 0 ~ "overlaps gene annotation",
+      distance <= NEAR_GENE_DISTANCE_BP ~ "within 10 kb of nearest gene",
+      TRUE ~ "more than 10 kb from nearest gene"
+    ),
+    multimodal_support_class = dplyr::case_when(
+      RNA_top_candidate &
+        both_modalities_direction_stable &
+        both_downsampling_iqrs_exclude_zero ~
+        "Tier 1: RNA candidate plus stable RNA and ATAC",
+      both_modalities_direction_stable ~
+        "Tier 2: concordant and direction-stable in both modalities",
+      RNA_direction_stable | ATAC_direction_stable ~
+        "Tier 3: concordant with one stable modality",
+      TRUE ~
+        "Tier 4: directional concordance only"
+    ),
+    effect_direction = dplyr::if_else(
+      RNA_log2FC > 0,
+      "HFD_higher",
+      "CON_higher"
+    ),
+    support_order = dplyr::case_when(
+      grepl("^Tier 1", multimodal_support_class) ~ 1L,
+      grepl("^Tier 2", multimodal_support_class) ~ 2L,
+      grepl("^Tier 3", multimodal_support_class) ~ 3L,
+      TRUE ~ 4L
+    )
+  ) |>
+  dplyr::group_by(analysis_unit, effect_direction) |>
+  dplyr::arrange(
+    support_order,
+    dplyr::desc(joint_effect_magnitude),
+    .by_group = TRUE
+  ) |>
+  dplyr::mutate(within_unit_direction_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+multimodal_review_shortlist <- multimodal_candidates |>
+  dplyr::filter(
+    within_unit_direction_rank <=
+      TOP_MULTIMODAL_PAIRS_PER_UNIT_AND_DIRECTION
+  )
+
+readr::write_csv(
+  multimodal_candidates,
+  file.path(
+    STEP7C_TABLE_DIR,
+    "RNA_ATAC_concordant_prioritized_candidates.csv"
+  )
+)
+
+readr::write_csv(
+  multimodal_review_shortlist,
+  file.path(STEP7C_TABLE_DIR, "RNA_ATAC_concordant_review_shortlist.csv")
+)
+```
+
+# 8. Add trajectory context to RNA candidates
+
+The trajectory layer answers whether the state containing an RNA candidate is
+on an approved lineage and whether that gene has a reproducible descriptive
+shape across relative pseudotime bins. It does not turn a pooled-library RNA
+effect into evidence of developmental regulation.
+
+```{r create-trajectory-context}
+split_units <- function(unit_string) {
+  units <- trimws(
+    unlist(strsplit(as.character(unit_string), ";", fixed = TRUE))
+  )
+  units[nzchar(units)]
+}
+
+lineage_unit_membership <- dplyr::bind_rows(
+  lapply(
+    seq_len(nrow(lineage_definitions)),
+    function(lineage_row) {
+      unit_path <- split_units(
+        lineage_definitions$cluster_path[[lineage_row]]
+      )
+
+      data.frame(
+        trajectory_id = lineage_definitions$trajectory_id[[lineage_row]],
+        lineage_id = lineage_definitions$lineage_id[[lineage_row]],
+        terminal_unit = as.character(
+          lineage_definitions$terminal_unit[[lineage_row]]
+        ),
+        analysis_unit = unit_path,
+        path_position = seq_along(unit_path),
+        trajectory_role = dplyr::case_when(
+          seq_along(unit_path) == 1L ~ "root",
+          seq_along(unit_path) == length(unit_path) ~ "terminal",
+          TRUE ~ "intermediate"
+        ),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+) |>
+  dplyr::left_join(
+    eligibility |>
+      dplyr::select(
+        analysis_unit,
+        analysis_lineage,
+        cell_state,
+        cell_state_full,
+        annotation_confidence
+      ),
+    by = "analysis_unit"
+  ) |>
+  dplyr::mutate(
+    annotated_unit = paste0(analysis_unit, ": ", cell_state),
+    model_role = dplyr::if_else(
+      grepl("sensitivity", trajectory_id, ignore.case = TRUE),
+      "root sensitivity model",
+      "primary descriptive model"
+    )
+  )
+
+readr::write_csv(
+  lineage_unit_membership,
+  file.path(STEP7C_TABLE_DIR, "trajectory_unit_membership.csv")
+)
+
+safe_spearman <- function(x, y) {
+  complete_rows <- is.finite(x) & is.finite(y)
+
+  if (
+    sum(complete_rows) < 3L ||
+      length(unique(x[complete_rows])) < 2L ||
+      length(unique(y[complete_rows])) < 2L
+  ) {
+    return(NA_real_)
+  }
+
+  suppressWarnings(
+    stats::cor(
+      x[complete_rows],
+      y[complete_rows],
+      method = "spearman"
+    )
+  )
+}
+
+trajectory_shape_by_diet <- trajectory_gene_trends |>
+  dplyr::group_by(
+    trajectory_id,
+    lineage_id,
+    terminal_unit,
+    diet,
+    gene
+  ) |>
+  dplyr::summarise(
+    pseudotime_bins = dplyr::n_distinct(pseudotime_bin),
+    mean_expression_across_bins = mean(
+      mean_log_normalized_expression,
+      na.rm = TRUE
+    ),
+    pseudotime_spearman_rho = safe_spearman(
+      median_pseudotime,
+      mean_log_normalized_expression
+    ),
+    .groups = "drop"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = c(
+      pseudotime_bins,
+      mean_expression_across_bins,
+      pseudotime_spearman_rho
+    ),
+    names_glue = "{.value}_{diet}"
+  )
+
+trajectory_bin_pairs <- trajectory_gene_trends |>
+  dplyr::select(
+    trajectory_id,
+    lineage_id,
+    terminal_unit,
+    gene,
+    pseudotime_bin,
+    diet,
+    mean_log_normalized_expression
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = mean_log_normalized_expression,
+    names_prefix = "mean_expression_"
+  )
+
+trajectory_diet_profile_summary <- trajectory_bin_pairs |>
+  dplyr::group_by(
+    trajectory_id,
+    lineage_id,
+    terminal_unit,
+    gene
+  ) |>
+  dplyr::summarise(
+    paired_pseudotime_bins = sum(
+      is.finite(mean_expression_CON) &
+        is.finite(mean_expression_HFD)
+    ),
+    mean_HFD_minus_CON_across_relative_bins = {
+      paired_rows <- is.finite(mean_expression_CON) &
+        is.finite(mean_expression_HFD)
+
+      if (any(paired_rows)) {
+        mean(
+          mean_expression_HFD[paired_rows] -
+            mean_expression_CON[paired_rows]
+        )
+      } else {
+        NA_real_
+      }
+    },
+    diet_profile_spearman_rho = safe_spearman(
+      mean_expression_CON,
+      mean_expression_HFD
+    ),
+    .groups = "drop"
+  )
+
+trajectory_gene_context <- trajectory_shape_by_diet |>
+  dplyr::left_join(
+    trajectory_diet_profile_summary,
+    by = c(
+      "trajectory_id", "lineage_id", "terminal_unit", "gene"
+    )
+  )
+
+trajectory_rna_candidates <- rna_prioritized |>
+  dplyr::rename(gene = feature) |>
+  dplyr::inner_join(
+    lineage_unit_membership |>
+      dplyr::select(
+        trajectory_id,
+        lineage_id,
+        terminal_unit,
+        analysis_unit,
+        path_position,
+        trajectory_role,
+        annotation_confidence,
+        annotated_unit,
+        model_role
+      ),
+    by = "analysis_unit"
+  ) |>
+  dplyr::left_join(
+    trajectory_gene_context,
+    by = c(
+      "trajectory_id", "lineage_id", "terminal_unit", "gene"
+    )
+  ) |>
+  dplyr::mutate(
+    sufficient_trajectory_bins =
+      dplyr::coalesce(pseudotime_bins_CON, 0L) >=
+        MINIMUM_PAIRED_PSEUDOTIME_BINS &
+      dplyr::coalesce(pseudotime_bins_HFD, 0L) >=
+        MINIMUM_PAIRED_PSEUDOTIME_BINS &
+      dplyr::coalesce(paired_pseudotime_bins, 0L) >=
+        MINIMUM_PAIRED_PSEUDOTIME_BINS,
+    state_effect_agrees_with_mean_lineage_profile = dplyr::case_when(
+      is.na(mean_HFD_minus_CON_across_relative_bins) ~ NA,
+      mean_HFD_minus_CON_across_relative_bins == 0 ~ NA,
+      TRUE ~ sign(log2FC_comparison_vs_reference) ==
+        sign(mean_HFD_minus_CON_across_relative_bins)
+    ),
+    trajectory_context_class = dplyr::case_when(
+      RNA_direction_stable &
+        RNA_downsampling_iqr_excludes_zero &
+        sufficient_trajectory_bins ~
+        "Tier 1: stable state effect with trajectory profile available",
+      RNA_direction_stable & sufficient_trajectory_bins ~
+        "Tier 2: stable state effect with trajectory profile available",
+      sufficient_trajectory_bins ~
+        "Tier 3: trajectory profile available; state effect less stable",
+      TRUE ~
+        "Tier 4: limited trajectory-bin context"
+    ),
+    trajectory_context_order = dplyr::case_when(
+      grepl("^Tier 1", trajectory_context_class) ~ 1L,
+      grepl("^Tier 2", trajectory_context_class) ~ 2L,
+      grepl("^Tier 3", trajectory_context_class) ~ 3L,
+      TRUE ~ 4L
+    )
+  ) |>
+  dplyr::group_by(trajectory_id, lineage_id) |>
+  dplyr::arrange(
+    trajectory_context_order,
+    support_order,
+    dplyr::desc(absolute_log2FC),
+    .by_group = TRUE
+  ) |>
+  dplyr::mutate(within_lineage_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+trajectory_rna_shortlist <- trajectory_rna_candidates |>
+  dplyr::filter(
+    within_lineage_rank <= TOP_TRAJECTORY_CANDIDATES_PER_LINEAGE
+  )
+
+readr::write_csv(
+  trajectory_gene_context,
+  file.path(STEP7C_TABLE_DIR, "trajectory_gene_profile_context.csv")
+)
+
+readr::write_csv(
+  trajectory_rna_candidates,
+  file.path(STEP7C_TABLE_DIR, "trajectory_aware_RNA_candidates.csv")
+)
+
+readr::write_csv(
+  trajectory_rna_shortlist,
+  file.path(STEP7C_TABLE_DIR, "trajectory_aware_RNA_shortlist.csv")
+)
+```
+
+## Absorptive root-sensitivity summary
+
+```{r summarize-absorptive-root-sensitivity}
+absorptive_root_sensitivity <- pseudotime_summary |>
+  dplyr::filter(
+    trajectory_id %in% c(
+      "crypt_to_absorptive",
+      "crypt_to_absorptive_root0_sensitivity"
+    )
+  ) |>
+  dplyr::group_by(
+    trajectory_id,
+    lineage_id,
+    analysis_unit,
+    cell_state
+  ) |>
+  dplyr::summarise(
+    nuclei_across_diet_rows = sum(nuclei),
+    median_of_diet_medians = stats::median(median_pseudotime),
+    .groups = "drop"
+  ) |>
+  dplyr::group_by(trajectory_id, lineage_id) |>
+  dplyr::arrange(median_of_diet_medians, .by_group = TRUE) |>
+  dplyr::mutate(pseudotime_order = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  absorptive_root_sensitivity,
+  file.path(STEP7C_TABLE_DIR, "absorptive_root_sensitivity_ordering.csv")
+)
+```
+
+# 9. Visual review
+
+```{r plot-rna-support, fig.width=14, fig.height=10}
+rna_plot_data <- rna_review_shortlist |>
+  dplyr::mutate(
+    state_display = paste0(analysis_unit, ": ", cell_state),
+    RNA_support_short = sub(":.*$", "", RNA_support_class)
+  )
+
+p_rna_support <- ggplot2::ggplot(
+  rna_plot_data,
+  ggplot2::aes(
+    x = log2FC_comparison_vs_reference,
+    y = detection_difference_percentage_points,
+    color = RNA_support_short,
+    size = log10(total_counts + 1)
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_point(alpha = 0.70) +
+  ggplot2::facet_wrap(~ state_display, scales = "free", ncol = 4) +
+  ggplot2::labs(
+    title = "WT RNA candidate support landscape",
+    subtitle = paste(
+      "HFD versus CON pooled-library effects; support reflects balanced",
+      "cell-sampling stability, not biological replication."
+    ),
+    x = "RNA pooled-library log2 fold change",
+    y = "Detection difference (percentage points)",
+    color = "Support",
+    size = "log10 total counts"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_rna_support)
+
+ggplot2::ggsave(
+  file.path(STEP7C_PLOT_DIR, "01_RNA_candidate_support_landscape.pdf"),
+  p_rna_support,
+  width = 14,
+  height = 10
+)
+```
+
+```{r plot-atac-support, fig.width=14, fig.height=10}
+atac_plot_data <- atac_review_shortlist |>
+  dplyr::mutate(
+    state_display = paste0(analysis_unit, ": ", cell_state),
+    ATAC_support_short = sub(":.*$", "", ATAC_support_class)
+  )
+
+p_atac_support <- ggplot2::ggplot(
+  atac_plot_data,
+  ggplot2::aes(
+    x = log2FC_comparison_vs_reference,
+    y = detection_difference_percentage_points,
+    color = ATAC_support_short,
+    shape = nearest_gene_context
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_point(alpha = 0.65, size = 1.1) +
+  ggplot2::facet_wrap(~ state_display, scales = "free", ncol = 4) +
+  ggplot2::labs(
+    title = "WT ATAC candidate support landscape",
+    subtitle = paste(
+      "HFD versus CON pooled-library effects; nearest-gene assignment is",
+      "genomic context and not a regulatory link."
+    ),
+    x = "ATAC pooled-library log2 fold change",
+    y = "Detection difference (percentage points)",
+    color = "Support",
+    shape = "Nearest-gene context"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_atac_support)
+
+ggplot2::ggsave(
+  file.path(STEP7C_PLOT_DIR, "02_ATAC_candidate_support_landscape.pdf"),
+  p_atac_support,
+  width = 14,
+  height = 10
+)
+```
+
+```{r plot-multimodal-candidates, fig.width=14, fig.height=10}
+multimodal_plot_data <- multimodal_review_shortlist |>
+  dplyr::mutate(
+    state_display = paste0(analysis_unit, ": ", cell_state),
+    multimodal_support_short = sub(
+      ":.*$",
+      "",
+      multimodal_support_class
+    )
+  )
+
+p_multimodal <- ggplot2::ggplot(
+  multimodal_plot_data,
+  ggplot2::aes(
+    x = ATAC_log2FC,
+    y = RNA_log2FC,
+    color = multimodal_support_short,
+    shape = nearest_gene_context
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75", linewidth = 0.3) +
+  ggplot2::geom_point(alpha = 0.75, size = 1.2) +
+  ggplot2::facet_wrap(~ state_display, scales = "free", ncol = 4) +
+  ggplot2::labs(
+    title = "Directionally concordant WT RNA/ATAC candidates",
+    subtitle = paste(
+      "Each point is an RNA gene and nearest-gene ATAC peak pair;",
+      "concordance does not establish peak-to-gene regulation."
+    ),
+    x = "ATAC pooled-library log2 fold change",
+    y = "RNA pooled-library log2 fold change",
+    color = "Support",
+    shape = "Nearest-gene context"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_multimodal)
+
+ggplot2::ggsave(
+  file.path(STEP7C_PLOT_DIR, "03_RNA_ATAC_concordant_candidates.pdf"),
+  p_multimodal,
+  width = 14,
+  height = 10
+)
+```
+
+```{r plot-root-sensitivity, fig.width=11, fig.height=7}
+p_root_sensitivity <- ggplot2::ggplot(
+  absorptive_root_sensitivity,
+  ggplot2::aes(
+    x = pseudotime_order,
+    y = median_of_diet_medians,
+    color = trajectory_id,
+    group = trajectory_id
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.7) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = paste0(analysis_unit, ": ", cell_state)),
+    check_overlap = TRUE,
+    nudge_y = 0.8,
+    size = 3
+  ) +
+  ggplot2::labs(
+    title = "Absorptive ordering under the approved root sensitivity model",
+    subtitle = paste(
+      "Medians summarize pooled-library pseudotime and compare ordering,",
+      "not absolute pseudotime values between models."
+    ),
+    x = "Within-model state order",
+    y = "Median of CON and HFD median pseudotime",
+    color = "Model"
+  ) +
+  theme_multiome(base_size = 9)
+
+print(p_root_sensitivity)
+
+ggplot2::ggsave(
+  file.path(STEP7C_PLOT_DIR, "04_absorptive_root_sensitivity_ordering.pdf"),
+  p_root_sensitivity,
+  width = 11,
+  height = 7
+)
+```
+
+# 10. Save a compact review summary
+
+```{r save-step-seven-c}
+candidate_support_summary <- dplyr::bind_rows(
+  rna_prioritized |>
+    dplyr::count(
+      modality = "RNA",
+      support_class = RNA_support_class,
+      name = "candidates"
+    ),
+  atac_prioritized |>
+    dplyr::count(
+      modality = "ATAC",
+      support_class = ATAC_support_class,
+      name = "candidates"
+    ),
+  multimodal_candidates |>
+    dplyr::count(
+      modality = "RNA_ATAC_pair",
+      support_class = multimodal_support_class,
+      name = "candidates"
+    ),
+  trajectory_rna_candidates |>
+    dplyr::count(
+      modality = "trajectory_RNA",
+      support_class = trajectory_context_class,
+      name = "candidates"
+    )
+)
+
+readr::write_csv(
+  candidate_support_summary,
+  file.path(STEP7C_DIR, "candidate_support_summary.csv")
+)
+
+step7c_summary <- data.frame(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  RNA_candidates = nrow(rna_prioritized),
+  RNA_shortlist = nrow(rna_review_shortlist),
+  ATAC_candidates = nrow(atac_prioritized),
+  ATAC_shortlist = nrow(atac_review_shortlist),
+  concordant_RNA_ATAC_pairs = nrow(multimodal_candidates),
+  concordant_RNA_ATAC_shortlist = nrow(multimodal_review_shortlist),
+  trajectory_RNA_candidates = nrow(trajectory_rna_candidates),
+  trajectory_RNA_shortlist = nrow(trajectory_rna_shortlist),
+  replicated_diet_design = FALSE,
+  biological_inference_performed = FALSE,
+  stringsAsFactors = FALSE
+)
+
+readr::write_csv(
+  step7c_summary,
+  file.path(STEP7C_DIR, "step7c_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 7C completed:", format(Sys.time())),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste("RNA candidate rows:", nrow(rna_prioritized)),
+    paste("ATAC candidate rows:", nrow(atac_prioritized)),
+    paste(
+      "Directionally concordant RNA/ATAC pairs:",
+      nrow(multimodal_candidates)
+    ),
+    paste(
+      "Trajectory-aware RNA candidate rows:",
+      nrow(trajectory_rna_candidates)
+    ),
+    "Biological-replicate diet inference performed: FALSE",
+    paste(
+      "Interpretation:",
+      "descriptive WT pooled-library candidates for later validation"
+    )
+  ),
+  STEP7C_COMPLETE_MARKER
+)
+
+step7c_summary
+```
+
+# Interpretation checkpoint
+
+Before promoting a candidate for cross-genotype comparison, ask:
+
+1. Is the candidate found in a high- or moderate-confidence matched state?
+2. Does its direction remain stable under balanced cell sampling?
+3. Is an RNA/ATAC pair supported by more than nearest-gene proximity?
+4. Does coverage inspection support the candidate peak in both libraries?
+5. Does the RNA candidate occur in a biologically coherent part of an
+   approved trajectory, and is that conclusion stable to the alternative
+   absorptive root?
+6. Does the same marker-supported state exist in PPAR and IL17?
+7. Is the direction reproduced across genotypes, or is it genotype-specific?
+
+# What comes next?
+
+Step 8 should construct a cross-genotype state-matching table before joining
+diet-associated effects. Comparisons should use biological state labels and
+marker evidence rather than raw cluster numbers. A candidate becomes suitable
+for inferential differential analysis only when independent biological
+replicates are available.
