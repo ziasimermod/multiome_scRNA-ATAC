@@ -1,0 +1,3071 @@
+---
+title: "Step 8B - Refine persistent HFD programs in source-matched WT populations"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 8 is the immutable, strict audit of Gourab's persistent HFD-associated
+gene lists in WT annotation unit 8 (`ISC-like crypt`). Step 8B asks the next,
+different question: do the same source directions emerge when the WT cells
+are regrouped into populations that better match the source annotations?
+
+The source-aligned primary populations are:
+
+1. `broad_stem`: WT units 8 and 6 (`ISC-like crypt` plus
+   `Crypt progenitor`);
+2. `DCS`: WT unit 9 (`Reg4+ deep crypt secretory`); and
+3. `broad_goblet_all`: WT units 4, 5, 7, and 13 (all approved immature and
+   mature goblet populations).
+
+Strict and component populations are retained as sensitivity analyses. In
+particular, unit 13 remains in the biologically complete goblet composite,
+while a `core_goblet` analysis using units 4, 5, and 7 tests how strongly its
+CON-dominant composition influences the pooled effect.
+
+For each population, this notebook:
+
+- recomputes descriptive HFD-versus-CON RNA and ATAC pooled-library effects;
+- evaluates cell-sampling stability by balanced repeated downsampling;
+- tests the persistent HFD-up and persistent HFD-down lists using ranked RNA
+  enrichment;
+- produces explicit concordant and discordant persistent-gene tables before
+  performing targeted MSigDB over-representation analysis;
+- characterizes ATAC changes independently; and
+- integrates RNA with exact plus-or-minus 2-kb TSS accessibility evidence.
+
+Distal peak-to-gene linkage, HyperMet/HypoImmune scoring, and cross-genotype
+comparisons are deliberately deferred. They should use the benchmark and
+candidate tables produced here rather than changing the definition of this
+analysis after results are known.
+
+## Statistical limitation
+
+WT contains one pooled CON library and one pooled HFD library. Diet and
+library are perfectly confounded, and individual mice cannot be recovered
+after pooling. All effect sizes, ranked enrichment results, and enrichment
+P values in this notebook are descriptive at the pooled-library level.
+Balanced cell downsampling tests sensitivity to unequal cell numbers and a
+small number of nuclei; it does not create biological replication.
+
+Composite-population sensitivity analyses also are not independent
+replication: the primary composite and its components contain overlapping
+cells. They measure dependence on the chosen annotation boundary. A composite
+pseudobulk effect can reflect both expression changes within a component and
+diet-associated changes in the relative abundance of its component states;
+the component tables are therefore essential to interpretation.
+
+# 1. Setup
+
+Run in a fresh R session configured for WT v2:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+This notebook additionally requires `fgsea` and `msigdbr`. Installation is
+documented in `analysis/README_STEP08_PERSISTENT_HFD.md`.
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight(
+  packages = unique(c(required_packages, "fgsea", "msigdbr"))
+)
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Signac)
+  library(Matrix)
+  library(GenomicRanges)
+  library(IRanges)
+  library(GenomeInfoDb)
+  library(S4Vectors)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+  library(fgsea)
+  library(msigdbr)
+})
+
+ggplot2::theme_set(theme_multiome())
+future::plan(future::sequential)
+set.seed(20260915)
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 8B is defined for the WT v2 benchmark. Set ",
+    "MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+```
+
+# 2. Define inputs, outputs, and evidence rules
+
+The pooled-effect thresholds mirror Step 7. `source_matched_primary`,
+`sensitivity`, and `component` describe scientific scope. `Tier_A`, `Tier_B`,
+and `Tier_C` describe only cell-number support. Neither is an annotation
+confidence score.
+
+```{r define-inputs-and-parameters}
+STEP6_DIR <- file.path(OUTPUT_DIR, "06_annotation")
+STEP7_DIR <- file.path(OUTPUT_DIR, "07_diet_response")
+STEP8_DIR <- file.path(OUTPUT_DIR, "08_persistent_hfd_programs")
+STEP8_TABLE_DIR <- file.path(STEP8_DIR, "tables")
+
+STEP8B_DIR <- file.path(
+  OUTPUT_DIR,
+  "08b_source_matched_persistent_hfd"
+)
+STEP8B_TABLE_DIR <- file.path(STEP8B_DIR, "tables")
+STEP8B_PLOT_DIR <- file.path(STEP8B_DIR, "plots")
+
+dir.create(STEP8B_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8B_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8B_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+STEP6_OBJECT_PATH <- file.path(
+  STEP6_DIR,
+  "multiome_annotated.rds"
+)
+STEP6_COMPLETE_MARKER <- file.path(
+  STEP6_DIR,
+  "STEP_06_COMPLETE.txt"
+)
+STEP7_COMPLETE_MARKER <- file.path(
+  STEP7_DIR,
+  "STEP_07_COMPLETE.txt"
+)
+STEP8_COMPLETE_MARKER <- file.path(
+  STEP8_DIR,
+  "STEP_08_COMPLETE.txt"
+)
+
+REFERENCE_GENE_PATH <- file.path(
+  DATASET_CONFIG_DIR,
+  "reference_programs",
+  "persistent_hfd_genes.csv"
+)
+STRICT_STEP8_RNA_PATH <- file.path(
+  STEP8_TABLE_DIR,
+  "persistent_gene_primary_WT_stem_RNA_summary.csv"
+)
+PROMOTER_OVERLAP_PATH <- file.path(
+  STEP8_TABLE_DIR,
+  "persistent_gene_exact_promoter_peak_overlaps.csv"
+)
+
+required_inputs <- c(
+  Step6_object = STEP6_OBJECT_PATH,
+  Step6_marker = STEP6_COMPLETE_MARKER,
+  Step7_marker = STEP7_COMPLETE_MARKER,
+  Step8_marker = STEP8_COMPLETE_MARKER,
+  persistent_reference = REFERENCE_GENE_PATH,
+  strict_Step8_RNA = STRICT_STEP8_RNA_PATH,
+  persistent_promoter_overlaps = PROMOTER_OVERLAP_PATH,
+  GRCm39_GTF = GRCM39_GTF
+)
+
+for (input_label in names(required_inputs)) {
+  assert_file(required_inputs[[input_label]], input_label)
+}
+
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+
+TIER_A_MIN_NUCLEI_PER_DIET <- 200L
+TIER_B_MIN_NUCLEI_PER_DIET <- 100L
+
+RNA_MIN_TOTAL_COUNTS <- 20L
+RNA_MIN_DETECTION_PERCENT <- 5
+RNA_CLEAR_LOG2FC <- 0.50
+RNA_CLEAR_DETECTION_DELTA <- 5
+RNA_TOP_FEATURES_PER_DIRECTION <- 250L
+
+ATAC_MIN_TOTAL_COUNTS <- 30L
+ATAC_MIN_DETECTION_PERCENT <- 1
+ATAC_CLEAR_LOG2FC <- 0.50
+ATAC_TOP_FEATURES_PER_DIRECTION <- 500L
+
+CPM_PSEUDOCOUNT <- 0.10
+
+DOWNSAMPLING_ITERATIONS <- 25L
+DOWNSAMPLING_MAX_CELLS_PER_DIET <- 500L
+DOWNSAMPLING_MAX_FEATURES_PER_POPULATION <- 1500L
+MINIMUM_SIGN_CONCORDANCE_PERCENT <- 80
+
+FGSEA_MIN_SIZE <- 10L
+FGSEA_MAX_SIZE <- 500L
+
+ORA_MIN_QUERY_GENES <- 5L
+ORA_MIN_PATHWAY_GENES_IN_UNIVERSE <- 5L
+ORA_MAX_PATHWAY_GENES_IN_UNIVERSE <- 500L
+
+TSS_WINDOW_BP <- 2000L
+PREVIEW_PLOTS_IN_RSTUDIO <- FALSE
+
+analysis_parameters <- tibble::tibble(
+  parameter = c(
+    "reference diet",
+    "comparison diet",
+    "Tier A minimum nuclei per diet",
+    "Tier B minimum nuclei per diet",
+    "RNA minimum total counts",
+    "RNA minimum detection percent",
+    "RNA clear-effect absolute log2FC",
+    "RNA clear-effect absolute detection delta",
+    "ATAC minimum total counts",
+    "ATAC minimum detection percent",
+    "ATAC clear-effect absolute log2FC",
+    "balanced downsampling iterations",
+    "maximum sampled nuclei per diet",
+    "minimum downsampling sign concordance percent",
+    "exact promoter window bp each side of TSS",
+    "replicated diet design",
+    "biological inference performed"
+  ),
+  value = c(
+    REFERENCE_DIET,
+    COMPARISON_DIET,
+    TIER_A_MIN_NUCLEI_PER_DIET,
+    TIER_B_MIN_NUCLEI_PER_DIET,
+    RNA_MIN_TOTAL_COUNTS,
+    RNA_MIN_DETECTION_PERCENT,
+    RNA_CLEAR_LOG2FC,
+    RNA_CLEAR_DETECTION_DELTA,
+    ATAC_MIN_TOTAL_COUNTS,
+    ATAC_MIN_DETECTION_PERCENT,
+    ATAC_CLEAR_LOG2FC,
+    DOWNSAMPLING_ITERATIONS,
+    DOWNSAMPLING_MAX_CELLS_PER_DIET,
+    MINIMUM_SIGN_CONCORDANCE_PERCENT,
+    TSS_WINDOW_BP,
+    FALSE,
+    FALSE
+  )
+)
+
+readr::write_csv(
+  analysis_parameters,
+  file.path(STEP8B_DIR, "step8b_parameters.csv")
+)
+```
+
+# 3. General helper functions
+
+PDFs use the base PDF device because Cairo is not reliable in the SOL
+interactive environment.
+
+```{r helper-functions}
+read_table_quietly <- function(path) {
+  suppressMessages(
+    readr::read_csv(
+      path,
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+  )
+}
+
+assert_columns <- function(data, required_columns, table_label) {
+  missing_columns <- setdiff(required_columns, colnames(data))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      table_label,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+align_matrix_to_metadata <- function(
+  feature_matrix,
+  metadata_cells,
+  matrix_label
+) {
+  matrix_cells <- colnames(feature_matrix)
+
+  if (!setequal(matrix_cells, metadata_cells)) {
+    stop(
+      matrix_label,
+      " and the Step 6 metadata do not contain the same cells.",
+      call. = FALSE
+    )
+  }
+
+  if (!identical(matrix_cells, metadata_cells)) {
+    message(
+      matrix_label,
+      " has the correct cells in a different order; reordering columns."
+    )
+    feature_matrix <- feature_matrix[
+      ,
+      metadata_cells,
+      drop = FALSE
+    ]
+  }
+
+  if (!identical(colnames(feature_matrix), metadata_cells)) {
+    stop("Failed to align ", matrix_label, ".", call. = FALSE)
+  }
+
+  feature_matrix
+}
+
+preview_plot <- function(plot_object) {
+  if (isTRUE(PREVIEW_PLOTS_IN_RSTUDIO)) {
+    print(plot_object)
+  }
+  invisible(plot_object)
+}
+
+save_native_pdf <- function(
+  filename,
+  plot_object,
+  width = 11,
+  height = 7
+) {
+  output_path <- file.path(STEP8B_PLOT_DIR, filename)
+  grDevices::pdf(
+    file = output_path,
+    width = width,
+    height = height,
+    family = "Helvetica",
+    useDingbats = FALSE
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot_object)
+  invisible(output_path)
+}
+
+observed_direction <- function(effect) {
+  dplyr::case_when(
+    is.na(effect) ~ NA_character_,
+    effect > 0 ~ "HFD_higher",
+    effect < 0 ~ "CON_higher",
+    TRUE ~ "no_change"
+  )
+}
+
+reference_aligned_effect <- function(effect, reference_direction) {
+  dplyr::case_when(
+    is.na(effect) ~ NA_real_,
+    reference_direction == "HFD_higher" ~ effect,
+    reference_direction == "CON_higher" ~ -effect,
+    TRUE ~ NA_real_
+  )
+}
+
+safe_spearman <- function(x, y) {
+  complete <- is.finite(x) & is.finite(y)
+
+  if (sum(complete) < 3L) {
+    return(NA_real_)
+  }
+
+  suppressWarnings(
+    stats::cor(
+      x[complete],
+      y[complete],
+      method = "spearman"
+    )
+  )
+}
+
+prepare_stability <- function(stability_table, prefix) {
+  stability_table |>
+    dplyr::mutate(
+      direction_stable =
+        sign(full_log2FC) == sign(downsampled_log2FC_median) &
+        sign_concordance_percent >=
+          MINIMUM_SIGN_CONCORDANCE_PERCENT,
+      downsampling_iqr_excludes_zero = dplyr::case_when(
+        full_log2FC > 0 ~ downsampled_log2FC_q25 > 0,
+        full_log2FC < 0 ~ downsampled_log2FC_q75 < 0,
+        TRUE ~ FALSE
+      )
+    ) |>
+    dplyr::rename_with(
+      ~ paste0(prefix, .x),
+      -dplyr::all_of(c("comparison_population", "feature"))
+    )
+}
+```
+
+# 4. Load and validate the WT object
+
+The legacy WT Step 6 object does not contain `annotation_unit`. In that
+expected case, `wnn_cluster` is used. This fallback is recorded, not inferred
+silently.
+
+```{r load-and-validate-wt-object}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+metadata <- multiome[[]]
+
+analysis_unit_column <- if (
+  "annotation_unit" %in% colnames(metadata)
+) {
+  "annotation_unit"
+} else if ("wnn_cluster" %in% colnames(metadata)) {
+  "wnn_cluster"
+} else {
+  stop(
+    "The Step 6 object contains neither annotation_unit nor wnn_cluster.",
+    call. = FALSE
+  )
+}
+
+required_metadata <- c(
+  "sample_id",
+  "diet",
+  analysis_unit_column,
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence"
+)
+
+missing_metadata <- setdiff(required_metadata, colnames(metadata))
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "The Step 6 object is missing metadata column(s): ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+metadata$cell_barcode <- rownames(metadata)
+metadata$sample_id <- as.character(metadata$sample_id)
+metadata$diet <- as.character(metadata$diet)
+metadata$analysis_unit <- as.character(
+  metadata[[analysis_unit_column]]
+)
+metadata$broad_compartment <- as.character(
+  metadata$broad_compartment
+)
+metadata$cell_state <- as.character(metadata$cell_state)
+metadata$cell_state_full <- as.character(metadata$cell_state_full)
+metadata$annotation_confidence <- tolower(
+  as.character(metadata$annotation_confidence)
+)
+
+expected_diets <- c(REFERENCE_DIET, COMPARISON_DIET)
+
+if (!setequal(unique(metadata$diet), expected_diets)) {
+  stop("Expected exactly CON and HFD in the WT object.", call. = FALSE)
+}
+
+if (!all(c("RNA", "ATAC") %in% names(multiome))) {
+  stop("The WT object must contain RNA and ATAC assays.", call. = FALSE)
+}
+
+rna_layers <- SeuratObject::Layers(multiome[["RNA"]])
+atac_layers <- SeuratObject::Layers(multiome[["ATAC"]])
+
+if (!"counts" %in% rna_layers || !"counts" %in% atac_layers) {
+  stop("RNA and ATAC must each contain a joined counts layer.", call. = FALSE)
+}
+
+rna_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+atac_counts <- SeuratObject::LayerData(
+  multiome[["ATAC"]],
+  layer = "counts"
+)
+
+metadata_cells <- rownames(metadata)
+
+matrix_alignment_audit <- tibble::tibble(
+  matrix = c("RNA counts", "ATAC counts"),
+  matrix_cells = c(ncol(rna_counts), ncol(atac_counts)),
+  metadata_cells = length(metadata_cells),
+  same_cell_set = c(
+    setequal(colnames(rna_counts), metadata_cells),
+    setequal(colnames(atac_counts), metadata_cells)
+  ),
+  identical_order_before_alignment = c(
+    identical(colnames(rna_counts), metadata_cells),
+    identical(colnames(atac_counts), metadata_cells)
+  )
+)
+
+rna_counts <- align_matrix_to_metadata(
+  rna_counts,
+  metadata_cells,
+  "RNA counts"
+)
+atac_counts <- align_matrix_to_metadata(
+  atac_counts,
+  metadata_cells,
+  "ATAC counts"
+)
+
+atac_ranges <- GenomicRanges::granges(multiome[["ATAC"]])
+
+if (length(atac_ranges) != nrow(atac_counts)) {
+  stop(
+    "ATAC genomic ranges and count features are not one-to-one.",
+    call. = FALSE
+  )
+}
+
+names(atac_ranges) <- rownames(atac_counts)
+
+rm(multiome)
+invisible(gc())
+
+readr::write_csv(
+  matrix_alignment_audit,
+  file.path(STEP8B_DIR, "matrix_cell_alignment_audit.csv")
+)
+
+run_inventory <- tibble::tibble(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  cohort_group = COHORT_GROUP,
+  nuclei = nrow(metadata),
+  RNA_features = nrow(rna_counts),
+  ATAC_features = nrow(atac_counts),
+  analysis_unit_column = analysis_unit_column,
+  independent_libraries = dplyr::n_distinct(metadata$sample_id),
+  replicated_diet_design = FALSE,
+  biological_inference_performed = FALSE
+)
+
+readr::write_csv(
+  run_inventory,
+  file.path(STEP8B_DIR, "step8b_run_inventory.csv")
+)
+
+run_inventory
+```
+
+# 5. Define source-matched and sensitivity populations
+
+The mapping is explicit and is written to disk before any diet effect is
+calculated. Units 0 and 18 are biologically informative cycling populations,
+but are excluded from these source-matched composites to avoid making cell
+cycle the definition of the source population.
+
+```{r define-source-matched-populations}
+population_definitions <- tibble::tibble(
+  comparison_population = c(
+    "broad_stem",
+    "strict_ISC",
+    "crypt_progenitor",
+    "DCS",
+    "broad_goblet_all",
+    "core_goblet",
+    "immature_goblet_4",
+    "mature_goblet_5",
+    "immature_goblet_7",
+    "immature_goblet_13"
+  ),
+  display_label = c(
+    "Broad stem (8 + 6)",
+    "Strict ISC-like (8)",
+    "Crypt progenitor (6)",
+    "Reg4+ DCS (9)",
+    "All goblet (4 + 5 + 7 + 13)",
+    "Core goblet (4 + 5 + 7)",
+    "Immature goblet (4)",
+    "Mature goblet (5)",
+    "Immature goblet (7)",
+    "Immature goblet, CON-dominant (13)"
+  ),
+  source_population = c(
+    "Gourab stem",
+    "Gourab stem",
+    "Gourab stem",
+    "Gourab DCS",
+    "Gourab goblet",
+    "Gourab goblet",
+    "Gourab goblet",
+    "Gourab goblet",
+    "Gourab goblet",
+    "Gourab goblet"
+  ),
+  analysis_role = c(
+    "source_matched_primary",
+    "sensitivity",
+    "component",
+    "source_matched_primary",
+    "source_matched_primary",
+    "sensitivity",
+    "component",
+    "component",
+    "component",
+    "component"
+  ),
+  member_units = list(
+    c("8", "6"),
+    "8",
+    "6",
+    "9",
+    c("4", "5", "7", "13"),
+    c("4", "5", "7"),
+    "4",
+    "5",
+    "7",
+    "13"
+  ),
+  rationale = c(
+    "Source-aligned broad stem population spanning ISC-like and noncycling crypt progenitor states.",
+    "Immutable Step 8 anchor retained as a strict sensitivity analysis.",
+    "Tests the noncycling crypt-progenitor contribution to the broad-stem result.",
+    "Approved Reg4-positive deep crypt secretory population.",
+    "Biologically complete approved immature-plus-mature goblet composite, including unit 13.",
+    "Tests sensitivity to removal of the strongly CON-dominant unit 13.",
+    "Component audit for immature goblet unit 4.",
+    "Component audit for mature goblet unit 5.",
+    "Component audit for immature goblet unit 7.",
+    "Component audit for approved but strongly CON-dominant immature goblet unit 13."
+  )
+)
+
+expected_unit_annotations <- tibble::tribble(
+  ~analysis_unit, ~expected_cell_state, ~expected_confidence,
+  "4", "Immature goblet", "moderate",
+  "5", "Mature goblet", "high",
+  "6", "Crypt progenitor", "moderate",
+  "7", "Immature goblet", "moderate",
+  "8", "ISC-like crypt", "moderate",
+  "9", "Reg4+ DCS", "high",
+  "13", "Immature goblet", "moderate"
+)
+
+unit_annotation <- metadata |>
+  dplyr::distinct(
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence
+  )
+
+duplicate_unit_annotation <- unit_annotation |>
+  dplyr::count(analysis_unit) |>
+  dplyr::filter(n != 1L)
+
+if (nrow(duplicate_unit_annotation) > 0L) {
+  stop(
+    "At least one analysis unit has inconsistent annotation metadata.",
+    call. = FALSE
+  )
+}
+
+unit_validation <- expected_unit_annotations |>
+  dplyr::left_join(unit_annotation, by = "analysis_unit") |>
+  dplyr::mutate(
+    unit_present = !is.na(cell_state),
+    epithelial = broad_compartment == "epithelial",
+    cell_state_matches = cell_state == expected_cell_state,
+    confidence_matches = annotation_confidence == expected_confidence,
+    validation_pass = unit_present & epithelial &
+      cell_state_matches & confidence_matches
+  )
+
+if (any(!unit_validation$validation_pass)) {
+  stop(
+    "The WT annotations no longer match the approved Step 8B population ",
+    "mapping. Review step8b_unit_annotation_validation.csv.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  unit_validation,
+  file.path(STEP8B_DIR, "step8b_unit_annotation_validation.csv")
+)
+
+population_definition_export <- population_definitions |>
+  dplyr::mutate(
+    member_units = vapply(
+      member_units,
+      paste,
+      collapse = ";",
+      FUN.VALUE = character(1)
+    )
+  )
+
+readr::write_csv(
+  population_definition_export,
+  file.path(STEP8B_DIR, "matched_population_definitions.csv")
+)
+```
+
+```{r quantify-population-support}
+population_cell_counts <- dplyr::bind_rows(
+  lapply(
+    seq_len(nrow(population_definitions)),
+    function(population_index) {
+      population_id <- population_definitions$comparison_population[[
+        population_index
+      ]]
+      member_units <- population_definitions$member_units[[
+        population_index
+      ]]
+
+      metadata |>
+        dplyr::filter(analysis_unit %in% member_units) |>
+        dplyr::count(diet, name = "nuclei") |>
+        tidyr::complete(
+          diet = expected_diets,
+          fill = list(nuclei = 0L)
+        ) |>
+        dplyr::mutate(comparison_population = population_id)
+    }
+  )
+)
+
+population_support <- population_cell_counts |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = nuclei,
+    names_prefix = "nuclei_"
+  ) |>
+  dplyr::left_join(
+    population_definition_export,
+    by = "comparison_population"
+  ) |>
+  dplyr::mutate(
+    minimum_nuclei_per_diet = pmin(nuclei_CON, nuclei_HFD),
+    cell_support_tier = dplyr::case_when(
+      minimum_nuclei_per_diet >= TIER_A_MIN_NUCLEI_PER_DIET ~
+        "Tier_A",
+      minimum_nuclei_per_diet >= TIER_B_MIN_NUCLEI_PER_DIET ~
+        "Tier_B",
+      TRUE ~ "Tier_C"
+    ),
+    primary_RNA_ATAC =
+      analysis_role == "source_matched_primary" &
+      cell_support_tier %in% c("Tier_A", "Tier_B"),
+    interpretation_scope = dplyr::case_when(
+      analysis_role == "source_matched_primary" &
+        cell_support_tier == "Tier_A" ~
+        "Primary source-matched descriptive RNA and ATAC benchmark",
+      analysis_role == "source_matched_primary" &
+        cell_support_tier == "Tier_B" ~
+        "Primary source-matched benchmark with reduced cell support",
+      analysis_role == "sensitivity" ~
+        "Annotation-boundary sensitivity analysis",
+      TRUE ~ "Internal component consistency analysis"
+    )
+  ) |>
+  dplyr::arrange(
+    factor(
+      analysis_role,
+      levels = c(
+        "source_matched_primary",
+        "sensitivity",
+        "component"
+      )
+    ),
+    comparison_population
+  )
+
+primary_populations <- population_support |>
+  dplyr::filter(primary_RNA_ATAC) |>
+  dplyr::pull(comparison_population)
+
+expected_primary_populations <- c(
+  "broad_stem",
+  "DCS",
+  "broad_goblet_all"
+)
+
+if (!setequal(primary_populations, expected_primary_populations)) {
+  stop(
+    "The source-matched primary population set is not the expected ",
+    "broad_stem, DCS, and broad_goblet_all set.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  population_cell_counts,
+  file.path(STEP8B_TABLE_DIR, "matched_population_counts_by_diet.csv")
+)
+readr::write_csv(
+  population_support,
+  file.path(STEP8B_TABLE_DIR, "matched_population_support.csv")
+)
+
+population_support
+```
+
+# 6. Calculate descriptive RNA effects
+
+Each population and diet is collapsed into one count vector. These are pooled
+library contrasts, not replicate-aware pseudobulk models.
+
+```{r pooled-effect-functions}
+summarize_pooled_effect <- function(
+  count_matrix,
+  feature_label,
+  metadata,
+  comparison_population,
+  member_units,
+  minimum_total_counts,
+  minimum_detection_percent,
+  cpm_pseudocount
+) {
+  reference_cells <- metadata$cell_barcode[
+    metadata$analysis_unit %in% member_units &
+      metadata$diet == REFERENCE_DIET
+  ]
+  comparison_cells <- metadata$cell_barcode[
+    metadata$analysis_unit %in% member_units &
+      metadata$diet == COMPARISON_DIET
+  ]
+
+  if (length(reference_cells) == 0L || length(comparison_cells) == 0L) {
+    return(NULL)
+  }
+
+  reference_counts <- Matrix::rowSums(
+    count_matrix[, reference_cells, drop = FALSE]
+  )
+  comparison_counts <- Matrix::rowSums(
+    count_matrix[, comparison_cells, drop = FALSE]
+  )
+  reference_detected <- Matrix::rowSums(
+    count_matrix[, reference_cells, drop = FALSE] > 0
+  )
+  comparison_detected <- Matrix::rowSums(
+    count_matrix[, comparison_cells, drop = FALSE] > 0
+  )
+
+  reference_library_size <- sum(reference_counts)
+  comparison_library_size <- sum(comparison_counts)
+
+  if (reference_library_size <= 0 || comparison_library_size <= 0) {
+    stop(
+      "A pooled library has zero counts for ",
+      comparison_population,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  reference_cpm <- 1e6 * reference_counts / reference_library_size
+  comparison_cpm <- 1e6 * comparison_counts / comparison_library_size
+  reference_percent <-
+    100 * reference_detected / length(reference_cells)
+  comparison_percent <-
+    100 * comparison_detected / length(comparison_cells)
+
+  tibble::tibble(
+    comparison_population = comparison_population,
+    feature = rownames(count_matrix),
+    feature_type = feature_label,
+    reference_diet = REFERENCE_DIET,
+    comparison_diet = COMPARISON_DIET,
+    reference_nuclei = length(reference_cells),
+    comparison_nuclei = length(comparison_cells),
+    reference_counts = reference_counts,
+    comparison_counts = comparison_counts,
+    total_counts = reference_counts + comparison_counts,
+    reference_CPM = reference_cpm,
+    comparison_CPM = comparison_cpm,
+    log2FC_comparison_vs_reference = log2(
+      (comparison_cpm + cpm_pseudocount) /
+        (reference_cpm + cpm_pseudocount)
+    ),
+    reference_percent_detected = reference_percent,
+    comparison_percent_detected = comparison_percent,
+    detection_difference_percentage_points =
+      comparison_percent - reference_percent
+  ) |>
+    dplyr::filter(
+      total_counts >= minimum_total_counts,
+      pmax(
+        reference_percent_detected,
+        comparison_percent_detected
+      ) >= minimum_detection_percent
+    )
+}
+
+calculate_population_effects <- function(
+  count_matrix,
+  feature_label,
+  minimum_total_counts,
+  minimum_detection_percent
+) {
+  dplyr::bind_rows(
+    lapply(
+      seq_len(nrow(population_definitions)),
+      function(population_index) {
+        summarize_pooled_effect(
+          count_matrix = count_matrix,
+          feature_label = feature_label,
+          metadata = metadata,
+          comparison_population =
+            population_definitions$comparison_population[[
+              population_index
+            ]],
+          member_units = population_definitions$member_units[[
+            population_index
+          ]],
+          minimum_total_counts = minimum_total_counts,
+          minimum_detection_percent = minimum_detection_percent,
+          cpm_pseudocount = CPM_PSEUDOCOUNT
+        )
+      }
+    )
+  ) |>
+    dplyr::left_join(
+      population_support |>
+        dplyr::select(
+          comparison_population,
+          display_label,
+          source_population,
+          analysis_role,
+          cell_support_tier
+        ),
+      by = "comparison_population"
+    )
+}
+
+select_top_effects <- function(
+  effects,
+  absolute_log2fc_threshold,
+  top_features_per_direction,
+  detection_delta_threshold = NULL
+) {
+  selected <- effects |>
+    dplyr::filter(
+      abs(log2FC_comparison_vs_reference) >=
+        absolute_log2fc_threshold
+    )
+
+  if (!is.null(detection_delta_threshold)) {
+    selected <- selected |>
+      dplyr::filter(
+        abs(detection_difference_percentage_points) >=
+          detection_delta_threshold
+      )
+  }
+
+  selected |>
+    dplyr::mutate(
+      direction = observed_direction(
+        log2FC_comparison_vs_reference
+      )
+    ) |>
+    dplyr::group_by(comparison_population, direction) |>
+    dplyr::slice_max(
+      order_by = abs(log2FC_comparison_vs_reference),
+      n = top_features_per_direction,
+      with_ties = FALSE
+    ) |>
+    dplyr::ungroup()
+}
+```
+
+```{r calculate-rna-effects}
+rna_effects <- calculate_population_effects(
+  count_matrix = rna_counts,
+  feature_label = "gene",
+  minimum_total_counts = RNA_MIN_TOTAL_COUNTS,
+  minimum_detection_percent = RNA_MIN_DETECTION_PERCENT
+)
+
+rna_top_candidates <- select_top_effects(
+  effects = rna_effects,
+  absolute_log2fc_threshold = RNA_CLEAR_LOG2FC,
+  top_features_per_direction = RNA_TOP_FEATURES_PER_DIRECTION,
+  detection_delta_threshold = RNA_CLEAR_DETECTION_DELTA
+)
+
+readr::write_csv(
+  rna_effects,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "RNA_pooled_library_effects_by_matched_population.csv.gz"
+  )
+)
+readr::write_csv(
+  rna_top_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "RNA_top_diet_candidates_by_matched_population.csv"
+  )
+)
+
+rna_top_candidates |>
+  dplyr::count(comparison_population, direction)
+```
+
+# 7. Evaluate balanced cell-sampling stability
+
+All evaluable persistent genes are included in RNA downsampling. ATAC
+downsampling includes the top clear-effect peaks plus every evaluable exact
+promoter peak for a persistent gene.
+
+```{r balanced-downsampling-functions}
+downsample_effect_stability <- function(
+  count_matrix,
+  full_effects,
+  required_features,
+  maximum_features_per_population,
+  random_seed
+) {
+  set.seed(random_seed)
+  cell_library_sizes <- Matrix::colSums(count_matrix)
+  iteration_results <- list()
+  result_index <- 1L
+
+  for (population_index in seq_len(nrow(population_definitions))) {
+    population_id <- population_definitions$comparison_population[[
+      population_index
+    ]]
+    member_units <- population_definitions$member_units[[
+      population_index
+    ]]
+
+    population_effects <- full_effects |>
+      dplyr::filter(comparison_population == population_id)
+
+    required_rows <- population_effects |>
+      dplyr::filter(feature %in% required_features)
+
+    top_rows <- population_effects |>
+      dplyr::slice_max(
+        order_by = abs(log2FC_comparison_vs_reference),
+        n = maximum_features_per_population,
+        with_ties = FALSE
+      )
+
+    selected_effects <- dplyr::bind_rows(
+      required_rows,
+      top_rows
+    ) |>
+      dplyr::distinct(feature, .keep_all = TRUE)
+
+    if (nrow(selected_effects) == 0L) {
+      next
+    }
+
+    feature_index <- match(
+      selected_effects$feature,
+      rownames(count_matrix)
+    )
+    valid_features <- !is.na(feature_index)
+    selected_effects <- selected_effects[valid_features, , drop = FALSE]
+    feature_index <- feature_index[valid_features]
+
+    reference_cells <- metadata$cell_barcode[
+      metadata$analysis_unit %in% member_units &
+        metadata$diet == REFERENCE_DIET
+    ]
+    comparison_cells <- metadata$cell_barcode[
+      metadata$analysis_unit %in% member_units &
+        metadata$diet == COMPARISON_DIET
+    ]
+
+    sampled_nuclei <- min(
+      length(reference_cells),
+      length(comparison_cells),
+      DOWNSAMPLING_MAX_CELLS_PER_DIET
+    )
+
+    if (sampled_nuclei < 1L) {
+      next
+    }
+
+    for (iteration in seq_len(DOWNSAMPLING_ITERATIONS)) {
+      sampled_reference <- sample(
+        reference_cells,
+        sampled_nuclei,
+        replace = FALSE
+      )
+      sampled_comparison <- sample(
+        comparison_cells,
+        sampled_nuclei,
+        replace = FALSE
+      )
+
+      sampled_reference_counts <- Matrix::rowSums(
+        count_matrix[
+          feature_index,
+          sampled_reference,
+          drop = FALSE
+        ]
+      )
+      sampled_comparison_counts <- Matrix::rowSums(
+        count_matrix[
+          feature_index,
+          sampled_comparison,
+          drop = FALSE
+        ]
+      )
+
+      sampled_reference_cpm <-
+        1e6 * sampled_reference_counts /
+        sum(cell_library_sizes[sampled_reference])
+      sampled_comparison_cpm <-
+        1e6 * sampled_comparison_counts /
+        sum(cell_library_sizes[sampled_comparison])
+
+      iteration_results[[result_index]] <- tibble::tibble(
+        comparison_population = population_id,
+        feature = selected_effects$feature,
+        iteration = iteration,
+        sampled_nuclei_per_diet = sampled_nuclei,
+        downsampled_log2FC = log2(
+          (sampled_comparison_cpm + CPM_PSEUDOCOUNT) /
+            (sampled_reference_cpm + CPM_PSEUDOCOUNT)
+        ),
+        full_log2FC =
+          selected_effects$log2FC_comparison_vs_reference
+      )
+
+      result_index <- result_index + 1L
+    }
+  }
+
+  stability_iterations <- dplyr::bind_rows(iteration_results)
+
+  if (nrow(stability_iterations) == 0L) {
+    stop("Balanced downsampling produced no results.", call. = FALSE)
+  }
+
+  stability_iterations |>
+    dplyr::group_by(comparison_population, feature) |>
+    dplyr::summarise(
+      sampled_nuclei_per_diet = dplyr::first(
+        sampled_nuclei_per_diet
+      ),
+      full_log2FC = dplyr::first(full_log2FC),
+      downsampled_log2FC_median = stats::median(
+        downsampled_log2FC
+      ),
+      downsampled_log2FC_q25 = stats::quantile(
+        downsampled_log2FC,
+        0.25
+      ),
+      downsampled_log2FC_q75 = stats::quantile(
+        downsampled_log2FC,
+        0.75
+      ),
+      sign_concordance_percent = 100 * mean(
+        sign(downsampled_log2FC) == sign(full_log2FC)
+      ),
+      .groups = "drop"
+    )
+}
+```
+
+```{r run-rna-downsampling}
+reference_genes <- read_table_quietly(REFERENCE_GENE_PATH)
+
+assert_columns(
+  reference_genes,
+  c(
+    "gene",
+    "reference_direction",
+    "reference_program",
+    "source_rank",
+    "avg_log2FC_day21",
+    "avg_log2FC_day50",
+    "source_file"
+  ),
+  "persistent HFD reference table"
+)
+
+reference_genes <- reference_genes |>
+  dplyr::mutate(
+    gene = dplyr::recode(gene, Atpif1 = "Atp5if1")
+  ) |>
+  dplyr::distinct(gene, .keep_all = TRUE)
+
+if (
+  any(!reference_genes$reference_direction %in%
+    c("HFD_higher", "CON_higher")) ||
+    any(!reference_genes$reference_program %in%
+      c("persistent_HFD_up", "persistent_HFD_down"))
+) {
+  stop("The persistent reference contains invalid directions.", call. = FALSE)
+}
+
+source_direction_mismatch <- reference_genes |>
+  dplyr::filter(
+    (reference_direction == "HFD_higher" &
+      avg_log2FC_day21 <= 0) |
+      (reference_direction == "CON_higher" &
+        avg_log2FC_day21 >= 0)
+  )
+
+if (nrow(source_direction_mismatch) > 0L) {
+  stop(
+    "At least one day-21 source effect disagrees with its stored direction.",
+    call. = FALSE
+  )
+}
+
+rna_stability <- downsample_effect_stability(
+  count_matrix = rna_counts,
+  full_effects = rna_effects,
+  required_features = reference_genes$gene,
+  maximum_features_per_population =
+    DOWNSAMPLING_MAX_FEATURES_PER_POPULATION,
+  random_seed = 20260916
+)
+
+readr::write_csv(
+  rna_stability,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "RNA_balanced_downsampling_stability.csv"
+  )
+)
+```
+
+# 8. Build persistent-gene RNA evidence
+
+Positive `RNA_reference_aligned_log2FC` means that WT agrees with the source
+direction, regardless of whether the source gene was HFD-up or HFD-down.
+
+```{r build-persistent-rna-evidence}
+rna_stability_key <- prepare_stability(
+  rna_stability,
+  "RNA_"
+) |>
+  dplyr::rename(gene = feature)
+
+population_key <- population_support |>
+  dplyr::select(
+    comparison_population,
+    display_label,
+    source_population,
+    analysis_role,
+    member_units,
+    cell_support_tier,
+    primary_RNA_ATAC
+  )
+
+rna_effect_key <- rna_effects |>
+  dplyr::select(
+    comparison_population,
+    feature,
+    reference_nuclei,
+    comparison_nuclei,
+    reference_counts,
+    comparison_counts,
+    total_counts,
+    reference_CPM,
+    comparison_CPM,
+    log2FC_comparison_vs_reference,
+    reference_percent_detected,
+    comparison_percent_detected,
+    detection_difference_percentage_points
+  ) |>
+  dplyr::rename(gene = feature) |>
+  dplyr::mutate(RNA_effect_available = TRUE)
+
+rna_persistent_evidence <- tidyr::crossing(
+  reference_genes,
+  population_key
+) |>
+  dplyr::left_join(
+    rna_effect_key,
+    by = c("comparison_population", "gene")
+  ) |>
+  dplyr::left_join(
+    rna_stability_key,
+    by = c("comparison_population", "gene")
+  ) |>
+  dplyr::mutate(
+    gene_in_RNA_assay = gene %in% rownames(rna_counts),
+    RNA_effect_available = dplyr::coalesce(
+      RNA_effect_available,
+      FALSE
+    ),
+    RNA_observed_direction = observed_direction(
+      log2FC_comparison_vs_reference
+    ),
+    RNA_reference_aligned_log2FC = reference_aligned_effect(
+      log2FC_comparison_vs_reference,
+      reference_direction
+    ),
+    RNA_reference_direction_concordant = dplyr::case_when(
+      !RNA_effect_available ~ NA,
+      RNA_reference_aligned_log2FC > 0 ~ TRUE,
+      RNA_reference_aligned_log2FC < 0 ~ FALSE,
+      TRUE ~ NA
+    ),
+    RNA_clear_effect =
+      RNA_effect_available &
+      abs(log2FC_comparison_vs_reference) >= RNA_CLEAR_LOG2FC &
+      abs(detection_difference_percentage_points) >=
+        RNA_CLEAR_DETECTION_DELTA,
+    RNA_stability_available = !is.na(RNA_sign_concordance_percent),
+    RNA_direction_stable = dplyr::coalesce(
+      RNA_direction_stable,
+      FALSE
+    ),
+    RNA_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      RNA_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    RNA_evidence_class = dplyr::case_when(
+      !gene_in_RNA_assay ~ "absent_from_RNA_assay",
+      !RNA_effect_available ~ "below_RNA_effect_filters",
+      RNA_reference_aligned_log2FC > 0 &
+        RNA_clear_effect & RNA_direction_stable &
+        RNA_downsampling_iqr_excludes_zero ~
+        "concordant_clear_stable_IQR",
+      RNA_reference_aligned_log2FC > 0 &
+        RNA_clear_effect & RNA_direction_stable ~
+        "concordant_clear_stable",
+      RNA_reference_aligned_log2FC > 0 & RNA_clear_effect ~
+        "concordant_clear_unstable",
+      RNA_reference_aligned_log2FC > 0 ~
+        "concordant_subthreshold",
+      RNA_reference_aligned_log2FC < 0 &
+        RNA_clear_effect & RNA_direction_stable &
+        RNA_downsampling_iqr_excludes_zero ~
+        "discordant_clear_stable_IQR",
+      RNA_reference_aligned_log2FC < 0 &
+        RNA_clear_effect & RNA_direction_stable ~
+        "discordant_clear_stable",
+      RNA_reference_aligned_log2FC < 0 & RNA_clear_effect ~
+        "discordant_clear_unstable",
+      RNA_reference_aligned_log2FC < 0 ~
+        "discordant_subthreshold",
+      TRUE ~ "no_directional_change"
+    )
+  ) |>
+  dplyr::arrange(
+    factor(
+      analysis_role,
+      levels = c(
+        "source_matched_primary",
+        "sensitivity",
+        "component"
+      )
+    ),
+    comparison_population,
+    reference_program,
+    source_rank
+  )
+
+readr::write_csv(
+  rna_persistent_evidence,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_RNA_evidence_by_matched_population.csv.gz"
+  )
+)
+
+rna_persistent_evidence |>
+  dplyr::filter(primary_RNA_ATAC) |>
+  dplyr::count(
+    comparison_population,
+    reference_program,
+    RNA_evidence_class
+  )
+```
+
+# 9. Confirm strict unit-8 provenance
+
+The recomputed `strict_ISC` pooled effect must reproduce Step 8. Step 8 is not
+rewritten or reinterpreted by this notebook.
+
+```{r audit-strict-step8-reproduction}
+strict_step8 <- read_table_quietly(STRICT_STEP8_RNA_PATH)
+
+assert_columns(
+  strict_step8,
+  c(
+    "gene",
+    "RNA_effect_available",
+    "log2FC_comparison_vs_reference",
+    "detection_difference_percentage_points"
+  ),
+  "strict Step 8 RNA summary"
+)
+
+strict_recomputed <- rna_persistent_evidence |>
+  dplyr::filter(comparison_population == "strict_ISC") |>
+  dplyr::select(
+    gene,
+    recomputed_effect_available = RNA_effect_available,
+    recomputed_log2FC = log2FC_comparison_vs_reference,
+    recomputed_detection_delta =
+      detection_difference_percentage_points
+  )
+
+strict_reproduction_audit <- strict_step8 |>
+  dplyr::select(
+    gene,
+    upstream_effect_available = RNA_effect_available,
+    upstream_log2FC = log2FC_comparison_vs_reference,
+    upstream_detection_delta =
+      detection_difference_percentage_points
+  ) |>
+  dplyr::full_join(strict_recomputed, by = "gene") |>
+  dplyr::mutate(
+    gene_present_in_both =
+      !is.na(upstream_effect_available) &
+      !is.na(recomputed_effect_available),
+    availability_matches =
+      upstream_effect_available == recomputed_effect_available,
+    log2FC_absolute_difference = abs(
+      upstream_log2FC - recomputed_log2FC
+    ),
+    detection_delta_absolute_difference = abs(
+      upstream_detection_delta - recomputed_detection_delta
+    ),
+    reproduction_pass =
+      gene_present_in_both &
+      availability_matches &
+      (
+        !upstream_effect_available |
+          (
+            log2FC_absolute_difference <= 1e-8 &
+              detection_delta_absolute_difference <= 1e-8
+          )
+      )
+  )
+
+readr::write_csv(
+  strict_reproduction_audit,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "strict_Step8_unit8_reproduction_audit.csv"
+  )
+)
+
+if (any(!strict_reproduction_audit$reproduction_pass)) {
+  stop(
+    "The Step 8B strict_ISC recomputation does not reproduce Step 8. ",
+    "Do not interpret regrouped results until the audit is resolved.",
+    call. = FALSE
+  )
+}
+```
+
+# 10. Test persistent lists by ranked enrichment
+
+Ranked enrichment uses every gene that passes the population-specific RNA
+count and detection filters. A positive NES for `persistent_HFD_up` and a
+negative NES for `persistent_HFD_down` agree with the source. Because the two
+diets are single pooled libraries, enrichment P values do not quantify
+mouse-to-mouse reproducibility.
+
+```{r run-ranked-persistent-enrichment}
+persistent_pathways <- split(
+  reference_genes$gene,
+  reference_genes$reference_program
+)
+
+run_one_ranked_enrichment <- function(population_id) {
+  population_effects <- rna_effects |>
+    dplyr::filter(comparison_population == population_id) |>
+    dplyr::filter(is.finite(log2FC_comparison_vs_reference)) |>
+    dplyr::arrange(dplyr::desc(log2FC_comparison_vs_reference))
+
+  ranked_statistics <- population_effects$log2FC_comparison_vs_reference
+  names(ranked_statistics) <- population_effects$feature
+  ranked_statistics <- sort(ranked_statistics, decreasing = TRUE)
+
+  enrichment <- fgsea::fgseaMultilevel(
+    pathways = persistent_pathways,
+    stats = ranked_statistics,
+    minSize = FGSEA_MIN_SIZE,
+    maxSize = FGSEA_MAX_SIZE,
+    eps = 0,
+    scoreType = "std"
+  ) |>
+    as.data.frame()
+
+  if (nrow(enrichment) == 0L) {
+    return(tibble::tibble())
+  }
+
+  enrichment |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      comparison_population = population_id,
+      leadingEdge = vapply(
+        leadingEdge,
+        paste,
+        collapse = ";",
+        FUN.VALUE = character(1)
+      ),
+      expected_NES_direction = dplyr::if_else(
+        pathway == "persistent_HFD_up",
+        "positive",
+        "negative"
+      ),
+      expected_direction_recovered = dplyr::if_else(
+        pathway == "persistent_HFD_up",
+        NES > 0,
+        NES < 0
+      )
+    )
+}
+
+ranked_enrichment <- dplyr::bind_rows(
+  lapply(
+    population_definitions$comparison_population,
+    run_one_ranked_enrichment
+  )
+) |>
+  dplyr::left_join(
+    population_support |>
+      dplyr::select(
+        comparison_population,
+        display_label,
+        analysis_role,
+        cell_support_tier
+      ),
+    by = "comparison_population"
+  ) |>
+  dplyr::arrange(analysis_role, comparison_population, pathway)
+
+readr::write_csv(
+  ranked_enrichment,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_program_ranked_RNA_enrichment.csv"
+  )
+)
+
+ranked_enrichment |>
+  dplyr::filter(comparison_population %in% primary_populations) |>
+  dplyr::select(
+    comparison_population,
+    pathway,
+    size,
+    NES,
+    pval,
+    padj,
+    expected_direction_recovered
+  )
+```
+
+# 11. Quantify annotation-boundary sensitivity
+
+These comparisons test whether a composite result is carried by one of its
+components. They do not represent independent samples.
+
+```{r calculate-population-sensitivity}
+sensitivity_pairs <- tibble::tribble(
+  ~primary_population, ~comparator_population, ~comparison_type,
+  "broad_stem", "strict_ISC", "strict_anchor",
+  "broad_stem", "crypt_progenitor", "component",
+  "broad_goblet_all", "core_goblet", "unit13_exclusion",
+  "broad_goblet_all", "immature_goblet_4", "component",
+  "broad_goblet_all", "mature_goblet_5", "component",
+  "broad_goblet_all", "immature_goblet_7", "component",
+  "broad_goblet_all", "immature_goblet_13", "component"
+)
+
+primary_sensitivity_values <- rna_persistent_evidence |>
+  dplyr::select(
+    gene,
+    comparison_population,
+    primary_effect_available = RNA_effect_available,
+    primary_log2FC = log2FC_comparison_vs_reference,
+    primary_clear_effect = RNA_clear_effect,
+    primary_direction_stable = RNA_direction_stable
+  )
+
+comparator_sensitivity_values <- rna_persistent_evidence |>
+  dplyr::select(
+    gene,
+    comparison_population,
+    comparator_effect_available = RNA_effect_available,
+    comparator_log2FC = log2FC_comparison_vs_reference,
+    comparator_clear_effect = RNA_clear_effect,
+    comparator_direction_stable = RNA_direction_stable
+  )
+
+sensitivity_gene_evidence <- tidyr::crossing(
+  sensitivity_pairs,
+  gene = reference_genes$gene
+) |>
+  dplyr::left_join(
+    primary_sensitivity_values,
+    by = c(
+      "primary_population" = "comparison_population",
+      "gene" = "gene"
+    )
+  ) |>
+  dplyr::left_join(
+    comparator_sensitivity_values,
+    by = c(
+      "comparator_population" = "comparison_population",
+      "gene" = "gene"
+    )
+  ) |>
+  dplyr::mutate(
+    both_evaluable =
+      primary_effect_available & comparator_effect_available,
+    direction_agrees = dplyr::case_when(
+      !both_evaluable ~ NA,
+      sign(primary_log2FC) == sign(comparator_log2FC) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    both_clear = primary_clear_effect & comparator_clear_effect,
+    both_stable =
+      primary_direction_stable & comparator_direction_stable
+  )
+
+sensitivity_summary <- sensitivity_gene_evidence |>
+  dplyr::group_by(
+    primary_population,
+    comparator_population,
+    comparison_type
+  ) |>
+  dplyr::summarise(
+    persistent_genes = dplyr::n(),
+    genes_evaluable_in_both = sum(both_evaluable),
+    genes_same_direction = sum(direction_agrees %in% TRUE),
+    genes_opposite_direction = sum(direction_agrees %in% FALSE),
+    same_direction_percent = 100 * genes_same_direction /
+      pmax(1L, genes_evaluable_in_both),
+    clear_in_both = sum(both_clear, na.rm = TRUE),
+    stable_in_both = sum(both_stable, na.rm = TRUE),
+    spearman_effect_correlation = safe_spearman(
+      primary_log2FC[both_evaluable],
+      comparator_log2FC[both_evaluable]
+    ),
+    .groups = "drop"
+  )
+
+candidate_sensitivity_summary <- sensitivity_gene_evidence |>
+  dplyr::filter(primary_effect_available) |>
+  dplyr::group_by(primary_population, gene) |>
+  dplyr::summarise(
+    sensitivity_comparators = dplyr::n(),
+    sensitivity_comparators_evaluable = sum(comparator_effect_available),
+    sensitivity_comparators_same_direction = sum(
+      direction_agrees %in% TRUE
+    ),
+    sensitivity_comparators_opposite_direction = sum(
+      direction_agrees %in% FALSE
+    ),
+    all_evaluable_sensitivities_agree =
+      sensitivity_comparators_evaluable > 0L &
+      sensitivity_comparators_opposite_direction == 0L,
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  sensitivity_gene_evidence,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_population_sensitivity.csv.gz"
+  )
+)
+readr::write_csv(
+  sensitivity_summary,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "population_sensitivity_summary.csv"
+  )
+)
+
+sensitivity_summary
+```
+
+# 12. Create concordant and discordant RNA candidate tables
+
+Candidate tables are created before ORA. `direction_stable` refers only to
+cell-sampling stability, not mouse-level replication.
+
+```{r create-rna-candidate-tables}
+primary_rna_candidates <- rna_persistent_evidence |>
+  dplyr::filter(primary_RNA_ATAC) |>
+  dplyr::left_join(
+    candidate_sensitivity_summary,
+    by = c(
+      "comparison_population" = "primary_population",
+      "gene"
+    )
+  ) |>
+  dplyr::mutate(
+    candidate_direction = dplyr::case_when(
+      RNA_reference_direction_concordant %in% TRUE ~ "concordant",
+      RNA_reference_direction_concordant %in% FALSE ~ "discordant",
+      TRUE ~ "not_evaluable"
+    ),
+    candidate_priority = dplyr::case_when(
+      !RNA_effect_available ~ "not_evaluable",
+      candidate_direction == "concordant" &
+        RNA_clear_effect & RNA_direction_stable &
+        RNA_downsampling_iqr_excludes_zero ~
+        "concordant_clear_stable_IQR",
+      candidate_direction == "concordant" &
+        RNA_clear_effect & RNA_direction_stable ~
+        "concordant_clear_stable",
+      candidate_direction == "concordant" & RNA_clear_effect ~
+        "concordant_clear",
+      candidate_direction == "concordant" ~
+        "concordant_subthreshold",
+      candidate_direction == "discordant" &
+        RNA_clear_effect & RNA_direction_stable &
+        RNA_downsampling_iqr_excludes_zero ~
+        "discordant_clear_stable_IQR",
+      candidate_direction == "discordant" &
+        RNA_clear_effect & RNA_direction_stable ~
+        "discordant_clear_stable",
+      candidate_direction == "discordant" & RNA_clear_effect ~
+        "discordant_clear",
+      candidate_direction == "discordant" ~
+        "discordant_subthreshold",
+      TRUE ~ "not_evaluable"
+    )
+  ) |>
+  dplyr::group_by(comparison_population, candidate_priority) |>
+  dplyr::arrange(
+    dplyr::desc(abs(RNA_reference_aligned_log2FC)),
+    source_rank,
+    .by_group = TRUE
+  ) |>
+  dplyr::mutate(within_priority_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+concordant_candidates <- primary_rna_candidates |>
+  dplyr::filter(candidate_direction == "concordant") |>
+  dplyr::arrange(
+    comparison_population,
+    dplyr::desc(RNA_clear_effect),
+    dplyr::desc(RNA_direction_stable),
+    dplyr::desc(abs(RNA_reference_aligned_log2FC))
+  )
+
+discordant_candidates <- primary_rna_candidates |>
+  dplyr::filter(candidate_direction == "discordant") |>
+  dplyr::arrange(
+    comparison_population,
+    dplyr::desc(RNA_clear_effect),
+    dplyr::desc(RNA_direction_stable),
+    dplyr::desc(abs(RNA_reference_aligned_log2FC))
+  )
+
+readr::write_csv(
+  primary_rna_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_primary_RNA_candidate_inventory.csv"
+  )
+)
+readr::write_csv(
+  concordant_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_concordant_RNA_candidates.csv"
+  )
+)
+readr::write_csv(
+  discordant_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_discordant_RNA_candidates.csv"
+  )
+)
+
+primary_rna_candidates |>
+  dplyr::count(
+    comparison_population,
+    reference_program,
+    candidate_priority
+  )
+```
+
+# 13. Perform targeted MSigDB ORA
+
+ORA asks whether stable, clear concordant or discordant candidates are
+enriched for Hallmark or GO Biological Process terms relative to persistent
+genes evaluable in the same WT population. This deliberately narrow universe
+tests structure within the supplied persistent lists; it is not a genome-wide
+discovery analysis.
+
+```{r prepare-msigdb-collections}
+get_msigdb_collection <- function(
+    collection,
+    subcollection = NULL
+) {
+  msigdbr_arguments <- list(
+    db_species = "MM",
+    species = "Mus musculus",
+    collection = collection
+  )
+
+  if (!is.null(subcollection)) {
+    msigdbr_arguments$subcollection <- subcollection
+  }
+
+  do.call(
+    msigdbr::msigdbr,
+    msigdbr_arguments
+  )
+}
+
+hallmark_msigdb <- get_msigdb_collection(
+  collection = "MH"
+) |>
+  dplyr::transmute(
+    collection = "Hallmark",
+    gene_set = gs_name,
+    gene = gene_symbol
+  ) |>
+  dplyr::distinct()
+
+go_bp_msigdb <- get_msigdb_collection(
+  collection = "M5",
+  subcollection = "GO:BP"
+) |>
+  dplyr::transmute(
+    collection = "GO Biological Process",
+    gene_set = gs_name,
+    gene = gene_symbol
+  ) |>
+  dplyr::distinct()
+
+msigdb_pathways <- dplyr::bind_rows(
+  hallmark_msigdb,
+  go_bp_msigdb
+) |>
+  dplyr::distinct(collection, gene_set, gene)
+
+empty_ora_result <- tibble::tibble(
+  comparison_population = character(),
+  ora_query = character(),
+  collection = character(),
+  gene_set = character(),
+  pathway_size_in_universe = integer(),
+  overlap_genes = character(),
+  overlap_n = integer(),
+  universe_n = integer(),
+  query_n = integer(),
+  p_value = double(),
+  fold_enrichment = double(),
+  p_adj = double()
+)
+
+msigdb_audit <- tibble::tibble(
+  msigdbr_version = as.character(
+    utils::packageVersion("msigdbr")
+  ),
+  species = "Mus musculus",
+  collection = c("Hallmark", "GO_Biological_Process"),
+  pathway_gene_rows = c(
+    nrow(hallmark_msigdb),
+    nrow(go_bp_msigdb)
+  ),
+  note = paste(
+    "MSigDB terms are used for targeted interpretation after candidate",
+    "definition; pooled-library design remains descriptive."
+  )
+)
+
+readr::write_csv(
+  msigdb_audit,
+  file.path(STEP8B_DIR, "msigdb_input_audit.csv")
+)
+```
+
+```{r run-targeted-ora}
+ora_query_grid <- tidyr::crossing(
+  comparison_population = primary_populations,
+  candidate_direction = c("concordant", "discordant"),
+  reference_program = c(
+    "persistent_HFD_up",
+    "persistent_HFD_down"
+  )
+) |>
+  dplyr::mutate(
+    ora_query = paste(
+      candidate_direction,
+      reference_program,
+      sep = "__"
+    )
+  )
+
+ora_candidate_sets <- dplyr::bind_rows(
+  lapply(
+    seq_len(nrow(ora_query_grid)),
+    function(query_index) {
+      query_row <- ora_query_grid[query_index, , drop = FALSE]
+      query_genes <- primary_rna_candidates |>
+        dplyr::filter(
+          comparison_population ==
+            query_row$comparison_population[[1]],
+          candidate_direction == query_row$candidate_direction[[1]],
+          reference_program == query_row$reference_program[[1]],
+          RNA_effect_available,
+          RNA_clear_effect,
+          RNA_direction_stable
+        ) |>
+        dplyr::pull(gene) |>
+        unique()
+
+      query_row |>
+        dplyr::transmute(
+          comparison_population,
+          ora_query,
+          query_genes = list(query_genes)
+        )
+    }
+  )
+)
+
+ora_universes <- primary_rna_candidates |>
+  dplyr::filter(RNA_effect_available) |>
+  dplyr::group_by(comparison_population) |>
+  dplyr::summarise(
+    universe_genes = list(unique(gene)),
+    .groups = "drop"
+  )
+
+run_one_ora <- function(
+  population_id,
+  query_label,
+  query_genes,
+  universe_genes
+) {
+  query_genes <- intersect(unique(query_genes), universe_genes)
+  universe_genes <- unique(universe_genes)
+
+  if (length(query_genes) < ORA_MIN_QUERY_GENES) {
+    return(empty_ora_result)
+  }
+
+  pathway_counts <- msigdb_pathways |>
+    dplyr::filter(gene %in% universe_genes) |>
+    dplyr::group_by(collection, gene_set) |>
+    dplyr::summarise(
+      pathway_genes = list(unique(gene)),
+      pathway_size_in_universe = dplyr::n_distinct(gene),
+      .groups = "drop"
+    ) |>
+    dplyr::filter(
+      pathway_size_in_universe >=
+        ORA_MIN_PATHWAY_GENES_IN_UNIVERSE,
+      pathway_size_in_universe <=
+        ORA_MAX_PATHWAY_GENES_IN_UNIVERSE
+    )
+
+  if (nrow(pathway_counts) == 0L) {
+    return(empty_ora_result)
+  }
+
+  pathway_counts |>
+    dplyr::rowwise() |>
+    dplyr::mutate(
+      overlap_genes = list(
+        intersect(query_genes, pathway_genes)
+      ),
+      overlap_n = length(overlap_genes),
+      universe_n = length(universe_genes),
+      query_n = length(query_genes),
+      p_value = stats::phyper(
+        overlap_n - 1L,
+        pathway_size_in_universe,
+        universe_n - pathway_size_in_universe,
+        query_n,
+        lower.tail = FALSE
+      ),
+      fold_enrichment =
+        (overlap_n / query_n) /
+        (pathway_size_in_universe / universe_n),
+      overlap_genes = paste(
+        sort(overlap_genes),
+        collapse = ";"
+      )
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::filter(overlap_n > 0L) |>
+    dplyr::group_by(collection) |>
+    dplyr::mutate(p_adj = stats::p.adjust(p_value, method = "BH")) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      comparison_population = population_id,
+      ora_query = query_label,
+      .before = 1
+    )
+}
+
+ora_input_audit <- ora_candidate_sets |>
+  dplyr::left_join(ora_universes, by = "comparison_population") |>
+  dplyr::mutate(
+    query_n = lengths(query_genes),
+    universe_n = lengths(universe_genes),
+    ORA_run = query_n >= ORA_MIN_QUERY_GENES,
+    exclusion_reason = dplyr::if_else(
+      ORA_run,
+      NA_character_,
+      paste0("fewer than ", ORA_MIN_QUERY_GENES, " query genes")
+    )
+  )
+
+targeted_ora <- dplyr::bind_rows(
+  empty_ora_result,
+  lapply(
+    seq_len(nrow(ora_input_audit)),
+    function(query_index) {
+      run_one_ora(
+        population_id =
+          ora_input_audit$comparison_population[[query_index]],
+        query_label = ora_input_audit$ora_query[[query_index]],
+        query_genes = ora_input_audit$query_genes[[query_index]],
+        universe_genes =
+          ora_input_audit$universe_genes[[query_index]]
+      )
+    }
+  )
+)
+
+readr::write_csv(
+  ora_input_audit |>
+    dplyr::select(-query_genes, -universe_genes),
+  file.path(STEP8B_TABLE_DIR, "targeted_ORA_input_audit.csv")
+)
+readr::write_csv(
+  targeted_ora,
+  file.path(STEP8B_TABLE_DIR, "targeted_MSigDB_ORA_results.csv")
+)
+
+targeted_ora |>
+  dplyr::arrange(p_adj, dplyr::desc(fold_enrichment)) |>
+  dplyr::select(
+    comparison_population,
+    ora_query,
+    collection,
+    gene_set,
+    overlap_n,
+    fold_enrichment,
+    p_value,
+    p_adj,
+    overlap_genes
+  ) |>
+  utils::head(30)
+```
+
+# 14. Characterize ATAC effects independently
+
+ATAC effects are calculated without requiring RNA concordance. Peak context
+uses this priority: exact plus-or-minus 2-kb TSS overlap, gene-body overlap
+outside that promoter window, then intergenic. `nearest_gene` is descriptive
+context and is not a regulatory assignment.
+
+```{r annotate-atac-feature-context}
+annotation <- build_grcm39_annotation(GRCM39_GTF)
+gene_annotation <- annotation[
+  as.character(annotation$type) == "gene"
+]
+
+gene_annotation$gene_name <- as.character(
+  gene_annotation$gene_name
+)
+gene_annotation$gene_id <- as.character(gene_annotation$gene_id)
+
+compatible_genes <- as.character(
+  GenomeInfoDb::seqnames(gene_annotation)
+) %in% GenomeInfoDb::seqlevels(atac_ranges)
+gene_ranges <- gene_annotation[compatible_genes]
+
+gene_strand <- as.character(GenomicRanges::strand(gene_ranges))
+tss_position <- ifelse(
+  gene_strand == "-",
+  GenomicRanges::end(gene_ranges),
+  GenomicRanges::start(gene_ranges)
+)
+
+all_gene_promoters <- GenomicRanges::GRanges(
+  seqnames = GenomeInfoDb::seqnames(gene_ranges),
+  ranges = IRanges::IRanges(
+    start = pmax(1L, tss_position - TSS_WINDOW_BP),
+    end = tss_position + TSS_WINDOW_BP
+  ),
+  strand = "*"
+)
+
+body_hits <- GenomicRanges::findOverlaps(
+  atac_ranges,
+  gene_ranges,
+  ignore.strand = TRUE
+)
+promoter_hits <- GenomicRanges::findOverlaps(
+  atac_ranges,
+  all_gene_promoters,
+  ignore.strand = TRUE
+)
+
+peak_context <- rep("intergenic", length(atac_ranges))
+peak_context[unique(S4Vectors::queryHits(body_hits))] <-
+  "gene_body_nonpromoter"
+peak_context[unique(S4Vectors::queryHits(promoter_hits))] <-
+  "promoter_proximal"
+
+nearest_hits <- GenomicRanges::distanceToNearest(
+  atac_ranges,
+  gene_ranges,
+  ignore.strand = TRUE
+)
+
+nearest_gene <- rep(NA_character_, length(atac_ranges))
+nearest_gene_id <- rep(NA_character_, length(atac_ranges))
+nearest_gene_distance <- rep(NA_integer_, length(atac_ranges))
+
+nearest_gene[S4Vectors::queryHits(nearest_hits)] <-
+  gene_ranges$gene_name[S4Vectors::subjectHits(nearest_hits)]
+nearest_gene_id[S4Vectors::queryHits(nearest_hits)] <-
+  gene_ranges$gene_id[S4Vectors::subjectHits(nearest_hits)]
+nearest_gene_distance[S4Vectors::queryHits(nearest_hits)] <-
+  S4Vectors::mcols(nearest_hits)$distance
+
+atac_feature_context <- tibble::tibble(
+  peak = names(atac_ranges),
+  chromosome = as.character(GenomeInfoDb::seqnames(atac_ranges)),
+  peak_start = GenomicRanges::start(atac_ranges),
+  peak_end = GenomicRanges::end(atac_ranges),
+  genomic_context = peak_context,
+  nearest_gene = nearest_gene,
+  nearest_gene_id = nearest_gene_id,
+  nearest_gene_distance_bp = nearest_gene_distance
+)
+
+readr::write_csv(
+  atac_feature_context,
+  file.path(STEP8B_TABLE_DIR, "ATAC_feature_context_GRCm39.csv.gz")
+)
+```
+
+```{r calculate-atac-effects}
+atac_effects <- calculate_population_effects(
+  count_matrix = atac_counts,
+  feature_label = "peak",
+  minimum_total_counts = ATAC_MIN_TOTAL_COUNTS,
+  minimum_detection_percent = ATAC_MIN_DETECTION_PERCENT
+)
+
+atac_top_candidates <- select_top_effects(
+  effects = atac_effects,
+  absolute_log2fc_threshold = ATAC_CLEAR_LOG2FC,
+  top_features_per_direction = ATAC_TOP_FEATURES_PER_DIRECTION
+) |>
+  dplyr::left_join(
+    atac_feature_context,
+    by = c("feature" = "peak")
+  )
+
+readr::write_csv(
+  atac_effects,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "ATAC_pooled_library_effects_by_matched_population.csv.gz"
+  )
+)
+readr::write_csv(
+  atac_top_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "ATAC_top_diet_candidates_by_matched_population.csv"
+  )
+)
+```
+
+```{r run-atac-downsampling}
+promoter_peak_overlaps <- read_table_quietly(PROMOTER_OVERLAP_PATH)
+
+assert_columns(
+  promoter_peak_overlaps,
+  c(
+    "gene",
+    "gene_id",
+    "peak",
+    "transcriptional_offset_bp",
+    "peak_overlaps_tss"
+  ),
+  "persistent-gene promoter-overlap table"
+)
+
+promoter_geometry_columns <- c(
+  "gene",
+  "gene_id",
+  "chromosome",
+  "strand",
+  "tss",
+  "promoter_start",
+  "promoter_end",
+  "peak",
+  "peak_start",
+  "peak_end",
+  "peak_center",
+  "transcriptional_offset_bp",
+  "peak_overlaps_tss"
+)
+
+promoter_peak_overlaps <- promoter_peak_overlaps |>
+  dplyr::select(dplyr::all_of(promoter_geometry_columns)) |>
+  dplyr::distinct(gene_id, peak, .keep_all = TRUE)
+
+missing_promoter_peaks <- setdiff(
+  promoter_peak_overlaps$peak,
+  rownames(atac_counts)
+)
+
+if (length(missing_promoter_peaks) > 0L) {
+  stop(
+    "Step 8 promoter overlaps contain peaks absent from the WT ATAC assay.",
+    call. = FALSE
+  )
+}
+
+atac_stability <- downsample_effect_stability(
+  count_matrix = atac_counts,
+  full_effects = atac_effects,
+  required_features = unique(promoter_peak_overlaps$peak),
+  maximum_features_per_population =
+    DOWNSAMPLING_MAX_FEATURES_PER_POPULATION,
+  random_seed = 20260917
+)
+
+atac_stability_key <- prepare_stability(
+  atac_stability,
+  "ATAC_"
+) |>
+  dplyr::rename(peak = feature)
+
+readr::write_csv(
+  atac_stability,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "ATAC_balanced_downsampling_stability.csv"
+  )
+)
+
+atac_effect_summary <- atac_effects |>
+  dplyr::mutate(
+    direction = observed_direction(log2FC_comparison_vs_reference),
+    ATAC_clear_effect =
+      abs(log2FC_comparison_vs_reference) >= ATAC_CLEAR_LOG2FC
+  ) |>
+  dplyr::left_join(
+    atac_feature_context,
+    by = c("feature" = "peak")
+  ) |>
+  dplyr::left_join(
+    atac_stability_key,
+    by = c(
+      "comparison_population",
+      "feature" = "peak"
+    )
+  ) |>
+  dplyr::mutate(
+    ATAC_stability_evaluated = !is.na(
+      ATAC_sign_concordance_percent
+    ),
+    ATAC_direction_stable = dplyr::coalesce(
+      ATAC_direction_stable,
+      FALSE
+    )
+  ) |>
+  dplyr::group_by(
+    comparison_population,
+    display_label,
+    analysis_role,
+    cell_support_tier,
+    direction,
+    genomic_context
+  ) |>
+  dplyr::summarise(
+    filtered_peaks = dplyr::n(),
+    clear_effect_peaks = sum(ATAC_clear_effect),
+    stability_evaluated_peaks = sum(ATAC_stability_evaluated),
+    clear_stable_peaks = sum(
+      ATAC_clear_effect & ATAC_direction_stable
+    ),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  atac_effect_summary,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "ATAC_effect_summary_by_population_direction_context.csv"
+  )
+)
+
+atac_effect_summary |>
+  dplyr::filter(comparison_population %in% primary_populations)
+```
+
+# 15. Integrate RNA with exact promoter accessibility
+
+All exact promoter-overlapping peaks are retained in the peak-level table.
+The representative peak is the evaluable overlapping peak with the largest
+absolute ATAC effect and is used only for compact plotting.
+
+```{r build-exact-promoter-evidence}
+promoter_atac_effect_key <- atac_effects |>
+  dplyr::select(
+    comparison_population,
+    feature,
+    reference_nuclei,
+    comparison_nuclei,
+    reference_counts,
+    comparison_counts,
+    total_counts,
+    reference_CPM,
+    comparison_CPM,
+    log2FC_comparison_vs_reference,
+    reference_percent_detected,
+    comparison_percent_detected,
+    detection_difference_percentage_points
+  ) |>
+  dplyr::rename(peak = feature) |>
+  dplyr::mutate(ATAC_effect_available = TRUE)
+
+promoter_peak_evidence <- tidyr::crossing(
+  promoter_peak_overlaps,
+  population_key
+) |>
+  dplyr::left_join(
+    promoter_atac_effect_key,
+    by = c("comparison_population", "peak")
+  ) |>
+  dplyr::left_join(
+    atac_stability_key,
+    by = c("comparison_population", "peak")
+  ) |>
+  dplyr::left_join(
+    rna_persistent_evidence |>
+      dplyr::select(
+        comparison_population,
+        gene,
+        reference_direction,
+        reference_program,
+        source_rank,
+        avg_log2FC_day21,
+        avg_log2FC_day50,
+        RNA_effect_available,
+        RNA_observed_direction,
+        RNA_reference_aligned_log2FC,
+        RNA_clear_effect,
+        RNA_direction_stable,
+        RNA_downsampling_iqr_excludes_zero,
+        RNA_evidence_class
+      ),
+    by = c("comparison_population", "gene")
+  ) |>
+  dplyr::mutate(
+    ATAC_effect_available = dplyr::coalesce(
+      ATAC_effect_available,
+      FALSE
+    ),
+    ATAC_observed_direction = observed_direction(
+      log2FC_comparison_vs_reference
+    ),
+    ATAC_reference_aligned_log2FC = reference_aligned_effect(
+      log2FC_comparison_vs_reference,
+      reference_direction
+    ),
+    ATAC_source_direction_concordant = dplyr::case_when(
+      !ATAC_effect_available ~ NA,
+      ATAC_reference_aligned_log2FC > 0 ~ TRUE,
+      ATAC_reference_aligned_log2FC < 0 ~ FALSE,
+      TRUE ~ NA
+    ),
+    ATAC_clear_effect =
+      ATAC_effect_available &
+      abs(log2FC_comparison_vs_reference) >= ATAC_CLEAR_LOG2FC,
+    ATAC_stability_available = !is.na(
+      ATAC_sign_concordance_percent
+    ),
+    ATAC_direction_stable = dplyr::coalesce(
+      ATAC_direction_stable,
+      FALSE
+    ),
+    ATAC_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      ATAC_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    RNA_ATAC_direction_match = dplyr::case_when(
+      !RNA_effect_available | !ATAC_effect_available ~ NA,
+      sign(RNA_reference_aligned_log2FC) ==
+        sign(ATAC_reference_aligned_log2FC) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    promoter_support_class = dplyr::case_when(
+      !ATAC_effect_available ~ "promoter_peak_below_ATAC_filters",
+      RNA_ATAC_direction_match %in% TRUE &
+        ATAC_clear_effect & ATAC_direction_stable ~
+        "RNA_matched_clear_stable_promoter_ATAC",
+      RNA_ATAC_direction_match %in% TRUE & ATAC_clear_effect ~
+        "RNA_matched_clear_promoter_ATAC",
+      RNA_ATAC_direction_match %in% TRUE ~
+        "RNA_matched_subthreshold_promoter_ATAC",
+      RNA_ATAC_direction_match %in% FALSE & ATAC_clear_effect ~
+        "RNA_opposed_clear_promoter_ATAC",
+      RNA_ATAC_direction_match %in% FALSE ~
+        "RNA_opposed_subthreshold_promoter_ATAC",
+      TRUE ~ "not_classified"
+    )
+  ) |>
+  dplyr::arrange(
+    analysis_role,
+    comparison_population,
+    reference_program,
+    source_rank,
+    transcriptional_offset_bp
+  )
+
+readr::write_csv(
+  promoter_peak_evidence,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_exact_promoter_evidence_by_population_peak.csv.gz"
+  )
+)
+```
+
+```{r summarize-exact-promoter-evidence}
+promoter_gene_summary_observed <- promoter_peak_evidence |>
+  dplyr::filter(primary_RNA_ATAC) |>
+  dplyr::group_by(comparison_population, gene) |>
+  dplyr::summarise(
+    promoter_peaks_in_assay = dplyr::n_distinct(peak),
+    promoter_peaks_evaluable = dplyr::n_distinct(
+      peak[ATAC_effect_available]
+    ),
+    promoter_peaks_RNA_matched = dplyr::n_distinct(
+      peak[RNA_ATAC_direction_match %in% TRUE]
+    ),
+    promoter_peaks_RNA_opposed = dplyr::n_distinct(
+      peak[RNA_ATAC_direction_match %in% FALSE]
+    ),
+    promoter_peaks_RNA_matched_clear = dplyr::n_distinct(
+      peak[
+        RNA_ATAC_direction_match %in% TRUE &
+          ATAC_clear_effect
+      ]
+    ),
+    promoter_peaks_RNA_matched_clear_stable = dplyr::n_distinct(
+      peak[
+        RNA_ATAC_direction_match %in% TRUE &
+          ATAC_clear_effect & ATAC_direction_stable
+      ]
+    ),
+    promoter_peak_directions_mixed =
+      promoter_peaks_RNA_matched > 0L &
+      promoter_peaks_RNA_opposed > 0L,
+    .groups = "drop"
+  )
+
+representative_promoter_peak <- promoter_peak_evidence |>
+  dplyr::filter(primary_RNA_ATAC, ATAC_effect_available) |>
+  dplyr::mutate(
+    absolute_ATAC_log2FC = abs(log2FC_comparison_vs_reference)
+  ) |>
+  dplyr::group_by(comparison_population, gene) |>
+  dplyr::arrange(
+    dplyr::desc(absolute_ATAC_log2FC),
+    abs(transcriptional_offset_bp),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = 1L) |>
+  dplyr::ungroup() |>
+  dplyr::transmute(
+    comparison_population,
+    gene,
+    representative_promoter_peak = peak,
+    representative_peak_offset_bp = transcriptional_offset_bp,
+    representative_peak_overlaps_TSS = peak_overlaps_tss,
+    representative_ATAC_log2FC =
+      log2FC_comparison_vs_reference,
+    representative_ATAC_reference_aligned_log2FC =
+      ATAC_reference_aligned_log2FC,
+    representative_ATAC_clear_effect = ATAC_clear_effect,
+    representative_ATAC_direction_stable =
+      ATAC_direction_stable,
+    representative_RNA_ATAC_direction_match =
+      RNA_ATAC_direction_match,
+    representative_promoter_support_class =
+      promoter_support_class
+  )
+
+integrated_primary_candidates <- primary_rna_candidates |>
+  dplyr::left_join(
+    promoter_gene_summary_observed,
+    by = c("comparison_population", "gene")
+  ) |>
+  dplyr::left_join(
+    representative_promoter_peak,
+    by = c("comparison_population", "gene")
+  ) |>
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::starts_with("promoter_peaks_"),
+      ~ dplyr::coalesce(.x, 0L)
+    ),
+    promoter_peak_directions_mixed = dplyr::coalesce(
+      promoter_peak_directions_mixed,
+      FALSE
+    ),
+    integrated_priority = dplyr::case_when(
+      candidate_direction == "concordant" &
+        RNA_clear_effect & RNA_direction_stable &
+        promoter_peaks_RNA_matched_clear_stable > 0L ~
+        "Tier_1_stable_source_concordant_RNA_plus_matched_promoter_ATAC",
+      candidate_direction == "concordant" &
+        RNA_clear_effect & RNA_direction_stable ~
+        "Tier_2_stable_source_concordant_RNA",
+      candidate_direction == "concordant" & RNA_clear_effect ~
+        "Tier_3_source_concordant_clear_RNA",
+      candidate_direction == "discordant" &
+        RNA_clear_effect & RNA_direction_stable ~
+        "discordance_priority_stable_clear_RNA",
+      candidate_direction == "discordant" & RNA_clear_effect ~
+        "discordance_priority_clear_RNA",
+      candidate_direction == "concordant" ~
+        "concordant_subthreshold_RNA",
+      candidate_direction == "discordant" ~
+        "discordant_subthreshold_RNA",
+      TRUE ~ "not_evaluable"
+    )
+  ) |>
+  dplyr::arrange(
+    comparison_population,
+    factor(
+      integrated_priority,
+      levels = c(
+        "Tier_1_stable_source_concordant_RNA_plus_matched_promoter_ATAC",
+        "Tier_2_stable_source_concordant_RNA",
+        "Tier_3_source_concordant_clear_RNA",
+        "discordance_priority_stable_clear_RNA",
+        "discordance_priority_clear_RNA",
+        "concordant_subthreshold_RNA",
+        "discordant_subthreshold_RNA",
+        "not_evaluable"
+      )
+    ),
+    dplyr::desc(abs(RNA_reference_aligned_log2FC))
+  )
+
+readr::write_csv(
+  promoter_gene_summary_observed,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_exact_promoter_summary.csv"
+  )
+)
+readr::write_csv(
+  integrated_primary_candidates,
+  file.path(
+    STEP8B_TABLE_DIR,
+    "persistent_gene_integrated_primary_candidates.csv"
+  )
+)
+
+integrated_primary_candidates |>
+  dplyr::count(comparison_population, integrated_priority)
+```
+
+# 16. Generate review figures
+
+The primary source plots combine HFD-up and HFD-down genes on one signed
+axis. Green indicates directional agreement; red indicates disagreement.
+Point shape distinguishes clear and stable effects from weaker observations.
+
+```{r plot-source-versus-wt-rna}
+build_source_scatter <- function(source_column, source_time_label) {
+  plot_data <- rna_persistent_evidence |>
+    dplyr::filter(comparison_population == "broad_stem") |>
+    dplyr::mutate(
+      source_effect = .data[[source_column]],
+      direction_class = dplyr::case_when(
+        !RNA_effect_available ~ "not evaluable",
+        RNA_reference_direction_concordant %in% TRUE ~ "concordant",
+        RNA_reference_direction_concordant %in% FALSE ~ "discordant",
+        TRUE ~ "no directional change"
+      ),
+      evidence_shape = dplyr::case_when(
+        RNA_clear_effect & RNA_direction_stable ~ "clear + stable",
+        RNA_clear_effect ~ "clear; unstable",
+        RNA_effect_available ~ "subthreshold",
+        TRUE ~ "not evaluable"
+      )
+    )
+
+  label_data <- plot_data |>
+    dplyr::filter(RNA_clear_effect) |>
+    dplyr::slice_max(
+      order_by = abs(source_effect) +
+        abs(log2FC_comparison_vs_reference),
+      n = 18L,
+      with_ties = FALSE
+    )
+
+  ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = source_effect,
+      y = log2FC_comparison_vs_reference,
+      color = direction_class,
+      shape = evidence_shape
+    )
+  ) +
+    ggplot2::geom_hline(yintercept = 0, color = "grey65") +
+    ggplot2::geom_vline(xintercept = 0, color = "grey65") +
+    ggplot2::geom_point(size = 2.2, alpha = 0.80) +
+    ggplot2::geom_text(
+      data = label_data,
+      ggplot2::aes(label = gene),
+      color = "black",
+      size = 3,
+      check_overlap = TRUE,
+      nudge_y = 0.08,
+      show.legend = FALSE
+    ) +
+    ggplot2::scale_color_manual(
+      values = c(
+        concordant = "#009E73",
+        discordant = "#D55E00",
+        `no directional change` = "grey55",
+        `not evaluable` = "grey82"
+      )
+    ) +
+    ggplot2::labs(
+      title = paste0(
+        "Persistent genes: source ",
+        source_time_label,
+        " versus WT d21 broad stem"
+      ),
+      subtitle = paste(
+        "WT broad stem combines annotation units 8 and 6;",
+        "green agrees with the source direction and red opposes it."
+      ),
+      x = paste0("Source ", source_time_label, " HFD versus CON log2FC"),
+      y = "WT d21 broad-stem HFD versus CON log2FC",
+      color = "Direction",
+      shape = "WT evidence",
+      caption = paste(
+        "Descriptive pooled-library effects; diet and library are confounded."
+      )
+    ) +
+    theme_multiome(base_size = 12)
+}
+
+p_source_day21 <- build_source_scatter(
+  "avg_log2FC_day21",
+  "d21"
+)
+p_source_day50 <- build_source_scatter(
+  "avg_log2FC_day50",
+  "d50"
+)
+
+print(p_source_day21)
+save_native_pdf(
+  "01_source_d21_vs_WT_d21_broad_stem_RNA.pdf",
+  p_source_day21,
+  width = 11,
+  height = 8
+)
+print(p_source_day50)
+save_native_pdf(
+  "S01_source_d50_vs_WT_d21_broad_stem_RNA.pdf",
+  p_source_day50,
+  width = 11,
+  height = 8
+)
+```
+
+```{r plot-ranked-enrichment}
+ranked_plot_data <- ranked_enrichment |>
+  dplyr::mutate(
+    display_label = factor(
+      display_label,
+      levels = rev(population_support$display_label)
+    ),
+    expected_result = dplyr::if_else(
+      expected_direction_recovered,
+      "expected direction",
+      "opposite direction"
+    )
+  )
+
+p_ranked_enrichment <- ggplot2::ggplot(
+  ranked_plot_data,
+  ggplot2::aes(
+    x = NES,
+    y = display_label,
+    color = expected_result,
+    shape = pathway
+  )
+) +
+  ggplot2::geom_vline(xintercept = 0, color = "grey70") +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_color_manual(
+    values = c(
+      `expected direction` = "#009E73",
+      `opposite direction` = "#D55E00"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Ranked recovery of persistent HFD programs",
+    subtitle = paste(
+      "Expected: positive NES for persistent HFD-up and negative NES",
+      "for persistent HFD-down."
+    ),
+    x = "Normalized enrichment score",
+    y = NULL,
+    color = NULL,
+    shape = "Reference list",
+    caption = paste(
+      "Gene-rank enrichment is descriptive and is not evidence of",
+      "mouse-level reproducibility."
+    )
+  ) +
+  theme_multiome(base_size = 11)
+
+print(p_ranked_enrichment)
+save_native_pdf(
+  "02_persistent_program_ranked_RNA_enrichment.pdf",
+  p_ranked_enrichment,
+  width = 12,
+  height = 8
+)
+```
+
+```{r plot-population-sensitivity}
+sensitivity_plot_data <- sensitivity_gene_evidence |>
+  dplyr::filter(both_evaluable) |>
+  dplyr::mutate(
+    direction_class = dplyr::if_else(
+      direction_agrees,
+      "same direction",
+      "opposite direction"
+    ),
+    pair_label = paste0(
+      primary_population,
+      " vs ",
+      comparator_population
+    )
+  )
+
+p_sensitivity <- ggplot2::ggplot(
+  sensitivity_plot_data,
+  ggplot2::aes(
+    x = primary_log2FC,
+    y = comparator_log2FC,
+    color = direction_class
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75") +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75") +
+  ggplot2::geom_point(size = 1.3, alpha = 0.65) +
+  ggplot2::facet_wrap(~ pair_label, scales = "free", ncol = 2) +
+  ggplot2::scale_color_manual(
+    values = c(
+      `same direction` = "#0072B2",
+      `opposite direction` = "#D55E00"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Sensitivity of persistent-gene RNA effects to regrouping",
+    subtitle = paste(
+      "Each comparator overlaps its primary composite; this tests",
+      "annotation-boundary dependence, not replication."
+    ),
+    x = "Primary composite HFD versus CON log2FC",
+    y = "Sensitivity/component HFD versus CON log2FC",
+    color = NULL
+  ) +
+  theme_multiome(base_size = 10)
+
+print(p_sensitivity)
+save_native_pdf(
+  "03_persistent_gene_population_sensitivity.pdf",
+  p_sensitivity,
+  width = 13,
+  height = 12
+)
+```
+
+```{r plot-atac-effect-summary}
+atac_plot_data <- atac_effect_summary |>
+  dplyr::filter(
+    comparison_population %in% primary_populations,
+    clear_effect_peaks > 0L
+  ) |>
+  dplyr::mutate(
+    display_label = factor(
+      display_label,
+      levels = population_support$display_label[
+        population_support$comparison_population %in%
+          primary_populations
+      ]
+    )
+  )
+
+p_atac_summary <- ggplot2::ggplot(
+  atac_plot_data,
+  ggplot2::aes(
+    x = display_label,
+    y = clear_effect_peaks,
+    fill = genomic_context
+  )
+) +
+  ggplot2::geom_col() +
+  ggplot2::facet_wrap(~ direction, scales = "free_y") +
+  ggplot2::scale_fill_manual(
+    values = c(
+      promoter_proximal = "#CC79A7",
+      gene_body_nonpromoter = "#56B4E9",
+      intergenic = "#999999"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Independent ATAC diet-effect inventory",
+    subtitle = paste(
+      "Clear effect denotes absolute pooled-library log2FC >=",
+      ATAC_CLEAR_LOG2FC
+    ),
+    x = NULL,
+    y = "Clear-effect peaks",
+    fill = "Genomic context",
+    caption = paste(
+      "Nearest-gene and genomic-context labels are descriptive;",
+      "they do not establish regulation."
+    )
+  ) +
+  theme_multiome(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 25, hjust = 1)
+  )
+
+print(p_atac_summary)
+save_native_pdf(
+  "04_primary_population_ATAC_effect_inventory.pdf",
+  p_atac_summary,
+  width = 12,
+  height = 8
+)
+```
+
+```{r plot-rna-promoter-atac}
+promoter_plot_data <- integrated_primary_candidates |>
+  dplyr::filter(
+    RNA_effect_available,
+    !is.na(representative_ATAC_log2FC)
+  ) |>
+  dplyr::mutate(
+    RNA_ATAC_class = dplyr::if_else(
+      representative_RNA_ATAC_direction_match %in% TRUE,
+      "RNA and promoter ATAC match",
+      "RNA and promoter ATAC oppose"
+    )
+  )
+
+p_rna_promoter <- ggplot2::ggplot(
+  promoter_plot_data,
+  ggplot2::aes(
+    x = log2FC_comparison_vs_reference,
+    y = representative_ATAC_log2FC,
+    color = RNA_ATAC_class
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey70") +
+  ggplot2::geom_vline(xintercept = 0, color = "grey70") +
+  ggplot2::geom_point(size = 2, alpha = 0.75) +
+  ggplot2::facet_wrap(~ display_label, scales = "free") +
+  ggplot2::scale_color_manual(
+    values = c(
+      `RNA and promoter ATAC match` = "#009E73",
+      `RNA and promoter ATAC oppose` = "#D55E00"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Persistent-gene RNA and exact-promoter ATAC effects",
+    subtitle = paste(
+      "One representative exact promoter peak per gene is shown;",
+      "all peaks remain in the exported evidence table."
+    ),
+    x = "RNA HFD versus CON log2FC",
+    y = "Representative promoter ATAC HFD versus CON log2FC",
+    color = NULL,
+    caption = paste(
+      "Directional agreement is regulatory context, not proof of a",
+      "causal peak-to-gene relationship."
+    )
+  ) +
+  theme_multiome(base_size = 10)
+
+print(p_rna_promoter)
+save_native_pdf(
+  "05_persistent_gene_RNA_exact_promoter_ATAC.pdf",
+  p_rna_promoter,
+  width = 13,
+  height = 8
+)
+```
+
+# 17. Write completion summaries
+
+```{r write-completion-summary}
+primary_summary <- integrated_primary_candidates |>
+  dplyr::group_by(
+    comparison_population,
+    display_label,
+    source_population,
+    cell_support_tier
+  ) |>
+  dplyr::summarise(
+    persistent_genes = dplyr::n(),
+    RNA_effect_evaluable = sum(RNA_effect_available),
+    clear_stable_concordant_RNA = sum(
+      candidate_direction == "concordant" &
+        RNA_clear_effect & RNA_direction_stable
+    ),
+    clear_stable_discordant_RNA = sum(
+      candidate_direction == "discordant" &
+        RNA_clear_effect & RNA_direction_stable
+    ),
+    Tier_1_integrated_candidates = sum(
+      integrated_priority ==
+        "Tier_1_stable_source_concordant_RNA_plus_matched_promoter_ATAC"
+    ),
+    genes_with_evaluable_exact_promoter_ATAC = sum(
+      promoter_peaks_evaluable > 0L
+    ),
+    .groups = "drop"
+  )
+
+ranked_primary_summary <- ranked_enrichment |>
+  dplyr::filter(comparison_population %in% primary_populations) |>
+  dplyr::select(
+    comparison_population,
+    pathway,
+    NES,
+    pval,
+    padj,
+    expected_direction_recovered
+  ) |>
+  tidyr::pivot_wider(
+    names_from = pathway,
+    values_from = c(
+      NES,
+      pval,
+      padj,
+      expected_direction_recovered
+    ),
+    names_glue = "{pathway}_{.value}"
+  )
+
+step8b_primary_summary <- primary_summary |>
+  dplyr::left_join(
+    ranked_primary_summary,
+    by = "comparison_population"
+  ) |>
+  dplyr::mutate(
+    replicated_diet_design = FALSE,
+    biological_inference_performed = FALSE,
+    exact_promoter_integration_performed = TRUE,
+    distal_regulatory_integration_performed = FALSE,
+    HyperMet_overlay_performed = FALSE,
+    HypoImmune_overlay_performed = FALSE
+  )
+
+readr::write_csv(
+  step8b_primary_summary,
+  file.path(STEP8B_DIR, "step8b_primary_population_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 8B completed:", Sys.time()),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste(
+      "Analysis unit source:",
+      analysis_unit_column
+    ),
+    paste(
+      "Source-matched primary populations:",
+      paste(primary_populations, collapse = ",")
+    ),
+    paste(
+      "Persistent reference genes:",
+      nrow(reference_genes)
+    ),
+    "Strict Step 8 unit-8 reproduction passed: TRUE",
+    "Rank-based persistent-list enrichment performed: TRUE",
+    "Targeted MSigDB ORA performed after candidate definition: TRUE",
+    "Independent ATAC characterization performed: TRUE",
+    "Exact plus-or-minus 2-kb TSS integration performed: TRUE",
+    "Distal regulatory integration performed: FALSE",
+    "HyperMet overlay performed: FALSE",
+    "HypoImmune overlay performed: FALSE",
+    "Cross-genotype comparison performed: FALSE",
+    "Replicated diet inference performed: FALSE"
+  ),
+  con = file.path(STEP8B_DIR, "STEP_08B_COMPLETE.txt")
+)
+
+step8b_primary_summary
+```
+
+# Interpretation checkpoint
+
+Before carrying these benchmarks into PPAR or IL17, review:
+
+1. whether the broad-stem and all-goblet ranked enrichments recover the
+   expected directions;
+2. which clear and stable concordant or discordant genes depend on a single
+   component population;
+3. whether including unit 13 materially changes the all-goblet result;
+4. whether exact-promoter ATAC evidence supports, opposes, or is absent for
+   the leading RNA candidates; and
+5. whether any ORA term is driven by only one or two genes despite meeting the
+   numerical query threshold.
+
+None of these checks removes the pooled-library limitation. Final biological
+claims require replicated material or orthogonal validation.

@@ -1,0 +1,1962 @@
+---
+title: "Step 8C - Decompose the WT broad-stem diet response and prioritize regulatory loci"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 8B established that the source-matched WT broad-stem population (`8 + 6`) recovers both persistent HFD-associated RNA programs better than strict ISC-like unit 8 alone. It also showed a large diet-associated shift in the composition of that population: HFD contains many more crypt-progenitor unit-6 nuclei and fewer ISC-like unit-8 nuclei.
+
+Step 8C separates those two phenomena. It asks whether a broad-stem diet effect is attributable primarily to:
+
+1.  a response occurring in both component states;
+2.  a response concentrated in crypt-progenitor unit 6;
+3.  a response concentrated in ISC-like unit 8;
+4.  opposing effects in the two states; or
+5.  the changed unit-8/unit-6 mixture itself.
+
+The decomposition is performed on linear quantities so that the terms add exactly. RNA uses the mean per-cell library-normalized abundance (counts per 10,000); ATAC uses the fraction of nuclei with at least one fragment in each peak. Existing Step 8B pooled-library log2 fold changes remain beside these quantities as the familiar effect-size summaries.
+
+The notebook then creates stable, component-resolved ATAC peak sets for the next motif-enrichment checkpoint and reprioritizes persistent-gene exact promoter candidates. It does not perform motif enrichment itself. This keeps the peak-set definition inspectable before sequence motifs are tested.
+
+## Statistical limitation
+
+WT contains one pooled CON library and one pooled HFD library. Diet and library are perfectly confounded. The decomposition is an exact descriptive partition of these two pooled samples; it is not a replicate-aware estimate and does not recover mouse-level variance. Repeated cell downsampling checks sampling stability only.
+
+# 1. Setup
+
+Run in a fresh WT v2 R session:
+
+``` r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight(packages = required_packages)
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Signac)
+  library(Matrix)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+})
+
+ggplot2::theme_set(theme_multiome())
+future::plan(future::sequential)
+set.seed(20260918)
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 8C is defined for the WT v2 benchmark. Set ",
+    "MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+```
+
+# 2. Define inputs, outputs, and evidence rules
+
+```{r define-inputs-and-parameters}
+STEP6_DIR <- file.path(OUTPUT_DIR, "06_annotation")
+STEP8B_DIR <- file.path(
+  OUTPUT_DIR,
+  "08b_source_matched_persistent_hfd"
+)
+STEP8B_TABLE_DIR <- file.path(STEP8B_DIR, "tables")
+
+STEP8C_DIR <- file.path(
+  OUTPUT_DIR,
+  "08c_broad_stem_decomposition"
+)
+STEP8C_TABLE_DIR <- file.path(STEP8C_DIR, "tables")
+STEP8C_PLOT_DIR <- file.path(STEP8C_DIR, "plots")
+
+dir.create(STEP8C_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8C_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8C_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+STEP6_OBJECT_PATH <- file.path(
+  STEP6_DIR,
+  "multiome_annotated.rds"
+)
+STEP8B_COMPLETE_MARKER <- file.path(
+  STEP8B_DIR,
+  "STEP_08B_COMPLETE.txt"
+)
+REFERENCE_GENE_PATH <- file.path(
+  DATASET_CONFIG_DIR,
+  "reference_programs",
+  "persistent_hfd_genes.csv"
+)
+STEP8B_RNA_EFFECT_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "RNA_pooled_library_effects_by_matched_population.csv.gz"
+)
+STEP8B_ATAC_EFFECT_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "ATAC_pooled_library_effects_by_matched_population.csv.gz"
+)
+STEP8B_RNA_STABILITY_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "RNA_balanced_downsampling_stability.csv"
+)
+STEP8B_ATAC_CONTEXT_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "ATAC_feature_context_GRCm39.csv.gz"
+)
+STEP8B_PROMOTER_EVIDENCE_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "persistent_gene_exact_promoter_evidence_by_population_peak.csv.gz"
+)
+
+required_inputs <- c(
+  Step6_object = STEP6_OBJECT_PATH,
+  Step8B_marker = STEP8B_COMPLETE_MARKER,
+  persistent_reference = REFERENCE_GENE_PATH,
+  Step8B_RNA_effects = STEP8B_RNA_EFFECT_PATH,
+  Step8B_ATAC_effects = STEP8B_ATAC_EFFECT_PATH,
+  Step8B_RNA_stability = STEP8B_RNA_STABILITY_PATH,
+  Step8B_ATAC_context = STEP8B_ATAC_CONTEXT_PATH,
+  Step8B_promoter_evidence = STEP8B_PROMOTER_EVIDENCE_PATH
+)
+
+for (input_label in names(required_inputs)) {
+  assert_file(required_inputs[[input_label]], input_label)
+}
+
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+BROAD_STEM_UNITS <- c("8", "6")
+UNIT8 <- "8"
+UNIT6 <- "6"
+
+RNA_SCALE_FACTOR <- 10000
+RNA_LINEAR_PSEUDOCOUNT <- 0.01
+RNA_CLEAR_LOG2FC <- 0.50
+RNA_CLEAR_DETECTION_DELTA <- 5
+
+ATAC_CLEAR_LOG2FC <- 0.50
+ATAC_CLEAR_DETECTION_DELTA <- 2
+ATAC_DOWNSAMPLING_ITERATIONS <- 25L
+MINIMUM_SIGN_CONCORDANCE_PERCENT <- 80
+
+MINIMUM_MOTIF_SET_SIZE <- 25L
+PREVIEW_PLOTS_IN_RSTUDIO <- FALSE
+
+analysis_parameters <- tibble::tibble(
+  parameter = c(
+    "reference diet",
+    "comparison diet",
+    "broad-stem component units",
+    "RNA linear scale factor",
+    "RNA clear-effect absolute pooled log2FC",
+    "RNA clear-effect absolute detection delta",
+    "ATAC clear-effect absolute pooled log2FC",
+    "ATAC clear-effect absolute detection delta",
+    "ATAC downsampling iterations",
+    "minimum sign-concordance percent",
+    "minimum motif-set size",
+    "replicated diet design",
+    "biological inference performed"
+  ),
+  value = c(
+    REFERENCE_DIET,
+    COMPARISON_DIET,
+    paste(BROAD_STEM_UNITS, collapse = ";"),
+    RNA_SCALE_FACTOR,
+    RNA_CLEAR_LOG2FC,
+    RNA_CLEAR_DETECTION_DELTA,
+    ATAC_CLEAR_LOG2FC,
+    ATAC_CLEAR_DETECTION_DELTA,
+    ATAC_DOWNSAMPLING_ITERATIONS,
+    MINIMUM_SIGN_CONCORDANCE_PERCENT,
+    MINIMUM_MOTIF_SET_SIZE,
+    FALSE,
+    FALSE
+  )
+)
+
+readr::write_csv(
+  analysis_parameters,
+  file.path(STEP8C_DIR, "step8c_parameters.csv")
+)
+```
+
+# 3. Helper functions
+
+```{r helper-functions}
+read_table_quietly <- function(path) {
+  suppressMessages(
+    readr::read_csv(
+      path,
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+  )
+}
+
+assert_columns <- function(data, required_columns, table_label) {
+  missing_columns <- setdiff(required_columns, colnames(data))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      table_label,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+align_matrix_to_metadata <- function(
+  feature_matrix,
+  metadata_cells,
+  matrix_label
+) {
+  if (!setequal(colnames(feature_matrix), metadata_cells)) {
+    stop(
+      matrix_label,
+      " and Step 6 metadata do not contain the same cells.",
+      call. = FALSE
+    )
+  }
+
+  if (!identical(colnames(feature_matrix), metadata_cells)) {
+    message(matrix_label, " columns are being reordered to metadata.")
+    feature_matrix <- feature_matrix[
+      ,
+      metadata_cells,
+      drop = FALSE
+    ]
+  }
+
+  feature_matrix
+}
+
+# preview_plot <- function(plot_object) {
+#   if (isTRUE(PREVIEW_PLOTS_IN_RSTUDIO)) print(plot_object)
+#   invisible(plot_object)
+# }
+
+save_native_pdf <- function(
+  filename,
+  plot_object,
+  width = 11,
+  height = 7
+) {
+  output_path <- file.path(STEP8C_PLOT_DIR, filename)
+  grDevices::pdf(
+    file = output_path,
+    width = width,
+    height = height,
+    family = "Helvetica",
+    useDingbats = FALSE
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot_object)
+  invisible(output_path)
+}
+
+effect_direction <- function(effect) {
+  dplyr::case_when(
+    is.na(effect) ~ NA_character_,
+    effect > 0 ~ "HFD_higher",
+    effect < 0 ~ "CON_higher",
+    TRUE ~ "no_change"
+  )
+}
+
+source_aligned_effect <- function(effect, reference_direction) {
+  dplyr::case_when(
+    is.na(effect) ~ NA_real_,
+    reference_direction == "HFD_higher" ~ effect,
+    reference_direction == "CON_higher" ~ -effect,
+    TRUE ~ NA_real_
+  )
+}
+
+summarize_matrix_by_component <- function(
+  feature_matrix,
+  metadata,
+  value_label,
+  binary = FALSE
+) {
+  dplyr::bind_rows(
+    lapply(
+      BROAD_STEM_UNITS,
+      function(component_unit) {
+        dplyr::bind_rows(
+          lapply(
+            c(REFERENCE_DIET, COMPARISON_DIET),
+            function(diet_value) {
+              selected_cells <- metadata$cell_barcode[
+                metadata$analysis_unit == component_unit &
+                  metadata$diet == diet_value
+              ]
+
+              if (length(selected_cells) == 0L) {
+                stop(
+                  "No cells for unit ", component_unit,
+                  " and diet ", diet_value, ".",
+                  call. = FALSE
+                )
+              }
+
+              feature_values <- Matrix::rowMeans(
+                feature_matrix[, selected_cells, drop = FALSE]
+              )
+
+              tibble::tibble(
+                feature = rownames(feature_matrix),
+                component_unit = component_unit,
+                component = dplyr::recode(
+                  component_unit,
+                  `8` = "unit8",
+                  `6` = "unit6"
+                ),
+                diet = diet_value,
+                nuclei = length(selected_cells),
+                value = as.numeric(feature_values),
+                value_type = value_label,
+                binary = binary
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+}
+
+midpoint_decomposition <- function(
+  component_means,
+  component_proportions,
+  pseudocount,
+  scale_to_percentage_points = FALSE
+) {
+  means_wide <- component_means |>
+    dplyr::select(feature, component, diet, value) |>
+    tidyr::pivot_wider(
+      names_from = c(component, diet),
+      values_from = value,
+      names_glue = "{component}_{diet}"
+    )
+
+  required_mean_columns <- c(
+    "unit8_CON",
+    "unit8_HFD",
+    "unit6_CON",
+    "unit6_HFD"
+  )
+  assert_columns(
+    means_wide,
+    c("feature", required_mean_columns),
+    "component-mean table"
+  )
+
+  proportion_value <- function(component_value, diet_value) {
+    selected <- component_proportions |>
+      dplyr::filter(
+        component == component_value,
+        diet == diet_value
+      ) |>
+      dplyr::pull(proportion)
+
+    if (length(selected) != 1L) {
+      stop("Component proportions are not one-to-one.", call. = FALSE)
+    }
+    selected[[1]]
+  }
+
+  p8_con <- proportion_value("unit8", REFERENCE_DIET)
+  p8_hfd <- proportion_value("unit8", COMPARISON_DIET)
+  p6_con <- proportion_value("unit6", REFERENCE_DIET)
+  p6_hfd <- proportion_value("unit6", COMPARISON_DIET)
+
+  output <- means_wide |>
+    dplyr::mutate(
+      unit8_proportion_CON = p8_con,
+      unit8_proportion_HFD = p8_hfd,
+      unit6_proportion_CON = p6_con,
+      unit6_proportion_HFD = p6_hfd,
+      unit8_midpoint_proportion = (p8_con + p8_hfd) / 2,
+      unit6_midpoint_proportion = (p6_con + p6_hfd) / 2,
+      observed_CON =
+        p8_con * unit8_CON + p6_con * unit6_CON,
+      observed_HFD =
+        p8_hfd * unit8_HFD + p6_hfd * unit6_HFD,
+      observed_difference = observed_HFD - observed_CON,
+      observed_log2FC = log2(
+        (observed_HFD + pseudocount) /
+          (observed_CON + pseudocount)
+      ),
+      standardized_CON =
+        unit8_midpoint_proportion * unit8_CON +
+        unit6_midpoint_proportion * unit6_CON,
+      standardized_HFD =
+        unit8_midpoint_proportion * unit8_HFD +
+        unit6_midpoint_proportion * unit6_HFD,
+      standardized_difference =
+        standardized_HFD - standardized_CON,
+      standardized_log2FC = log2(
+        (standardized_HFD + pseudocount) /
+          (standardized_CON + pseudocount)
+      ),
+      within_state_component =
+        unit8_midpoint_proportion * (unit8_HFD - unit8_CON) +
+        unit6_midpoint_proportion * (unit6_HFD - unit6_CON),
+      composition_component =
+        ((unit8_HFD + unit8_CON) / 2) * (p8_hfd - p8_con) +
+        ((unit6_HFD + unit6_CON) / 2) * (p6_hfd - p6_con),
+      decomposition_residual =
+        observed_difference -
+        within_state_component -
+        composition_component,
+      absolute_within_fraction = dplyr::if_else(
+        abs(within_state_component) + abs(composition_component) > 0,
+        abs(within_state_component) /
+          (abs(within_state_component) + abs(composition_component)),
+        NA_real_
+      ),
+      unit8_log2FC = log2(
+        (unit8_HFD + pseudocount) /
+          (unit8_CON + pseudocount)
+      ),
+      unit6_log2FC = log2(
+        (unit6_HFD + pseudocount) /
+          (unit6_CON + pseudocount)
+      )
+    )
+
+  if (isTRUE(scale_to_percentage_points)) {
+    output <- output |>
+      dplyr::mutate(
+        dplyr::across(
+          c(
+            observed_CON,
+            observed_HFD,
+            observed_difference,
+            standardized_CON,
+            standardized_HFD,
+            standardized_difference,
+            within_state_component,
+            composition_component,
+            decomposition_residual,
+            unit8_CON,
+            unit8_HFD,
+            unit6_CON,
+            unit6_HFD
+          ),
+          ~ 100 * .x
+        )
+      )
+  }
+
+  output
+}
+
+prepare_effect_wide <- function(effect_table, feature_name = "feature") {
+  effect_table |>
+    dplyr::filter(
+      comparison_population %in%
+        c("broad_stem", "strict_ISC", "crypt_progenitor")
+    ) |>
+    dplyr::mutate(
+      effect_population = dplyr::recode(
+        comparison_population,
+        broad_stem = "broad",
+        strict_ISC = "unit8",
+        crypt_progenitor = "unit6"
+      )
+    ) |>
+    dplyr::select(
+      dplyr::all_of(feature_name),
+      effect_population,
+      log2FC_comparison_vs_reference,
+      detection_difference_percentage_points,
+      reference_percent_detected,
+      comparison_percent_detected
+    ) |>
+    tidyr::pivot_wider(
+      names_from = effect_population,
+      values_from = c(
+        log2FC_comparison_vs_reference,
+        detection_difference_percentage_points,
+        reference_percent_detected,
+        comparison_percent_detected
+      ),
+      names_glue = "{effect_population}_{.value}"
+    )
+}
+
+prepare_rna_stability_wide <- function(stability_table) {
+  stability_table |>
+    dplyr::filter(
+      comparison_population %in%
+        c("broad_stem", "strict_ISC", "crypt_progenitor")
+    ) |>
+    dplyr::mutate(
+      effect_population = dplyr::recode(
+        comparison_population,
+        broad_stem = "broad",
+        strict_ISC = "unit8",
+        crypt_progenitor = "unit6"
+      ),
+      direction_stable =
+        sign(full_log2FC) == sign(downsampled_log2FC_median) &
+        sign_concordance_percent >=
+          MINIMUM_SIGN_CONCORDANCE_PERCENT,
+      downsampling_iqr_excludes_zero = dplyr::case_when(
+        full_log2FC > 0 ~ downsampled_log2FC_q25 > 0,
+        full_log2FC < 0 ~ downsampled_log2FC_q75 < 0,
+        TRUE ~ FALSE
+      )
+    ) |>
+    dplyr::select(
+      feature,
+      effect_population,
+      sign_concordance_percent,
+      direction_stable,
+      downsampling_iqr_excludes_zero
+    ) |>
+    tidyr::pivot_wider(
+      names_from = effect_population,
+      values_from = c(
+        sign_concordance_percent,
+        direction_stable,
+        downsampling_iqr_excludes_zero
+      ),
+      names_glue = "{effect_population}_{.value}"
+    )
+}
+
+classify_component_response <- function(
+  broad_clear,
+  unit8_clear,
+  unit6_clear,
+  broad_effect,
+  unit8_effect,
+  unit6_effect,
+  within_component,
+  composition_component
+) {
+  dplyr::case_when(
+    unit8_clear & unit6_clear &
+      sign(unit8_effect) == sign(unit6_effect) ~
+      "shared_within_state",
+    unit8_clear & unit6_clear &
+      sign(unit8_effect) != sign(unit6_effect) ~
+      "opposing_state_effects",
+    unit6_clear & !unit8_clear ~ "unit6_specific",
+    unit8_clear & !unit6_clear ~ "unit8_specific",
+    broad_clear &
+      abs(composition_component) > abs(within_component) ~
+      "composition_dominant",
+    broad_clear ~ "broad_mixed_within_state",
+    TRUE ~ "weak_or_unresolved"
+  )
+}
+
+run_binary_detection_stability <- function(
+  binary_matrix,
+  metadata,
+  component_unit,
+  features,
+  iterations,
+  random_seed
+) {
+  features <- intersect(features, rownames(binary_matrix))
+
+  if (length(features) == 0L) {
+    return(tibble::tibble())
+  }
+
+  reference_cells <- metadata$cell_barcode[
+    metadata$analysis_unit == component_unit &
+      metadata$diet == REFERENCE_DIET
+  ]
+  comparison_cells <- metadata$cell_barcode[
+    metadata$analysis_unit == component_unit &
+      metadata$diet == COMPARISON_DIET
+  ]
+  sampled_nuclei <- min(
+    length(reference_cells),
+    length(comparison_cells)
+  )
+
+  selected_matrix <- binary_matrix[features, , drop = FALSE]
+  full_difference <- 100 * (
+    Matrix::rowMeans(
+      selected_matrix[, comparison_cells, drop = FALSE]
+    ) -
+      Matrix::rowMeans(
+        selected_matrix[, reference_cells, drop = FALSE]
+      )
+  )
+
+  set.seed(random_seed)
+  sampled_differences <- matrix(
+    NA_real_,
+    nrow = length(features),
+    ncol = iterations,
+    dimnames = list(features, NULL)
+  )
+
+  for (iteration_index in seq_len(iterations)) {
+    sampled_reference <- sample(
+      reference_cells,
+      size = sampled_nuclei,
+      replace = FALSE
+    )
+    sampled_comparison <- sample(
+      comparison_cells,
+      size = sampled_nuclei,
+      replace = FALSE
+    )
+
+    sampled_differences[, iteration_index] <- 100 * (
+      Matrix::rowMeans(
+        selected_matrix[, sampled_comparison, drop = FALSE]
+      ) -
+        Matrix::rowMeans(
+          selected_matrix[, sampled_reference, drop = FALSE]
+        )
+    )
+  }
+
+  quantiles <- t(apply(
+    sampled_differences,
+    1,
+    stats::quantile,
+    probs = c(0.25, 0.50, 0.75),
+    na.rm = TRUE,
+    names = FALSE
+  ))
+
+  sign_concordance <- vapply(
+    seq_along(features),
+    function(feature_index) {
+      if (full_difference[[feature_index]] == 0) return(NA_real_)
+      100 * mean(
+        sign(sampled_differences[feature_index, ]) ==
+          sign(full_difference[[feature_index]]),
+        na.rm = TRUE
+      )
+    },
+    numeric(1)
+  )
+
+  tibble::tibble(
+    feature = features,
+    component_unit = component_unit,
+    sampled_nuclei_per_diet = sampled_nuclei,
+    full_detection_difference_percentage_points =
+      as.numeric(full_difference),
+    downsampled_detection_difference_q25 = quantiles[, 1],
+    downsampled_detection_difference_median = quantiles[, 2],
+    downsampled_detection_difference_q75 = quantiles[, 3],
+    sign_concordance_percent = sign_concordance,
+    direction_stable =
+      sign_concordance >= MINIMUM_SIGN_CONCORDANCE_PERCENT &
+      sign(full_difference) == sign(quantiles[, 2]),
+    downsampling_iqr_excludes_zero = dplyr::case_when(
+      full_difference > 0 ~ quantiles[, 1] > 0,
+      full_difference < 0 ~ quantiles[, 3] < 0,
+      TRUE ~ FALSE
+    )
+  )
+}
+```
+
+# 4. Load and validate the WT object
+
+```{r load-and-validate-wt-object}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+metadata <- multiome[[]]
+
+analysis_unit_column <- if (
+  "annotation_unit" %in% colnames(metadata)
+) {
+  "annotation_unit"
+} else if ("wnn_cluster" %in% colnames(metadata)) {
+  "wnn_cluster"
+} else {
+  stop(
+    "The Step 6 object contains neither annotation_unit nor wnn_cluster.",
+    call. = FALSE
+  )
+}
+
+required_metadata <- c(
+  "sample_id",
+  "diet",
+  analysis_unit_column,
+  "broad_compartment",
+  "cell_state",
+  "annotation_confidence"
+)
+missing_metadata <- setdiff(required_metadata, colnames(metadata))
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "The Step 6 object is missing metadata column(s): ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+metadata$cell_barcode <- rownames(metadata)
+metadata$sample_id <- as.character(metadata$sample_id)
+metadata$diet <- as.character(metadata$diet)
+metadata$analysis_unit <- as.character(
+  metadata[[analysis_unit_column]]
+)
+metadata$broad_compartment <- as.character(
+  metadata$broad_compartment
+)
+metadata$cell_state <- as.character(metadata$cell_state)
+metadata$annotation_confidence <- tolower(
+  as.character(metadata$annotation_confidence)
+)
+
+if (!setequal(unique(metadata$diet), c(REFERENCE_DIET, COMPARISON_DIET))) {
+  stop("Expected exactly CON and HFD in the WT object.", call. = FALSE)
+}
+
+unit_annotation_validation <- metadata |>
+  dplyr::filter(analysis_unit %in% BROAD_STEM_UNITS) |>
+  dplyr::distinct(
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    annotation_confidence
+  ) |>
+  dplyr::mutate(
+    expected_cell_state = dplyr::recode(
+      analysis_unit,
+      `8` = "ISC-like crypt",
+      `6` = "Crypt progenitor"
+    ),
+    validation_pass =
+      broad_compartment == "epithelial" &
+      cell_state == expected_cell_state &
+      annotation_confidence %in% c("high", "moderate")
+  )
+
+if (
+  nrow(unit_annotation_validation) != length(BROAD_STEM_UNITS) ||
+    any(!unit_annotation_validation$validation_pass)
+) {
+  stop(
+    "The approved WT unit-8/unit-6 annotations no longer match Step 8C.",
+    call. = FALSE
+  )
+}
+
+if (!all(c("RNA", "ATAC") %in% names(multiome))) {
+  stop("The WT object must contain RNA and ATAC assays.", call. = FALSE)
+}
+
+rna_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+atac_counts <- SeuratObject::LayerData(
+  multiome[["ATAC"]],
+  layer = "counts"
+)
+
+metadata_cells <- rownames(metadata)
+matrix_alignment_audit <- tibble::tibble(
+  matrix = c("RNA counts", "ATAC counts"),
+  matrix_cells = c(ncol(rna_counts), ncol(atac_counts)),
+  metadata_cells = length(metadata_cells),
+  same_cell_set = c(
+    setequal(colnames(rna_counts), metadata_cells),
+    setequal(colnames(atac_counts), metadata_cells)
+  ),
+  identical_order_before_alignment = c(
+    identical(colnames(rna_counts), metadata_cells),
+    identical(colnames(atac_counts), metadata_cells)
+  )
+)
+
+rna_counts <- align_matrix_to_metadata(
+  rna_counts,
+  metadata_cells,
+  "RNA counts"
+)
+atac_counts <- align_matrix_to_metadata(
+  atac_counts,
+  metadata_cells,
+  "ATAC counts"
+)
+
+readr::write_csv(
+  matrix_alignment_audit,
+  file.path(STEP8C_DIR, "matrix_cell_alignment_audit.csv")
+)
+readr::write_csv(
+  unit_annotation_validation,
+  file.path(STEP8C_DIR, "step8c_unit_annotation_validation.csv")
+)
+
+rm(multiome)
+invisible(gc())
+```
+
+# 5. Quantify the broad-stem mixture
+
+```{r quantify-component-composition}
+component_composition <- metadata |>
+  dplyr::filter(analysis_unit %in% BROAD_STEM_UNITS) |>
+  dplyr::count(diet, analysis_unit, name = "nuclei") |>
+  dplyr::group_by(diet) |>
+  dplyr::mutate(
+    broad_stem_nuclei = sum(nuclei),
+    proportion = nuclei / broad_stem_nuclei,
+    percent = 100 * proportion,
+    component = dplyr::recode(
+      analysis_unit,
+      `8` = "unit8",
+      `6` = "unit6"
+    ),
+    component_label = dplyr::recode(
+      analysis_unit,
+      `8` = "Unit 8: ISC-like crypt",
+      `6` = "Unit 6: Crypt progenitor"
+    )
+  ) |>
+  dplyr::ungroup()
+
+composition_totals <- component_composition |>
+  dplyr::group_by(diet) |>
+  dplyr::summarise(total = sum(proportion), .groups = "drop") |>
+  dplyr::pull(total)
+
+if (
+  nrow(component_composition) != 4L ||
+    any(abs(composition_totals - 1) > 1e-12)
+) {
+  stop("Broad-stem component proportions failed validation.", call. = FALSE)
+}
+
+readr::write_csv(
+  component_composition,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "broad_stem_component_counts_and_proportions.csv"
+  )
+)
+
+p_composition <- ggplot2::ggplot(
+  component_composition,
+  ggplot2::aes(
+    x = diet,
+    y = percent,
+    fill = component_label
+  )
+) +
+  ggplot2::geom_col(width = 0.72) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = paste0(nuclei, "\n", sprintf("%.1f%%", percent))
+    ),
+    position = ggplot2::position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(
+      "Unit 8: ISC-like crypt" = "green3",
+      "Unit 6: Crypt progenitor" = "yellow3"
+    )
+  ) +
+  ggplot2::labs(
+    title = "WT broad-stem composition differs strongly by pooled diet library",
+    subtitle = "This redistribution can contribute to an observed composite diet effect",
+    x = NULL,
+    y = "Percent of broad-stem nuclei",
+    fill = NULL,
+    caption = "Descriptive: one pooled CON and one pooled HFD library."
+  ) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid.major.x = ggplot2::element_blank()
+  )
+
+save_native_pdf(
+  "01_broad_stem_component_composition.pdf",
+  p_composition,
+  width = 9,
+  height = 7
+)
+print(p_composition)
+component_composition
+```
+
+# 6. Decompose RNA effects on a linear scale
+
+Per-cell RNA counts are divided by each nucleus's total RNA count and scaled to 10,000 before component means are calculated. This is a linear abundance scale; log-normalized Seurat values are deliberately not averaged for the additive decomposition.
+
+```{r calculate-rna-decomposition}
+rna_cell_totals <- Matrix::colSums(rna_counts)
+
+if (any(!is.finite(rna_cell_totals)) || any(rna_cell_totals <= 0)) {
+  stop("RNA counts contain a cell with a non-positive library size.")
+}
+
+rna_linear <- rna_counts %*% Matrix::Diagonal(
+  x = RNA_SCALE_FACTOR / rna_cell_totals
+)
+colnames(rna_linear) <- colnames(rna_counts)
+rownames(rna_linear) <- rownames(rna_counts)
+
+rna_component_means <- summarize_matrix_by_component(
+  feature_matrix = rna_linear,
+  metadata = metadata,
+  value_label = "mean_per_cell_counts_per_10000",
+  binary = FALSE
+)
+
+rna_decomposition <- midpoint_decomposition(
+  component_means = rna_component_means,
+  component_proportions = component_composition,
+  pseudocount = RNA_LINEAR_PSEUDOCOUNT,
+  scale_to_percentage_points = FALSE
+)
+
+maximum_rna_residual <- max(
+  abs(rna_decomposition$decomposition_residual),
+  na.rm = TRUE
+)
+
+if (maximum_rna_residual > 1e-8) {
+  stop(
+    "RNA midpoint decomposition residual exceeded tolerance: ",
+    signif(maximum_rna_residual, 4),
+    call. = FALSE
+  )
+}
+
+step8b_rna_effects <- read_table_quietly(STEP8B_RNA_EFFECT_PATH)
+step8b_rna_stability <- read_table_quietly(
+  STEP8B_RNA_STABILITY_PATH
+)
+
+rna_effect_wide <- prepare_effect_wide(step8b_rna_effects)
+rna_stability_wide <- prepare_rna_stability_wide(
+  step8b_rna_stability
+)
+
+rna_decomposition <- rna_decomposition |>
+  dplyr::left_join(rna_effect_wide, by = "feature") |>
+  dplyr::left_join(rna_stability_wide, by = "feature") |>
+  dplyr::mutate(
+    broad_effect_available = !is.na(
+      broad_log2FC_comparison_vs_reference
+    ),
+    unit8_effect_available = !is.na(
+      unit8_log2FC_comparison_vs_reference
+    ),
+    unit6_effect_available = !is.na(
+      unit6_log2FC_comparison_vs_reference
+    ),
+    broad_clear = broad_effect_available &
+      abs(broad_log2FC_comparison_vs_reference) >=
+        RNA_CLEAR_LOG2FC &
+      abs(broad_detection_difference_percentage_points) >=
+        RNA_CLEAR_DETECTION_DELTA,
+    unit8_clear = unit8_effect_available &
+      abs(unit8_log2FC_comparison_vs_reference) >=
+        RNA_CLEAR_LOG2FC &
+      abs(unit8_detection_difference_percentage_points) >=
+        RNA_CLEAR_DETECTION_DELTA,
+    unit6_clear = unit6_effect_available &
+      abs(unit6_log2FC_comparison_vs_reference) >=
+        RNA_CLEAR_LOG2FC &
+      abs(unit6_detection_difference_percentage_points) >=
+        RNA_CLEAR_DETECTION_DELTA,
+    RNA_response_class = classify_component_response(
+      broad_clear = broad_clear,
+      unit8_clear = unit8_clear,
+      unit6_clear = unit6_clear,
+      broad_effect = broad_log2FC_comparison_vs_reference,
+      unit8_effect = unit8_log2FC_comparison_vs_reference,
+      unit6_effect = unit6_log2FC_comparison_vs_reference,
+      within_component = within_state_component,
+      composition_component = composition_component
+    ),
+    pooled_pseudobulk_direction = effect_direction(
+      broad_log2FC_comparison_vs_reference
+    ),
+    observed_linear_direction = effect_direction(observed_log2FC),
+    standardized_direction = effect_direction(
+      standardized_log2FC
+    ),
+    direction_changed_after_composition_standardization =
+      dplyr::case_when(
+        is.na(observed_log2FC) | is.na(standardized_log2FC) ~ NA,
+        sign(observed_log2FC) !=
+          sign(standardized_log2FC) ~ TRUE,
+        TRUE ~ FALSE
+      ),
+    pooled_and_linear_observed_direction_agree = dplyr::case_when(
+      !broad_effect_available | is.na(observed_log2FC) ~ NA,
+      sign(broad_log2FC_comparison_vs_reference) ==
+        sign(observed_log2FC) ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+
+readr::write_csv(
+  rna_component_means,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "RNA_linear_component_means.csv.gz"
+  )
+)
+readr::write_csv(
+  rna_decomposition,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "RNA_broad_stem_composition_decomposition.csv.gz"
+  )
+)
+
+rm(rna_linear, rna_counts, rna_cell_totals)
+invisible(gc())
+```
+
+# 7. Reprioritize persistent RNA genes
+
+```{r prioritize-persistent-rna-genes}
+reference_genes <- read_table_quietly(REFERENCE_GENE_PATH)
+assert_columns(
+  reference_genes,
+  c(
+    "gene",
+    "reference_direction",
+    "reference_program",
+    "source_rank",
+    "avg_log2FC_day21",
+    "avg_log2FC_day50"
+  ),
+  "persistent-HFD reference table"
+)
+
+persistent_rna_decomposition <- reference_genes |>
+  dplyr::left_join(
+    rna_decomposition,
+    by = c("gene" = "feature")
+  ) |>
+  dplyr::mutate(
+    pooled_source_aligned_log2FC = source_aligned_effect(
+      broad_log2FC_comparison_vs_reference,
+      reference_direction
+    ),
+    observed_linear_source_aligned_log2FC = source_aligned_effect(
+      observed_log2FC,
+      reference_direction
+    ),
+    standardized_source_aligned_log2FC = source_aligned_effect(
+      standardized_log2FC,
+      reference_direction
+    ),
+    unit8_source_aligned_log2FC = source_aligned_effect(
+      unit8_log2FC_comparison_vs_reference,
+      reference_direction
+    ),
+    unit6_source_aligned_log2FC = source_aligned_effect(
+      unit6_log2FC_comparison_vs_reference,
+      reference_direction
+    ),
+    pooled_source_concordant = dplyr::case_when(
+      !broad_effect_available ~ NA,
+      pooled_source_aligned_log2FC > 0 ~ TRUE,
+      pooled_source_aligned_log2FC < 0 ~ FALSE,
+      TRUE ~ NA
+    ),
+    observed_linear_source_concordant = dplyr::case_when(
+      is.na(observed_log2FC) ~ NA,
+      observed_linear_source_aligned_log2FC > 0 ~ TRUE,
+      observed_linear_source_aligned_log2FC < 0 ~ FALSE,
+      TRUE ~ NA
+    ),
+    standardized_source_concordant = dplyr::case_when(
+      is.na(standardized_log2FC) ~ NA,
+      standardized_source_aligned_log2FC > 0 ~ TRUE,
+      standardized_source_aligned_log2FC < 0 ~ FALSE,
+      TRUE ~ NA
+    ),
+    RNA_candidate_priority = dplyr::case_when(
+      standardized_source_concordant %in% TRUE &
+        RNA_response_class == "shared_within_state" ~
+        "A_source_concordant_shared_within_state",
+      standardized_source_concordant %in% TRUE &
+        RNA_response_class == "unit6_specific" ~
+        "B_source_concordant_unit6_specific",
+      standardized_source_concordant %in% TRUE &
+        RNA_response_class == "unit8_specific" ~
+        "C_source_concordant_unit8_specific",
+      observed_linear_source_concordant %in% TRUE &
+        RNA_response_class == "composition_dominant" ~
+        "D_observed_concordance_composition_dominant",
+      standardized_source_concordant %in% TRUE ~
+        "E_source_concordant_mixed_or_subthreshold",
+      observed_linear_source_concordant %in% FALSE ~
+        "F_source_discordant",
+      TRUE ~ "G_not_evaluable"
+    )
+  ) |>
+  dplyr::arrange(
+    RNA_candidate_priority,
+    dplyr::desc(abs(standardized_source_aligned_log2FC)),
+    reference_program,
+    source_rank
+  )
+
+readr::write_csv(
+  persistent_rna_decomposition,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "persistent_gene_RNA_composition_decomposition.csv"
+  )
+)
+
+rna_mechanism_summary <- persistent_rna_decomposition |>
+  dplyr::count(
+    reference_program,
+    RNA_response_class,
+    standardized_source_concordant,
+    name = "genes"
+  ) |>
+  dplyr::arrange(
+    reference_program,
+    dplyr::desc(genes),
+    RNA_response_class
+  )
+
+readr::write_csv(
+  rna_mechanism_summary,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "persistent_gene_RNA_mechanism_summary.csv"
+  )
+)
+
+rna_mechanism_summary
+```
+
+```{r plot-rna-decomposition}
+rna_class_colors <- c(
+  shared_within_state = "#009E73",
+  unit6_specific = "#E69F00",
+  unit8_specific = "#0072B2",
+  opposing_state_effects = "#CC79A7",
+  composition_dominant = "#D55E00",
+  broad_mixed_within_state = "#56B4E9",
+  weak_or_unresolved = "#9CA3AF"
+)
+
+plot_persistent <- persistent_rna_decomposition |>
+  dplyr::filter(
+    is.finite(observed_log2FC),
+    is.finite(standardized_log2FC)
+  )
+
+label_genes <- plot_persistent |>
+  dplyr::filter(
+    RNA_candidate_priority %in% c(
+      "A_source_concordant_shared_within_state",
+      "B_source_concordant_unit6_specific",
+      "C_source_concordant_unit8_specific",
+      "D_observed_concordance_composition_dominant"
+    )
+  ) |>
+  dplyr::slice_max(
+    order_by = abs(
+      observed_log2FC - standardized_log2FC
+    ) + abs(standardized_log2FC),
+    n = 14,
+    with_ties = FALSE
+  )
+
+p_observed_standardized <- ggplot2::ggplot(
+  plot_persistent,
+  ggplot2::aes(
+    x = observed_log2FC,
+    y = standardized_log2FC,
+    color = RNA_response_class
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75") +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75") +
+  ggplot2::geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "grey45"
+  ) +
+  ggplot2::geom_point(alpha = 0.78, size = 2.1) +
+  ggplot2::geom_text(
+    data = label_genes,
+    ggplot2::aes(label = gene),
+    size = 3,
+    check_overlap = TRUE,
+    vjust = -0.5,
+    show.legend = FALSE
+  ) +
+  ggplot2::scale_color_manual(values = rna_class_colors) +
+  ggplot2::facet_wrap(~ reference_program) +
+  ggplot2::labs(
+    title = "Observed and composition-standardized persistent-gene RNA effects",
+    subtitle = "Departure from the diagonal indicates sensitivity to the unit-8/unit-6 mixture",
+    x = "Observed cell-weighted broad-stem log2FC (HFD / CON)",
+    y = "Midpoint-composition-standardized log2FC",
+    color = "Response class",
+    caption = "Standardization uses fixed midpoint component weights; effects remain pooled-library descriptive."
+  ) +
+  ggplot2::theme(legend.position = "bottom")
+
+print(p_observed_standardized)
+save_native_pdf(
+  "02_persistent_RNA_observed_vs_standardized.pdf",
+  p_observed_standardized,
+  width = 13,
+  height = 8
+)
+
+p_component_rna <- ggplot2::ggplot(
+  plot_persistent |>
+    dplyr::filter(
+      is.finite(unit8_log2FC_comparison_vs_reference),
+      is.finite(unit6_log2FC_comparison_vs_reference)
+    ),
+  ggplot2::aes(
+    x = unit8_log2FC_comparison_vs_reference,
+    y = unit6_log2FC_comparison_vs_reference,
+    color = RNA_response_class
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75") +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75") +
+  ggplot2::geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "grey45"
+  ) +
+  ggplot2::geom_point(alpha = 0.8, size = 2.1) +
+  ggplot2::scale_color_manual(values = rna_class_colors) +
+  ggplot2::facet_wrap(~ reference_program) +
+  ggplot2::labs(
+    title = "Persistent-gene diet effects differ between stem components",
+    x = "Unit 8 pooled RNA log2FC",
+    y = "Unit 6 pooled RNA log2FC",
+    color = "Response class",
+    caption = "Axes are HFD versus CON within each annotated component."
+  ) +
+  ggplot2::theme(legend.position = "bottom")
+
+print(p_component_rna)
+save_native_pdf(
+  "03_persistent_RNA_unit8_vs_unit6.pdf",
+  p_component_rna,
+  width = 13,
+  height = 8
+)
+```
+
+# 8. Decompose ATAC accessibility and create stable peak sets
+
+ATAC is decomposed using peak detection probability: the fraction of nuclei with at least one fragment in a peak. This does not imply that every detected fragment is activating. `HFD_opening` and `CON_opening` below describe only the direction of accessibility.
+
+```{r calculate-atac-decomposition}
+atac_binary <- atac_counts
+atac_binary@x[] <- 1
+
+atac_component_means <- summarize_matrix_by_component(
+  feature_matrix = atac_binary,
+  metadata = metadata,
+  value_label = "fraction_nuclei_peak_detected",
+  binary = TRUE
+)
+
+atac_decomposition <- midpoint_decomposition(
+  component_means = atac_component_means,
+  component_proportions = component_composition,
+  pseudocount = 1e-4,
+  scale_to_percentage_points = TRUE
+)
+
+maximum_atac_residual <- max(
+  abs(atac_decomposition$decomposition_residual),
+  na.rm = TRUE
+)
+
+if (maximum_atac_residual > 1e-8) {
+  stop(
+    "ATAC midpoint decomposition residual exceeded tolerance: ",
+    signif(maximum_atac_residual, 4),
+    call. = FALSE
+  )
+}
+
+step8b_atac_effects <- read_table_quietly(STEP8B_ATAC_EFFECT_PATH)
+atac_effect_wide <- prepare_effect_wide(step8b_atac_effects)
+atac_context <- read_table_quietly(STEP8B_ATAC_CONTEXT_PATH)
+
+atac_decomposition <- atac_decomposition |>
+  dplyr::left_join(atac_effect_wide, by = "feature") |>
+  dplyr::left_join(
+    atac_context,
+    by = c("feature" = "peak")
+  ) |>
+  dplyr::mutate(
+    peak_width = peak_end - peak_start + 1L,
+    broad_effect_available = !is.na(
+      broad_log2FC_comparison_vs_reference
+    ),
+    unit8_effect_available = !is.na(
+      unit8_log2FC_comparison_vs_reference
+    ),
+    unit6_effect_available = !is.na(
+      unit6_log2FC_comparison_vs_reference
+    ),
+    broad_clear = broad_effect_available &
+      abs(broad_log2FC_comparison_vs_reference) >=
+        ATAC_CLEAR_LOG2FC &
+      abs(broad_detection_difference_percentage_points) >=
+        ATAC_CLEAR_DETECTION_DELTA,
+    unit8_clear = unit8_effect_available &
+      abs(unit8_log2FC_comparison_vs_reference) >=
+        ATAC_CLEAR_LOG2FC &
+      abs(unit8_detection_difference_percentage_points) >=
+        ATAC_CLEAR_DETECTION_DELTA,
+    unit6_clear = unit6_effect_available &
+      abs(unit6_log2FC_comparison_vs_reference) >=
+        ATAC_CLEAR_LOG2FC &
+      abs(unit6_detection_difference_percentage_points) >=
+        ATAC_CLEAR_DETECTION_DELTA,
+    ATAC_response_class = classify_component_response(
+      broad_clear = broad_clear,
+      unit8_clear = unit8_clear,
+      unit6_clear = unit6_clear,
+      broad_effect = broad_log2FC_comparison_vs_reference,
+      unit8_effect = unit8_log2FC_comparison_vs_reference,
+      unit6_effect = unit6_log2FC_comparison_vs_reference,
+      within_component = within_state_component,
+      composition_component = composition_component
+    )
+  )
+
+candidate_atac_features <- atac_decomposition |>
+  dplyr::filter(
+    unit8_clear | unit6_clear | broad_clear |
+      abs(standardized_difference) >=
+        ATAC_CLEAR_DETECTION_DELTA
+  ) |>
+  dplyr::pull(feature) |>
+  unique()
+
+unit8_atac_stability <- run_binary_detection_stability(
+  binary_matrix = atac_binary,
+  metadata = metadata,
+  component_unit = UNIT8,
+  features = candidate_atac_features,
+  iterations = ATAC_DOWNSAMPLING_ITERATIONS,
+  random_seed = 20260919
+) |>
+  dplyr::rename_with(
+    ~ paste0("unit8_", .x),
+    -feature
+  )
+
+unit6_atac_stability <- run_binary_detection_stability(
+  binary_matrix = atac_binary,
+  metadata = metadata,
+  component_unit = UNIT6,
+  features = candidate_atac_features,
+  iterations = ATAC_DOWNSAMPLING_ITERATIONS,
+  random_seed = 20260920
+) |>
+  dplyr::rename_with(
+    ~ paste0("unit6_", .x),
+    -feature
+  )
+
+atac_stability <- dplyr::full_join(
+  unit8_atac_stability,
+  unit6_atac_stability,
+  by = "feature"
+)
+
+atac_decomposition <- atac_decomposition |>
+  dplyr::left_join(atac_stability, by = "feature") |>
+  dplyr::mutate(
+    unit8_direction_stable = dplyr::coalesce(
+      unit8_direction_stable,
+      FALSE
+    ),
+    unit6_direction_stable = dplyr::coalesce(
+      unit6_direction_stable,
+      FALSE
+    ),
+    unit8_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      unit8_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    unit6_downsampling_iqr_excludes_zero = dplyr::coalesce(
+      unit6_downsampling_iqr_excludes_zero,
+      FALSE
+    ),
+    motif_peak_set = dplyr::case_when(
+      ATAC_response_class == "shared_within_state" &
+        unit8_direction_stable & unit6_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit6_downsampling_iqr_excludes_zero &
+        unit8_log2FC_comparison_vs_reference > 0 ~
+        "shared_HFD_opening",
+      ATAC_response_class == "shared_within_state" &
+        unit8_direction_stable & unit6_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit6_downsampling_iqr_excludes_zero &
+        unit8_log2FC_comparison_vs_reference < 0 ~
+        "shared_CON_opening",
+      ATAC_response_class == "unit6_specific" &
+        unit6_direction_stable &
+        unit6_downsampling_iqr_excludes_zero &
+        unit6_log2FC_comparison_vs_reference > 0 ~
+        "unit6_HFD_opening",
+      ATAC_response_class == "unit6_specific" &
+        unit6_direction_stable &
+        unit6_downsampling_iqr_excludes_zero &
+        unit6_log2FC_comparison_vs_reference < 0 ~
+        "unit6_CON_opening",
+      ATAC_response_class == "unit8_specific" &
+        unit8_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit8_log2FC_comparison_vs_reference > 0 ~
+        "unit8_HFD_opening",
+      ATAC_response_class == "unit8_specific" &
+        unit8_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit8_log2FC_comparison_vs_reference < 0 ~
+        "unit8_CON_opening",
+      ATAC_response_class == "opposing_state_effects" &
+        unit8_direction_stable & unit6_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit6_downsampling_iqr_excludes_zero &
+        unit6_log2FC_comparison_vs_reference > 0 ~
+        "opposing_unit6_HFD_unit8_CON",
+      ATAC_response_class == "opposing_state_effects" &
+        unit8_direction_stable & unit6_direction_stable &
+        unit8_downsampling_iqr_excludes_zero &
+        unit6_downsampling_iqr_excludes_zero &
+        unit6_log2FC_comparison_vs_reference < 0 ~
+        "opposing_unit6_CON_unit8_HFD",
+      TRUE ~ NA_character_
+    ),
+    motif_ready = !is.na(motif_peak_set)
+  )
+
+readr::write_csv(
+  atac_component_means,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "ATAC_detection_component_means.csv.gz"
+  )
+)
+readr::write_csv(
+  atac_stability,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "ATAC_binary_detection_downsampling_stability.csv.gz"
+  )
+)
+readr::write_csv(
+  atac_decomposition,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "ATAC_broad_stem_composition_decomposition.csv.gz"
+  )
+)
+
+motif_ready_peak_sets <- atac_decomposition |>
+  dplyr::filter(motif_ready) |>
+  dplyr::select(
+    peak = feature,
+    motif_peak_set,
+    ATAC_response_class,
+    chromosome,
+    peak_start,
+    peak_end,
+    peak_width,
+    genomic_context,
+    nearest_gene,
+    nearest_gene_distance_bp,
+    dplyr::everything()
+  )
+
+motif_peak_set_summary <- motif_ready_peak_sets |>
+  dplyr::count(
+    motif_peak_set,
+    ATAC_response_class,
+    genomic_context,
+    name = "peaks"
+  ) |>
+  dplyr::group_by(motif_peak_set) |>
+  dplyr::mutate(
+    total_peak_set_size = sum(peaks),
+    meets_minimum_motif_set_size =
+      total_peak_set_size >= MINIMUM_MOTIF_SET_SIZE
+  ) |>
+  dplyr::ungroup()
+
+motif_background_universe <- atac_decomposition |>
+  dplyr::filter(unit8_effect_available | unit6_effect_available) |>
+  dplyr::transmute(
+    peak = feature,
+    chromosome,
+    peak_start,
+    peak_end,
+    peak_width,
+    genomic_context,
+    nearest_gene,
+    nearest_gene_distance_bp,
+    testable_unit8 = unit8_effect_available,
+    testable_unit6 = unit6_effect_available,
+    mean_detection_percent = rowMeans(
+      cbind(unit8_CON, unit8_HFD, unit6_CON, unit6_HFD),
+      na.rm = TRUE
+    ),
+    broad_log2FC = broad_log2FC_comparison_vs_reference,
+    unit8_log2FC = unit8_log2FC_comparison_vs_reference,
+    unit6_log2FC = unit6_log2FC_comparison_vs_reference
+  )
+
+readr::write_csv(
+  motif_ready_peak_sets,
+  file.path(STEP8C_TABLE_DIR, "motif_ready_peak_sets.csv.gz")
+)
+readr::write_csv(
+  motif_peak_set_summary,
+  file.path(STEP8C_TABLE_DIR, "motif_peak_set_summary.csv")
+)
+readr::write_csv(
+  motif_background_universe,
+  file.path(STEP8C_TABLE_DIR, "motif_background_universe.csv.gz")
+)
+
+rm(atac_binary, atac_counts)
+invisible(gc())
+
+motif_peak_set_summary
+```
+
+```{r plot-atac-component-effects}
+atac_plot_data <- atac_decomposition |>
+  dplyr::filter(
+    unit8_effect_available,
+    unit6_effect_available,
+    unit8_clear | unit6_clear
+  )
+
+p_atac_components <- ggplot2::ggplot(
+  atac_plot_data,
+  ggplot2::aes(
+    x = unit8_log2FC_comparison_vs_reference,
+    y = unit6_log2FC_comparison_vs_reference,
+    color = ATAC_response_class
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey75") +
+  ggplot2::geom_vline(xintercept = 0, color = "grey75") +
+  ggplot2::geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "grey45"
+  ) +
+  ggplot2::geom_point(size = 0.55, alpha = 0.45) +
+  ggplot2::scale_color_manual(values = rna_class_colors) +
+  ggplot2::coord_cartesian(xlim = c(-4, 4), ylim = c(-4, 4)) +
+  ggplot2::labs(
+    title = "WT broad-stem ATAC effects are strongly component resolved",
+    subtitle = "Only peaks clear in unit 8 or unit 6 are shown",
+    x = "Unit 8 pooled ATAC log2FC",
+    y = "Unit 6 pooled ATAC log2FC",
+    color = "Response class",
+    caption = "Motif-ready sets additionally require stable binary-detection direction under cell downsampling."
+  ) +
+  ggplot2::theme(legend.position = "bottom")
+
+print(p_atac_components)
+save_native_pdf(
+  "04_ATAC_unit8_vs_unit6_response_classes.pdf",
+  p_atac_components,
+  width = 12,
+  height = 8
+)
+
+p_motif_inventory <- motif_peak_set_summary |>
+  dplyr::group_by(motif_peak_set) |>
+  dplyr::summarise(
+    peaks = max(total_peak_set_size),
+    meets_minimum_motif_set_size =
+      all(meets_minimum_motif_set_size),
+    .groups = "drop"
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = reorder(motif_peak_set, peaks),
+      y = peaks,
+      fill = meets_minimum_motif_set_size
+    )
+  ) +
+  ggplot2::geom_col() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_fill_manual(
+    values = c(`TRUE` = "#009E73", `FALSE` = "#999999")
+  ) +
+  ggplot2::labs(
+    title = "Stable component-resolved ATAC peak sets prepared for motif review",
+    x = NULL,
+    y = "Peaks",
+    fill = paste0("At least ", MINIMUM_MOTIF_SET_SIZE, " peaks")
+  ) +
+  ggplot2::theme(legend.position = "bottom")
+
+print(p_motif_inventory)
+save_native_pdf(
+  "05_motif_ready_peak_set_inventory.pdf",
+  p_motif_inventory,
+  width = 11,
+  height = 7
+)
+```
+
+# 9. Integrate persistent RNA with exact promoter accessibility
+
+```{r integrate-exact-promoter-evidence}
+step8b_promoter_evidence <- read_table_quietly(
+  STEP8B_PROMOTER_EVIDENCE_PATH
+)
+
+promoter_geometry_columns <- c(
+  "gene",
+  "gene_id",
+  "chromosome",
+  "strand",
+  "tss",
+  "promoter_start",
+  "promoter_end",
+  "peak",
+  "peak_start",
+  "peak_end",
+  "peak_center",
+  "transcriptional_offset_bp",
+  "peak_overlaps_tss"
+)
+assert_columns(
+  step8b_promoter_evidence,
+  promoter_geometry_columns,
+  "Step 8B promoter evidence"
+)
+
+promoter_geometry <- step8b_promoter_evidence |>
+  dplyr::select(dplyr::all_of(promoter_geometry_columns)) |>
+  dplyr::distinct(gene, peak, .keep_all = TRUE)
+
+promoter_decomposition <- promoter_geometry |>
+  dplyr::left_join(
+    persistent_rna_decomposition,
+    by = "gene"
+  ) |>
+  dplyr::left_join(
+    atac_decomposition |>
+      dplyr::rename(peak = feature),
+    by = "peak",
+    suffix = c("_gene", "_peak")
+  ) |>
+  dplyr::mutate(
+    standardized_RNA_ATAC_direction_match = dplyr::case_when(
+      is.na(standardized_log2FC_gene) |
+        is.na(within_state_component_peak) ~ NA,
+      sign(standardized_log2FC_gene) ==
+        sign(within_state_component_peak) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    source_aligned_promoter_effect = source_aligned_effect(
+      within_state_component_peak,
+      reference_direction
+    ),
+    promoter_candidate_priority = dplyr::case_when(
+      standardized_source_concordant %in% TRUE &
+        standardized_RNA_ATAC_direction_match %in% TRUE &
+        motif_ready &
+        ATAC_response_class %in% c(
+          "shared_within_state",
+          "unit6_specific",
+          "unit8_specific"
+        ) ~
+        "Tier_1_source_concordant_RNA_plus_stable_component_promoter_ATAC",
+      standardized_source_concordant %in% TRUE &
+        standardized_RNA_ATAC_direction_match %in% TRUE &
+        ATAC_response_class %in% c(
+          "shared_within_state",
+          "unit6_specific",
+          "unit8_specific"
+        ) ~
+        "Tier_2_source_concordant_RNA_plus_component_promoter_ATAC",
+      standardized_source_concordant %in% TRUE &
+        standardized_RNA_ATAC_direction_match %in% FALSE ~
+        "Tier_3_source_concordant_RNA_opposed_promoter_ATAC",
+      observed_linear_source_concordant %in% TRUE &
+        RNA_response_class == "composition_dominant" ~
+        "Tier_4_composition_sensitive_RNA",
+      TRUE ~ "Not_prioritized"
+    )
+  )
+
+representative_promoter_candidates <- promoter_decomposition |>
+  dplyr::filter(promoter_candidate_priority != "Not_prioritized") |>
+  dplyr::group_by(gene) |>
+  dplyr::arrange(
+    promoter_candidate_priority,
+    dplyr::desc(abs(within_state_component_peak)),
+    abs(transcriptional_offset_bp),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = 1L) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(
+    promoter_candidate_priority,
+    RNA_candidate_priority,
+    dplyr::desc(abs(standardized_source_aligned_log2FC))
+  )
+
+readr::write_csv(
+  promoter_decomposition,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "persistent_gene_exact_promoter_decomposition.csv.gz"
+  )
+)
+readr::write_csv(
+  representative_promoter_candidates,
+  file.path(
+    STEP8C_TABLE_DIR,
+    "persistent_gene_prioritized_promoter_candidates.csv"
+  )
+)
+
+representative_promoter_candidates |>
+  dplyr::select(
+    gene,
+    reference_program,
+    RNA_candidate_priority,
+    RNA_response_class,
+    standardized_log2FC_gene,
+    peak,
+    ATAC_response_class,
+    motif_peak_set,
+    within_state_component_peak,
+    standardized_RNA_ATAC_direction_match,
+    promoter_candidate_priority
+  )
+```
+
+```{r plot-prioritized-promoter-candidates}
+promoter_plot_data <- representative_promoter_candidates |>
+  dplyr::slice_head(n = 30L) |>
+  dplyr::mutate(
+    gene = factor(gene, levels = rev(unique(gene)))
+  )
+
+if (nrow(promoter_plot_data) > 0L) {
+  p_promoter <- ggplot2::ggplot(
+    promoter_plot_data,
+    ggplot2::aes(
+      x = standardized_log2FC_gene,
+      y = gene,
+      color = promoter_candidate_priority,
+      size = abs(within_state_component_peak)
+    )
+  ) +
+    ggplot2::geom_vline(xintercept = 0, color = "grey75") +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::facet_wrap(~ reference_program, scales = "free_y") +
+    ggplot2::labs(
+      title = "Persistent-gene candidates after composition standardization",
+      subtitle = "Point size is the exact-promoter within-state ATAC detection change",
+      x = "Composition-standardized RNA log2FC",
+      y = NULL,
+      color = "Integrated priority",
+      size = "Absolute promoter\nchange (percentage points)",
+      caption = "Exact promoter overlap is regulatory context, not proof of causality."
+    ) +
+    ggplot2::theme(legend.position = "bottom")
+
+  print(p_promoter)
+  save_native_pdf(
+    "06_prioritized_persistent_gene_promoter_candidates.pdf",
+    p_promoter,
+    width = 13,
+    height = 9
+  )
+}
+```
+
+# 10. Write completion summaries
+
+```{r write-completion-summary}
+classification_summary <- dplyr::bind_rows(
+  rna_mechanism_summary |>
+    dplyr::transmute(
+      feature_type = "RNA_persistent_gene",
+      group = reference_program,
+      classification = RNA_response_class,
+      direction_or_concordance = as.character(
+        standardized_source_concordant
+      ),
+      features = genes
+    ),
+  motif_peak_set_summary |>
+    dplyr::transmute(
+      feature_type = "ATAC_peak",
+      group = motif_peak_set,
+      classification = ATAC_response_class,
+      direction_or_concordance = genomic_context,
+      features = peaks
+    )
+)
+
+readr::write_csv(
+  classification_summary,
+  file.path(STEP8C_DIR, "step8c_classification_summary.csv")
+)
+
+step8c_summary <- tibble::tibble(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  broad_stem_units = paste(BROAD_STEM_UNITS, collapse = ";"),
+  broad_stem_CON_nuclei = sum(
+    component_composition$nuclei[
+      component_composition$diet == REFERENCE_DIET
+    ]
+  ),
+  broad_stem_HFD_nuclei = sum(
+    component_composition$nuclei[
+      component_composition$diet == COMPARISON_DIET
+    ]
+  ),
+  persistent_genes = nrow(reference_genes),
+  persistent_genes_source_concordant_after_standardization = sum(
+    persistent_rna_decomposition$standardized_source_concordant %in% TRUE,
+    na.rm = TRUE
+  ),
+  motif_ready_peak_sets = dplyr::n_distinct(
+    motif_ready_peak_sets$motif_peak_set
+  ),
+  motif_ready_peaks = nrow(motif_ready_peak_sets),
+  prioritized_exact_promoter_genes = dplyr::n_distinct(
+    representative_promoter_candidates$gene
+  ),
+  motif_enrichment_performed = FALSE,
+  distal_linking_performed = FALSE,
+  cross_genotype_comparison_performed = FALSE,
+  replicated_diet_design = FALSE,
+  biological_inference_performed = FALSE
+)
+
+readr::write_csv(
+  step8c_summary,
+  file.path(STEP8C_DIR, "step8c_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 8C completed:", Sys.time()),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste("Broad-stem units:", paste(BROAD_STEM_UNITS, collapse = ",")),
+    paste(
+      "Maximum RNA decomposition residual:",
+      format(maximum_rna_residual, scientific = TRUE)
+    ),
+    paste(
+      "Maximum ATAC decomposition residual:",
+      format(maximum_atac_residual, scientific = TRUE)
+    ),
+    paste(
+      "Motif-ready peak sets:",
+      dplyr::n_distinct(motif_ready_peak_sets$motif_peak_set)
+    ),
+    paste("Motif-ready peaks:", nrow(motif_ready_peak_sets)),
+    paste(
+      "Prioritized exact-promoter genes:",
+      dplyr::n_distinct(representative_promoter_candidates$gene)
+    ),
+    "Midpoint composition decomposition performed: TRUE",
+    "Component-resolved ATAC downsampling performed: TRUE",
+    "Motif enrichment performed: FALSE",
+    "Distal peak-to-gene linking performed: FALSE",
+    "Cross-genotype comparison performed: FALSE",
+    "Replicated diet inference performed: FALSE"
+  ),
+  con = file.path(STEP8C_DIR, "STEP_08C_COMPLETE.txt")
+)
+
+step8c_summary
+```
+
+# Interpretation checkpoint
+
+Before motif enrichment:
+
+1.  confirm the unit-8 and unit-6 mixture and the exact decomposition residuals;
+2.  inspect genes whose observed and standardized directions differ;
+3.  distinguish shared, unit-6-specific, unit-8-specific, opposing, and composition-dominant RNA candidates;
+4.  confirm that each proposed motif peak set has adequate size and stable binary-detection direction;
+5.  inspect exact-promoter candidates, especially cases in which the RNA and promoter directions oppose; and
+6.  approve only biologically interpretable peak sets in the Step 8D decision table.
+
+The observed broad-stem result remains useful: it captures the combined effect of state redistribution and molecular change. The standardized and component-resolved results answer the narrower regulatory-mechanism question.

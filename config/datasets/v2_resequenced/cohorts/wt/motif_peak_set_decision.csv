@@ -1,0 +1,9 @@
+cohort_id,peak_set_id,approved,reviewer,review_date,decision_notes
+wt,shared_HFD_opening,TRUE,"Dominic Saiz, PhD",09-16-26,"Review Step 8C peak-set size, genomic context, and downsampling stability before approval. This set represents peaks opening in both unit 8 and unit 6."
+wt,shared_CON_opening,TRUE,"Dominic Saiz, PhD",09-16-26,"Review Step 8C peak-set size, genomic context, and downsampling stability before approval. This set represents peaks more accessible in CON in both unit 8 and unit 6."
+wt,unit6_HFD_opening,TRUE,"Dominic Saiz, PhD",09-16-26,Review Step 8C evidence before approval. This set represents stable HFD-opening peaks concentrated in crypt-progenitor unit 6.
+wt,unit6_CON_opening,TRUE,"Dominic Saiz, PhD",09-16-26,Review Step 8C evidence before approval. This set represents stable CON-opening peaks concentrated in crypt-progenitor unit 6.
+wt,unit8_HFD_opening,TRUE,"Dominic Saiz, PhD",09-16-26,Review Step 8C evidence before approval. This set represents stable HFD-opening peaks concentrated in ISC-like unit 8.
+wt,unit8_CON_opening,TRUE,"Dominic Saiz, PhD",09-16-26,Review Step 8C evidence before approval. This set represents stable CON-opening peaks concentrated in ISC-like unit 8.
+wt,opposing_unit6_HFD_unit8_CON,FALSE,"Dominic Saiz, PhD",09-16-26,Exploratory only. Approve only if the opposing-state peak set is sufficiently large and its component directions remain stable.
+wt,opposing_unit6_CON_unit8_HFD,FALSE,"Dominic Saiz, PhD",09-16-26,Exploratory only. Approve only if the opposing-state peak set is sufficiently large and its component directions remain stable.

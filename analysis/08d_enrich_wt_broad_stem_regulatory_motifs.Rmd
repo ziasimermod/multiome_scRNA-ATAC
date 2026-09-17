@@ -1,0 +1,1396 @@
+---
+title: "Step 8D - Enrich motifs in reviewed WT broad-stem regulatory peak sets"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+Step 8C separates the broad-stem diet response into shared, unit-6-specific,
+unit-8-specific, opposing, and composition-dominant components. It also
+creates stable ATAC peak sets without looking at DNA motifs. Step 8D tests
+JASPAR 2024 CORE vertebrate motifs only in peak sets that have been manually
+approved after Step 8C review.
+
+For each approved target set, background peaks are drawn from the same
+testable component universe and matched on:
+
+- baseline accessibility;
+- GC content;
+- peak width; and
+- promoter, gene-body, or intergenic context.
+
+Motif enrichment is a sequence-composition result, not proof that the
+corresponding transcription factor is expressed, active, or bound. A compact
+TF-expression column is included as secondary context only.
+
+## Statistical limitation
+
+The target peak sets originate from one pooled CON and one pooled HFD WT
+library. Motif P values quantify over-representation among sequences; they do
+not create biological replication or test a mouse-level diet effect.
+
+# 1. Setup
+
+Run after Step 8C in a fresh WT v2 session:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+Additional Bioconductor packages are required:
+
+```r
+BiocManager::install(
+  c(
+    "JASPAR2024",
+    "TFBSTools",
+    "motifmatchr",
+    "Biostrings",
+    "Rsamtools",
+    "DBI",
+    "RSQLite"
+  ),
+  ask = FALSE,
+  update = FALSE
+)
+```
+
+JASPAR2024 may populate its versioned cache the first time it is used.
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+motif_packages <- c(
+  "JASPAR2024",
+  "TFBSTools",
+  "motifmatchr",
+  "Biostrings",
+  "Rsamtools",
+  "DBI",
+  "RSQLite"
+)
+
+check_r_version()
+package_preflight(
+  packages = unique(c(required_packages, motif_packages))
+)
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(GenomicRanges)
+  library(IRanges)
+  library(ggplot2)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(tibble)
+  library(Biostrings)
+  library(Rsamtools)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(DBI)
+  library(RSQLite)
+  library(JASPAR2024)
+})
+
+ggplot2::theme_set(theme_multiome())
+future::plan(future::sequential)
+set.seed(20260921)
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 8D is defined for the WT v2 benchmark.",
+    call. = FALSE
+  )
+}
+```
+
+# 2. Define inputs, outputs, and matching rules
+
+```{r define-inputs-and-parameters}
+STEP8B_DIR <- file.path(
+  OUTPUT_DIR,
+  "08b_source_matched_persistent_hfd"
+)
+STEP8B_TABLE_DIR <- file.path(STEP8B_DIR, "tables")
+STEP8C_DIR <- file.path(
+  OUTPUT_DIR,
+  "08c_broad_stem_decomposition"
+)
+STEP8C_TABLE_DIR <- file.path(STEP8C_DIR, "tables")
+
+STEP8D_DIR <- file.path(
+  OUTPUT_DIR,
+  "08d_broad_stem_motif_enrichment"
+)
+STEP8D_TABLE_DIR <- file.path(STEP8D_DIR, "tables")
+STEP8D_PLOT_DIR <- file.path(STEP8D_DIR, "plots")
+
+dir.create(STEP8D_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8D_TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STEP8D_PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+STEP8C_COMPLETE_MARKER <- file.path(
+  STEP8C_DIR,
+  "STEP_08C_COMPLETE.txt"
+)
+MOTIF_PEAK_SET_PATH <- file.path(
+  STEP8C_TABLE_DIR,
+  "motif_ready_peak_sets.csv.gz"
+)
+MOTIF_BACKGROUND_PATH <- file.path(
+  STEP8C_TABLE_DIR,
+  "motif_background_universe.csv.gz"
+)
+MOTIF_PEAK_SET_SUMMARY_PATH <- file.path(
+  STEP8C_TABLE_DIR,
+  "motif_peak_set_summary.csv"
+)
+MOTIF_DECISION_PATH <- file.path(
+  COHORT_CONFIG_DIR,
+  "motif_peak_set_decision.csv"
+)
+STEP8B_RNA_EFFECT_PATH <- file.path(
+  STEP8B_TABLE_DIR,
+  "RNA_pooled_library_effects_by_matched_population.csv.gz"
+)
+
+GRCM39_FASTA <- Sys.getenv(
+  "MULTIOME_GRCM39_FASTA",
+  unset = file.path(
+    PROJECT_DIR,
+    "reference",
+    "GRCm39_2024-A",
+    "fasta",
+    "genome.fa"
+  )
+)
+
+required_inputs <- c(
+  Step8C_marker = STEP8C_COMPLETE_MARKER,
+  motif_peak_sets = MOTIF_PEAK_SET_PATH,
+  motif_background = MOTIF_BACKGROUND_PATH,
+  motif_peak_set_summary = MOTIF_PEAK_SET_SUMMARY_PATH,
+  motif_decision = MOTIF_DECISION_PATH,
+  Step8B_RNA_effects = STEP8B_RNA_EFFECT_PATH,
+  GRCm39_FASTA = GRCM39_FASTA
+)
+
+for (input_label in names(required_inputs)) {
+  assert_file(required_inputs[[input_label]], input_label)
+}
+
+if (!file.exists(paste0(GRCM39_FASTA, ".fai"))) {
+  stop(
+    "The GRCm39 FASTA index is missing: ",
+    paste0(GRCM39_FASTA, ".fai"),
+    "\nIndex the exact FASTA once with Rsamtools::indexFa() or samtools faidx.",
+    call. = FALSE
+  )
+}
+
+MINIMUM_TARGET_PEAKS <- 25L
+BACKGROUND_RATIO <- 10L
+MINIMUM_BACKGROUND_RATIO <- 3
+GC_BINS <- 4L
+WIDTH_BINS <- 3L
+ACCESSIBILITY_BINS <- 4L
+MOTIF_PVALUE_CUTOFF <- 5e-5
+TOP_MOTIFS_PER_SET <- 15L
+PREVIEW_PLOTS_IN_RSTUDIO <- FALSE
+
+analysis_parameters <- tibble::tibble(
+  parameter = c(
+    "minimum target peaks",
+    "target background ratio",
+    "minimum accepted background ratio",
+    "GC matching bins",
+    "width matching bins",
+    "accessibility matching bins",
+    "motif-match p-value cutoff",
+    "JASPAR release",
+    "JASPAR collection",
+    "JASPAR taxonomic group",
+    "replicated diet design",
+    "biological inference performed"
+  ),
+  value = c(
+    MINIMUM_TARGET_PEAKS,
+    BACKGROUND_RATIO,
+    MINIMUM_BACKGROUND_RATIO,
+    GC_BINS,
+    WIDTH_BINS,
+    ACCESSIBILITY_BINS,
+    MOTIF_PVALUE_CUTOFF,
+    "JASPAR2024",
+    "CORE",
+    "vertebrates",
+    FALSE,
+    FALSE
+  )
+)
+
+readr::write_csv(
+  analysis_parameters,
+  file.path(STEP8D_DIR, "step8d_parameters.csv")
+)
+```
+
+# 3. Helper functions
+
+```{r helper-functions}
+read_table_quietly <- function(path) {
+  suppressMessages(
+    readr::read_csv(
+      path,
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+  )
+}
+
+assert_columns <- function(data, required_columns, table_label) {
+  missing_columns <- setdiff(required_columns, colnames(data))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      table_label,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+preview_plot <- function(plot_object) {
+  if (isTRUE(PREVIEW_PLOTS_IN_RSTUDIO)) print(plot_object)
+  invisible(plot_object)
+}
+
+save_native_pdf <- function(
+  filename,
+  plot_object,
+  width = 11,
+  height = 7
+) {
+  output_path <- file.path(STEP8D_PLOT_DIR, filename)
+  grDevices::pdf(
+    file = output_path,
+    width = width,
+    height = height,
+    family = "Helvetica",
+    useDingbats = FALSE
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot_object)
+  invisible(output_path)
+}
+
+parse_approved <- function(values) {
+  tolower(trimws(as.character(values))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+matching_scope <- function(peak_set_id) {
+  dplyr::case_when(
+    grepl("^unit6_", peak_set_id) ~ "unit6",
+    grepl("^unit8_", peak_set_id) ~ "unit8",
+    grepl("^shared_", peak_set_id) ~ "both",
+    grepl("^opposing_", peak_set_id) ~ "both",
+    TRUE ~ "unknown"
+  )
+}
+
+matching_population <- function(peak_set_id) {
+  dplyr::case_when(
+    grepl("^unit6_", peak_set_id) ~ "crypt_progenitor",
+    grepl("^unit8_", peak_set_id) ~ "strict_ISC",
+    TRUE ~ "broad_stem"
+  )
+}
+
+accessibility_direction <- function(peak_set_id) {
+  dplyr::case_when(
+    grepl("HFD_opening", peak_set_id) ~ "HFD_opening",
+    grepl("CON_opening", peak_set_id) ~ "CON_opening",
+    grepl("unit6_HFD_unit8_CON", peak_set_id) ~
+      "opposing_unit6_HFD_unit8_CON",
+    grepl("unit6_CON_unit8_HFD", peak_set_id) ~
+      "opposing_unit6_CON_unit8_HFD",
+    TRUE ~ "not_classified"
+  )
+}
+
+safe_ntile <- function(x, bins) {
+  if (length(unique(x[is.finite(x)])) < 2L) {
+    return(rep.int(1L, length(x)))
+  }
+  dplyr::ntile(x, bins)
+}
+
+standardize_numeric <- function(x) {
+  x_center <- mean(x, na.rm = TRUE)
+  x_scale <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(x_scale) || x_scale == 0) x_scale <- 1
+  (x - x_center) / x_scale
+}
+
+match_background_for_set <- function(
+  peak_set_id,
+  target_peaks,
+  universe,
+  excluded_target_peaks,
+  background_ratio,
+  random_seed
+) {
+  scope <- matching_scope(peak_set_id)
+
+  eligible_universe <- universe |>
+    dplyr::filter(
+      dplyr::case_when(
+        scope == "unit6" ~ testable_unit6,
+        scope == "unit8" ~ testable_unit8,
+        scope == "both" ~ testable_unit6 & testable_unit8,
+        TRUE ~ FALSE
+      )
+    ) |>
+    dplyr::filter(!peak %in% excluded_target_peaks)
+
+  if (nrow(eligible_universe) == 0L) {
+    stop("No eligible background peaks for ", peak_set_id, ".")
+  }
+
+  combined <- dplyr::bind_rows(
+    target_peaks |>
+      dplyr::select(
+        peak,
+        gc_percent,
+        peak_width,
+        mean_detection_percent,
+        genomic_context
+      ) |>
+      dplyr::mutate(record_role = "target"),
+    eligible_universe |>
+      dplyr::select(
+        peak,
+        gc_percent,
+        peak_width,
+        mean_detection_percent,
+        genomic_context
+      ) |>
+      dplyr::mutate(record_role = "background_candidate")
+  ) |>
+    dplyr::mutate(
+      gc_bin = safe_ntile(gc_percent, GC_BINS),
+      width_bin = safe_ntile(peak_width, WIDTH_BINS),
+      accessibility_bin = safe_ntile(
+        mean_detection_percent,
+        ACCESSIBILITY_BINS
+      ),
+      matching_stratum = paste(
+        genomic_context,
+        gc_bin,
+        width_bin,
+        accessibility_bin,
+        sep = "|"
+      )
+    )
+
+  target_binned <- combined |>
+    dplyr::filter(record_role == "target")
+  background_binned <- combined |>
+    dplyr::filter(record_role == "background_candidate")
+
+  requested_by_stratum <- target_binned |>
+    dplyr::count(matching_stratum, name = "target_n") |>
+    dplyr::mutate(requested_background_n = target_n * background_ratio)
+
+  set.seed(random_seed)
+  initially_matched <- dplyr::bind_rows(
+    lapply(
+      seq_len(nrow(requested_by_stratum)),
+      function(stratum_index) {
+        stratum_value <- requested_by_stratum$matching_stratum[[
+          stratum_index
+        ]]
+        requested_n <- requested_by_stratum$requested_background_n[[
+          stratum_index
+        ]]
+        available <- background_binned |>
+          dplyr::filter(matching_stratum == stratum_value)
+
+        if (nrow(available) == 0L) return(NULL)
+        available |>
+          dplyr::slice_sample(n = min(requested_n, nrow(available)))
+      }
+    )
+  ) |>
+    dplyr::distinct(peak, .keep_all = TRUE)
+
+  desired_background_n <- min(
+    background_ratio * nrow(target_binned),
+    nrow(background_binned)
+  )
+
+  if (nrow(initially_matched) < desired_background_n) {
+    target_centers <- target_binned |>
+      dplyr::summarise(
+        gc = mean(gc_percent, na.rm = TRUE),
+        width = mean(log1p(peak_width), na.rm = TRUE),
+        accessibility = mean(
+          mean_detection_percent,
+          na.rm = TRUE
+        )
+      )
+
+    supplemental <- background_binned |>
+      dplyr::filter(!peak %in% initially_matched$peak)
+
+    gc_scaled <- standardize_numeric(
+      c(supplemental$gc_percent, target_centers$gc)
+    )
+    width_scaled <- standardize_numeric(
+      c(log1p(supplemental$peak_width), target_centers$width)
+    )
+    accessibility_scaled <- standardize_numeric(
+      c(
+        supplemental$mean_detection_percent,
+        target_centers$accessibility
+      )
+    )
+
+    target_index <- nrow(supplemental) + 1L
+    supplemental$gc_z <- gc_scaled[-target_index]
+    supplemental$width_z <- width_scaled[-target_index]
+    supplemental$accessibility_z <- accessibility_scaled[-target_index]
+
+    target_gc_z <- gc_scaled[[target_index]]
+    target_width_z <- width_scaled[[target_index]]
+    target_accessibility_z <- accessibility_scaled[[target_index]]
+
+    target_contexts <- unique(target_binned$genomic_context)
+    supplemental <- supplemental |>
+      dplyr::mutate(
+        matching_distance =
+          (gc_z - target_gc_z)^2 +
+          (width_z - target_width_z)^2 +
+          (accessibility_z - target_accessibility_z)^2 +
+          dplyr::if_else(
+            genomic_context %in% target_contexts,
+            0,
+            4
+          )
+      ) |>
+      dplyr::arrange(matching_distance) |>
+      dplyr::slice_head(
+        n = desired_background_n - nrow(initially_matched)
+      )
+
+    initially_matched <- dplyr::bind_rows(
+      initially_matched,
+      supplemental
+    ) |>
+      dplyr::distinct(peak, .keep_all = TRUE)
+  }
+
+  background_output <- initially_matched |>
+    dplyr::slice_head(n = desired_background_n) |>
+    dplyr::mutate(
+      motif_peak_set = peak_set_id,
+      membership = "background"
+    )
+
+  target_output <- target_binned |>
+    dplyr::mutate(
+      motif_peak_set = peak_set_id,
+      membership = "target"
+    )
+
+  membership <- dplyr::bind_rows(
+    target_output,
+    background_output
+  ) |>
+    dplyr::select(
+      motif_peak_set,
+      peak,
+      membership,
+      gc_percent,
+      peak_width,
+      mean_detection_percent,
+      genomic_context,
+      matching_stratum
+    )
+
+  achieved_ratio <- nrow(background_output) / nrow(target_output)
+
+  audit <- membership |>
+    dplyr::group_by(motif_peak_set, membership) |>
+    dplyr::summarise(
+      peaks = dplyr::n(),
+      GC_median = stats::median(gc_percent, na.rm = TRUE),
+      width_median = stats::median(peak_width, na.rm = TRUE),
+      accessibility_median = stats::median(
+        mean_detection_percent,
+        na.rm = TRUE
+      ),
+      promoter_percent = 100 * mean(
+        genomic_context == "promoter_proximal"
+      ),
+      gene_body_percent = 100 * mean(
+        genomic_context == "gene_body_nonpromoter"
+      ),
+      intergenic_percent = 100 * mean(
+        genomic_context == "intergenic"
+      ),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      requested_background_ratio = background_ratio,
+      achieved_background_ratio = achieved_ratio,
+      minimum_ratio_pass =
+        achieved_ratio >= MINIMUM_BACKGROUND_RATIO
+    )
+
+  if (!all(audit$minimum_ratio_pass)) {
+    stop(
+      "Background matching for ", peak_set_id,
+      " achieved only ", signif(achieved_ratio, 3),
+      " background peaks per target peak.",
+      call. = FALSE
+    )
+  }
+
+  list(membership = membership, audit = audit)
+}
+
+mouse_symbol_from_motif_name <- function(motif_name) {
+  simple_name <- grepl("^[A-Za-z][A-Za-z0-9]+$", motif_name)
+  output <- rep(NA_character_, length(motif_name))
+  output[simple_name] <- paste0(
+    toupper(substr(motif_name[simple_name], 1, 1)),
+    tolower(substr(motif_name[simple_name], 2, nchar(motif_name[simple_name])))
+  )
+  output
+}
+```
+
+# 4. Validate the manual motif decision
+
+Every approved row must have a reviewer and review date. The decision file is
+committed with all rows unapproved; approval should occur only after review of
+`motif_peak_set_summary.csv` and the Step 8C plots.
+
+```{r validate-motif-decision}
+motif_peak_sets <- read_table_quietly(MOTIF_PEAK_SET_PATH)
+motif_background <- read_table_quietly(MOTIF_BACKGROUND_PATH)
+motif_peak_set_summary <- read_table_quietly(
+  MOTIF_PEAK_SET_SUMMARY_PATH
+)
+motif_decision <- read_table_quietly(MOTIF_DECISION_PATH)
+
+assert_columns(
+  motif_peak_sets,
+  c(
+    "peak",
+    "motif_peak_set",
+    "chromosome",
+    "peak_start",
+    "peak_end",
+    "peak_width",
+    "genomic_context"
+  ),
+  "Step 8C motif peak sets"
+)
+assert_columns(
+  motif_background,
+  c(
+    "peak",
+    "chromosome",
+    "peak_start",
+    "peak_end",
+    "peak_width",
+    "genomic_context",
+    "testable_unit8",
+    "testable_unit6",
+    "mean_detection_percent"
+  ),
+  "Step 8C motif background"
+)
+assert_columns(
+  motif_decision,
+  c(
+    "cohort_id",
+    "peak_set_id",
+    "approved",
+    "reviewer",
+    "review_date",
+    "decision_notes"
+  ),
+  "motif decision table"
+)
+
+if (anyDuplicated(motif_decision$peak_set_id) > 0L) {
+  stop("Motif decision table contains duplicate peak_set_id values.")
+}
+
+motif_decision <- motif_decision |>
+  dplyr::mutate(
+    cohort_id = tolower(trimws(as.character(cohort_id))),
+    peak_set_id = trimws(as.character(peak_set_id)),
+    approved_logical = parse_approved(approved),
+    reviewer = trimws(as.character(reviewer)),
+    review_date = trimws(as.character(review_date)),
+    decision_notes = trimws(as.character(decision_notes))
+  )
+
+if (any(motif_decision$cohort_id != COHORT_ID)) {
+  stop("Motif decision table contains a non-WT cohort row.")
+}
+
+approved_decisions <- motif_decision |>
+  dplyr::filter(approved_logical)
+
+if (nrow(approved_decisions) == 0L) {
+  stop(
+    "No motif peak set has approved=TRUE. Review Step 8C, complete ",
+    MOTIF_DECISION_PATH,
+    ", and rerun Step 8D.",
+    call. = FALSE
+  )
+}
+
+if (
+  anyNA(approved_decisions$reviewer) ||
+    any(!nzchar(approved_decisions$reviewer)) ||
+    anyNA(approved_decisions$review_date) ||
+    any(!nzchar(approved_decisions$review_date))
+) {
+  stop(
+    "Every approved motif peak set requires reviewer and review_date.",
+    call. = FALSE
+  )
+}
+
+available_peak_sets <- unique(motif_peak_sets$motif_peak_set)
+missing_approved_sets <- setdiff(
+  approved_decisions$peak_set_id,
+  available_peak_sets
+)
+
+if (length(missing_approved_sets) > 0L) {
+  stop(
+    "Approved motif peak set(s) are absent from Step 8C: ",
+    paste(missing_approved_sets, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+approved_set_sizes <- motif_peak_sets |>
+  dplyr::filter(
+    motif_peak_set %in% approved_decisions$peak_set_id
+  ) |>
+  dplyr::count(motif_peak_set, name = "target_peaks")
+
+if (any(approved_set_sizes$target_peaks < MINIMUM_TARGET_PEAKS)) {
+  undersized <- approved_set_sizes$motif_peak_set[
+    approved_set_sizes$target_peaks < MINIMUM_TARGET_PEAKS
+  ]
+  stop(
+    "Approved motif set(s) contain fewer than ",
+    MINIMUM_TARGET_PEAKS,
+    " peaks: ",
+    paste(undersized, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  approved_decisions,
+  file.path(STEP8D_DIR, "approved_motif_peak_sets_applied.csv")
+)
+
+approved_set_sizes
+```
+
+# 5. Retrieve exact GRCm39 sequences and calculate GC content
+
+```{r retrieve-peak-sequences}
+approved_target_peaks <- motif_peak_sets |>
+  dplyr::filter(
+    motif_peak_set %in% approved_decisions$peak_set_id
+  ) |>
+  dplyr::select(
+    peak,
+    motif_peak_set,
+    chromosome,
+    peak_start,
+    peak_end,
+    peak_width,
+    genomic_context
+  ) |>
+  dplyr::distinct()
+
+all_sequence_candidates <- dplyr::bind_rows(
+  approved_target_peaks |>
+    dplyr::select(
+      peak,
+      chromosome,
+      peak_start,
+      peak_end,
+      peak_width,
+      genomic_context
+    ),
+  motif_background |>
+    dplyr::select(
+      peak,
+      chromosome,
+      peak_start,
+      peak_end,
+      peak_width,
+      genomic_context
+    )
+) |>
+  dplyr::distinct(peak, .keep_all = TRUE)
+
+fasta_file <- Rsamtools::FaFile(GRCM39_FASTA)
+fasta_index <- Rsamtools::scanFaIndex(fasta_file)
+fasta_seqnames <- as.character(GenomeInfoDb::seqnames(fasta_index))
+fasta_lengths <- GenomicRanges::width(fasta_index)
+names(fasta_lengths) <- fasta_seqnames
+
+sequence_qc <- all_sequence_candidates |>
+  dplyr::mutate(
+    chromosome_present = chromosome %in% fasta_seqnames,
+    coordinate_valid = chromosome_present &
+      peak_start >= 1L &
+      peak_end <= fasta_lengths[chromosome] &
+      peak_end >= peak_start,
+    exclusion_reason = dplyr::case_when(
+      !chromosome_present ~ "chromosome_absent_from_FASTA",
+      !coordinate_valid ~ "invalid_or_out_of_bounds_coordinate",
+      TRUE ~ NA_character_
+    )
+  )
+
+readr::write_csv(
+  sequence_qc,
+  file.path(STEP8D_TABLE_DIR, "motif_sequence_qc.csv.gz")
+)
+
+invalid_target_peaks <- approved_target_peaks |>
+  dplyr::anti_join(
+    sequence_qc |>
+      dplyr::filter(coordinate_valid) |>
+      dplyr::select(peak),
+    by = "peak"
+  )
+
+if (nrow(invalid_target_peaks) > 0L) {
+  stop(
+    "At least one approved target peak cannot be retrieved from the exact ",
+    "GRCm39 FASTA. Review motif_sequence_qc.csv before proceeding.",
+    call. = FALSE
+  )
+}
+
+valid_sequence_candidates <- sequence_qc |>
+  dplyr::filter(coordinate_valid)
+
+peak_ranges <- GenomicRanges::GRanges(
+  seqnames = valid_sequence_candidates$chromosome,
+  ranges = IRanges::IRanges(
+    start = valid_sequence_candidates$peak_start,
+    end = valid_sequence_candidates$peak_end
+  )
+)
+names(peak_ranges) <- valid_sequence_candidates$peak
+
+peak_sequences <- Rsamtools::scanFa(
+  fasta_file,
+  param = peak_ranges
+)
+names(peak_sequences) <- names(peak_ranges)
+names(peak_sequences) <- names(peak_ranges)
+
+gc_percent <- 100 * rowSums(
+  Biostrings::letterFrequency(
+    peak_sequences,
+    letters = c("G", "C"),
+    as.prob = TRUE
+  )
+)
+
+sequence_metrics <- valid_sequence_candidates |>
+  dplyr::mutate(
+    sequence_width = width(peak_sequences),
+    gc_percent = as.numeric(gc_percent),
+    sequence_width_matches_peak = sequence_width == peak_width
+  )
+
+if (any(!sequence_metrics$sequence_width_matches_peak)) {
+  stop("Retrieved FASTA sequence width does not match a peak width.")
+}
+
+readr::write_csv(
+  sequence_metrics,
+  file.path(STEP8D_TABLE_DIR, "motif_sequence_metrics.csv.gz")
+)
+```
+
+# 6. Match background peaks
+
+```{r match-background-peaks}
+background_with_gc <- motif_background |>
+  dplyr::inner_join(
+    sequence_metrics |>
+      dplyr::select(peak, gc_percent),
+    by = "peak"
+  )
+
+targets_with_gc <- approved_target_peaks |>
+  dplyr::inner_join(
+    motif_background |>
+      dplyr::select(peak, mean_detection_percent),
+    by = "peak"
+  ) |>
+  dplyr::inner_join(
+    sequence_metrics |>
+      dplyr::select(peak, gc_percent),
+    by = "peak"
+  )
+
+missing_target_accessibility <- setdiff(
+  approved_target_peaks$peak,
+  targets_with_gc$peak
+)
+
+if (length(missing_target_accessibility) > 0L) {
+  stop(
+    "Approved target peaks are missing from the background universe: ",
+    paste(head(missing_target_accessibility, 10), collapse = ", "),
+    call. = FALSE
+  )
+}
+
+matched_results <- lapply(
+  seq_len(nrow(approved_decisions)),
+  function(decision_index) {
+    peak_set_id <- approved_decisions$peak_set_id[[decision_index]]
+    target_set <- targets_with_gc |>
+      dplyr::filter(motif_peak_set == peak_set_id)
+
+    match_background_for_set(
+      peak_set_id = peak_set_id,
+      target_peaks = target_set,
+      universe = background_with_gc,
+      excluded_target_peaks = unique(targets_with_gc$peak),
+      background_ratio = BACKGROUND_RATIO,
+      random_seed = 20260921 + decision_index
+    )
+  }
+)
+
+motif_peak_membership <- dplyr::bind_rows(
+  lapply(matched_results, `[[`, "membership")
+)
+background_matching_audit <- dplyr::bind_rows(
+  lapply(matched_results, `[[`, "audit")
+)
+
+readr::write_csv(
+  motif_peak_membership,
+  file.path(STEP8D_TABLE_DIR, "motif_peak_membership.csv.gz")
+)
+readr::write_csv(
+  background_matching_audit,
+  file.path(STEP8D_TABLE_DIR, "motif_background_matching_audit.csv")
+)
+
+background_matching_audit
+```
+
+# 7. Retrieve JASPAR 2024 motifs and scan sequences
+
+The CORE vertebrate collection is queried with `all_versions = FALSE` to
+avoid treating multiple versions of the same JASPAR profile as independent
+discoveries.
+
+```{r retrieve-and-scan-jaspar-motifs}
+jaspar_options <- list(
+  collection = "CORE",
+  tax_group = "vertebrates",
+  all_versions = FALSE
+)
+
+load_jaspar_pfms <- function(options) {
+  jaspar_database <- JASPAR2024::JASPAR2024()
+  jaspar_connection <- DBI::dbConnect(
+    RSQLite::SQLite(),
+    db(jaspar_database)
+  )
+  on.exit(DBI::dbDisconnect(jaspar_connection), add = TRUE)
+
+  TFBSTools::getMatrixSet(
+    x = jaspar_connection,
+    opts = options
+  )
+}
+
+jaspar_pfms <- load_jaspar_pfms(jaspar_options)
+
+if (length(jaspar_pfms) == 0L) {
+  stop("JASPAR2024 returned no CORE vertebrate motifs.")
+}
+
+motif_metadata_base <- tibble::tibble(
+  motif_id = vapply(
+    jaspar_pfms,
+    TFBSTools::ID,
+    character(1)
+  ),
+  motif_name = vapply(
+    jaspar_pfms,
+    TFBSTools::name,
+    character(1)
+  ),
+  motif_class = vapply(
+    jaspar_pfms,
+    function(x) paste(TFBSTools::tags(x)$class, collapse = ";"),
+    character(1)
+  ),
+  motif_family = vapply(
+    jaspar_pfms,
+    function(x) paste(TFBSTools::tags(x)$family, collapse = ";"),
+    character(1)
+  )
+) |>
+  dplyr::mutate(
+    candidate_mouse_gene = mouse_symbol_from_motif_name(motif_name)
+  )
+
+scan_peaks <- unique(motif_peak_membership$peak)
+scan_sequences <- peak_sequences[scan_peaks]
+
+if (anyNA(match(scan_peaks, names(peak_sequences)))) {
+  stop("A matched target or background peak lacks a retrieved sequence.")
+}
+
+motif_match_object <- motifmatchr::matchMotifs(
+  pwms = jaspar_pfms,
+  subject = scan_sequences,
+  bg = "subject",
+  out = "matches",
+  p.cutoff = MOTIF_PVALUE_CUTOFF
+)
+
+motif_match_matrix <- motifmatchr::motifMatches(
+  motif_match_object
+)
+rownames(motif_match_matrix) <- scan_peaks
+
+if (nrow(motif_match_matrix) != length(scan_peaks)) {
+  stop("Motif match matrix does not align with scanned peaks.")
+}
+
+motif_matrix_columns <- colnames(motif_match_matrix)
+motif_matrix_ids <- vapply(
+  motif_matrix_columns,
+  function(matrix_column) {
+    matching_ids <- motif_metadata_base$motif_id[
+      startsWith(matrix_column, motif_metadata_base$motif_id)
+    ]
+    if (length(matching_ids) == 0L) return(NA_character_)
+    matching_ids[[which.max(nchar(matching_ids))]]
+  },
+  character(1)
+)
+
+motif_metadata <- tibble::tibble(
+  motif_match_column = motif_matrix_columns,
+  motif_id = motif_matrix_ids
+) |>
+  dplyr::left_join(motif_metadata_base, by = "motif_id")
+
+if (anyNA(motif_metadata$motif_name)) {
+  stop("JASPAR motif metadata and match matrix IDs do not agree.")
+}
+
+readr::write_csv(
+  motif_metadata,
+  file.path(STEP8D_TABLE_DIR, "JASPAR2024_CORE_motif_metadata.csv")
+)
+```
+
+# 8. Test motif enrichment
+
+```{r test-motif-enrichment}
+test_one_peak_set <- function(peak_set_id) {
+  membership <- motif_peak_membership |>
+    dplyr::filter(motif_peak_set == peak_set_id)
+
+  target_peaks <- membership$peak[membership$membership == "target"]
+  background_peaks <- membership$peak[
+    membership$membership == "background"
+  ]
+
+  target_matches <- motif_match_matrix[target_peaks, , drop = FALSE]
+  background_matches <- motif_match_matrix[
+    background_peaks,
+    ,
+    drop = FALSE
+  ]
+
+  target_with_motif <- Matrix::colSums(target_matches)
+  background_with_motif <- Matrix::colSums(background_matches)
+  target_without_motif <- length(target_peaks) - target_with_motif
+  background_without_motif <-
+    length(background_peaks) - background_with_motif
+
+  p_values <- vapply(
+    seq_along(target_with_motif),
+    function(motif_index) {
+      stats::fisher.test(
+        matrix(
+          c(
+            target_with_motif[[motif_index]],
+            target_without_motif[[motif_index]],
+            background_with_motif[[motif_index]],
+            background_without_motif[[motif_index]]
+          ),
+          nrow = 2,
+          byrow = TRUE
+        ),
+        alternative = "greater"
+      )$p.value
+    },
+    numeric(1)
+  )
+
+  tibble::tibble(
+    motif_peak_set = peak_set_id,
+    motif_match_column = colnames(motif_match_matrix),
+    target_peaks = length(target_peaks),
+    background_peaks = length(background_peaks),
+    target_with_motif = as.integer(target_with_motif),
+    background_with_motif = as.integer(background_with_motif),
+    target_motif_percent =
+      100 * target_with_motif / length(target_peaks),
+    background_motif_percent =
+      100 * background_with_motif / length(background_peaks),
+    motif_percentage_point_difference =
+      target_motif_percent - background_motif_percent,
+    odds_ratio_Haldane =
+      ((target_with_motif + 0.5) *
+        (background_without_motif + 0.5)) /
+      ((target_without_motif + 0.5) *
+        (background_with_motif + 0.5)),
+    p_value = p_values,
+    p_adjust_BH = stats::p.adjust(p_values, method = "BH")
+  ) |>
+    dplyr::left_join(motif_metadata, by = "motif_match_column") |>
+    dplyr::mutate(
+      matching_scope = matching_scope(motif_peak_set),
+      accessibility_direction = accessibility_direction(
+        motif_peak_set
+      )
+    ) |>
+    dplyr::arrange(p_adjust_BH, p_value, dplyr::desc(odds_ratio_Haldane))
+}
+
+motif_enrichment <- dplyr::bind_rows(
+  lapply(approved_decisions$peak_set_id, test_one_peak_set)
+)
+
+step8b_rna_effects <- read_table_quietly(STEP8B_RNA_EFFECT_PATH) |>
+  dplyr::mutate(feature_upper = toupper(feature))
+
+motif_enrichment <- motif_enrichment |>
+  dplyr::mutate(
+    comparison_population = matching_population(motif_peak_set),
+    candidate_mouse_gene_upper = toupper(candidate_mouse_gene)
+  ) |>
+  dplyr::left_join(
+    step8b_rna_effects |>
+      dplyr::select(
+        comparison_population,
+        feature_upper,
+        TF_RNA_log2FC = log2FC_comparison_vs_reference,
+        TF_RNA_detection_delta =
+          detection_difference_percentage_points
+      ),
+    by = c(
+      "comparison_population",
+      "candidate_mouse_gene_upper" = "feature_upper"
+    )
+  ) |>
+  dplyr::mutate(
+    TF_RNA_context_available = !is.na(TF_RNA_log2FC),
+    TF_RNA_direction_matches_peak_opening = dplyr::case_when(
+      !TF_RNA_context_available ~ NA,
+      accessibility_direction == "HFD_opening" &
+        TF_RNA_log2FC > 0 ~ TRUE,
+      accessibility_direction == "CON_opening" &
+        TF_RNA_log2FC < 0 ~ TRUE,
+      accessibility_direction %in% c(
+        "HFD_opening",
+        "CON_opening"
+      ) ~ FALSE,
+      TRUE ~ NA
+    )
+  )
+
+top_motif_candidates <- motif_enrichment |>
+  dplyr::filter(
+    is.finite(p_adjust_BH),
+    p_adjust_BH <= 0.10,
+    odds_ratio_Haldane > 1
+  ) |>
+  dplyr::group_by(motif_peak_set) |>
+  dplyr::slice_min(
+    order_by = p_adjust_BH,
+    n = TOP_MOTIFS_PER_SET,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  motif_enrichment,
+  file.path(STEP8D_TABLE_DIR, "motif_enrichment_results.csv.gz")
+)
+readr::write_csv(
+  top_motif_candidates,
+  file.path(STEP8D_TABLE_DIR, "motif_top_candidates.csv")
+)
+
+top_motif_candidates |>
+  dplyr::select(
+    motif_peak_set,
+    motif_id,
+    motif_name,
+    odds_ratio_Haldane,
+    p_adjust_BH,
+    target_motif_percent,
+    background_motif_percent,
+    candidate_mouse_gene,
+    TF_RNA_log2FC,
+    TF_RNA_direction_matches_peak_opening
+  )
+```
+
+# 9. Generate review figures
+
+```{r plot-background-audit}
+p_background <- background_matching_audit |>
+  dplyr::select(
+    motif_peak_set,
+    membership,
+    GC_median,
+    width_median,
+    accessibility_median,
+    promoter_percent,
+    gene_body_percent,
+    intergenic_percent
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(
+      GC_median,
+      width_median,
+      accessibility_median,
+      promoter_percent,
+      gene_body_percent,
+      intergenic_percent
+    ),
+    names_to = "matching_metric",
+    values_to = "value"
+  ) |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = membership,
+      y = value,
+      color = membership,
+      group = motif_peak_set
+    )
+  ) +
+  ggplot2::geom_line(alpha = 0.55) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::facet_grid(
+    matching_metric ~ motif_peak_set,
+    scales = "free_y"
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(target = "#D55E00", background = "#0072B2")
+  ) +
+  ggplot2::labs(
+    title = "Target and matched-background peak characteristics",
+    x = NULL,
+    y = NULL,
+    color = NULL
+  ) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    axis.text.x = ggplot2::element_text(angle = 30, hjust = 1)
+  )
+
+preview_plot(p_background)
+save_native_pdf(
+  "01_motif_background_matching_audit.pdf",
+  p_background,
+  width = max(11, 3 * nrow(approved_decisions)),
+  height = 12
+)
+```
+
+```{r plot-top-motifs}
+if (nrow(top_motif_candidates) > 0L) {
+  plot_motifs <- top_motif_candidates |>
+    dplyr::mutate(
+      motif_label = paste0(motif_name, " [", motif_id, "]"),
+      minus_log10_q = -log10(pmax(p_adjust_BH, 1e-300))
+    )
+
+  p_motifs <- ggplot2::ggplot(
+    plot_motifs,
+    ggplot2::aes(
+      x = odds_ratio_Haldane,
+      y = reorder(motif_label, odds_ratio_Haldane),
+      size = minus_log10_q,
+      color = motif_percentage_point_difference
+    )
+  ) +
+    ggplot2::geom_vline(xintercept = 1, color = "grey70") +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::facet_wrap(
+      ~ motif_peak_set,
+      scales = "free_y"
+    ) +
+    ggplot2::scale_color_gradient2(
+      low = "#0072B2",
+      mid = "grey85",
+      high = "#D55E00",
+      midpoint = 0
+    ) +
+    ggplot2::labs(
+      title = "JASPAR 2024 motifs enriched in reviewed WT regulatory peak sets",
+      subtitle = "Fisher tests use GC-, width-, accessibility-, and context-matched background peaks",
+      x = "Motif odds ratio (Haldane corrected)",
+      y = NULL,
+      size = expression(-log[10](BH~q)),
+      color = "Target minus background\npercentage points",
+      caption = "Motif enrichment is sequence evidence; TF RNA is secondary context and binding is not established."
+    ) +
+    ggplot2::theme(legend.position = "bottom")
+
+  preview_plot(p_motifs)
+  save_native_pdf(
+    "02_reviewed_peak_set_motif_enrichment.pdf",
+    p_motifs,
+    width = 14,
+    height = max(8, 4 * ceiling(nrow(approved_decisions) / 2))
+  )
+}
+```
+
+# 10. Write completion summaries
+
+```{r write-completion-summary}
+motif_summary <- motif_enrichment |>
+  dplyr::group_by(motif_peak_set) |>
+  dplyr::summarise(
+    target_peaks = dplyr::first(target_peaks),
+    background_peaks = dplyr::first(background_peaks),
+    motifs_tested = dplyr::n(),
+    motifs_BH_q_0_05 = sum(p_adjust_BH <= 0.05, na.rm = TRUE),
+    motifs_BH_q_0_10 = sum(p_adjust_BH <= 0.10, na.rm = TRUE),
+    top_motif = motif_name[which.min(p_adjust_BH)],
+    top_motif_q = min(p_adjust_BH, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    approved_decisions |>
+      dplyr::select(
+        peak_set_id,
+        reviewer,
+        review_date,
+        decision_notes
+      ),
+    by = c("motif_peak_set" = "peak_set_id")
+  ) |>
+  dplyr::mutate(
+    replicated_diet_design = FALSE,
+    biological_inference_performed = FALSE
+  )
+
+readr::write_csv(
+  motif_summary,
+  file.path(STEP8D_DIR, "step8d_motif_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 8D completed:", Sys.time()),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste(
+      "Approved motif peak sets:",
+      paste(approved_decisions$peak_set_id, collapse = ",")
+    ),
+    paste("JASPAR motifs tested:", length(jaspar_pfms)),
+    paste("GRCm39 FASTA:", GRCM39_FASTA),
+    "Matched-background motif enrichment performed: TRUE",
+    "GC matching performed: TRUE",
+    "Accessibility matching performed: TRUE",
+    "Peak-width matching performed: TRUE",
+    "Genomic-context matching performed: TRUE",
+    "TF expression used as required evidence: FALSE",
+    "Motif enrichment interpreted as TF binding: FALSE",
+    "Replicated diet inference performed: FALSE"
+  ),
+  con = file.path(STEP8D_DIR, "STEP_08D_COMPLETE.txt")
+)
+
+motif_summary
+```
+
+# Interpretation checkpoint
+
+Prioritize motifs that:
+
+1. remain enriched against a well-matched background;
+2. recur in biologically related peak sets or distinguish unit 6 from unit 8;
+3. have a plausible TF expressed in the relevant component population; and
+4. connect to source-concordant RNA plus promoter candidates without being
+   treated as proof of TF binding.
+
+Do not select a TF solely because its motif has the smallest P value. Similar
+DNA-binding families often share motifs, and motif presence cannot identify
+which family member occupies a locus. Candidate mechanisms should ultimately
+be supported by TF expression, motif deviation/activity, footprinting where
+coverage permits, distal peak-to-gene evidence, or orthogonal experiments.
