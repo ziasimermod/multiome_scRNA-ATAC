@@ -1,0 +1,1880 @@
+---
+title: "Step 5D - Symmetric pseudobulk validation of Gourab d21 and WT epithelial annotations"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# Purpose
+
+Step 5C established that one-way transfer of Gourab's labels onto WT nuclei is
+useful as descriptive evidence, but the inverse WT-to-Gourab transfer collapsed
+onto the WT Reg4-positive DCS reference. That collapse makes the inverse labels
+unsuitable for biological interpretation.
+
+This notebook therefore replaces reciprocal label transfer with a symmetric
+comparison that does not train either dataset on the other. It:
+
+1. records a formal QC disposition for the Step 5C inverse transfer;
+2. retains Gourab's original integrated clusters inside each named state;
+3. constructs cluster-by-diet RNA pseudobulks independently in each dataset;
+4. compares relative marker programs after gene-wise standardization within
+   each dataset and diet;
+5. evaluates similarity in both directions, including mutual-best matches;
+6. bootstraps genes to measure match stability; and
+7. reports focused evidence for WT crypt and secretory clusters.
+
+This is annotation validation, not a diet-effect test. Both datasets contain
+one pooled library per diet, so diet is used as a sensitivity stratum and is
+balanced in the primary identity comparison. No WT labels are overwritten.
+
+A practical SOL allocation is **8 CPU cores, 64 GiB memory, 6 hours, R 4.4.2,
+no GPU**.
+
+# 1. Setup
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 12,
+  fig.height = 8
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+if (!requireNamespace("presto", quietly = TRUE)) {
+  stop(
+    "Package 'presto' is required so the integrated-cluster marker audit is ",
+    "tractable. Run setup/install_packages.R in a clean R session first.",
+    call. = FALSE
+  )
+}
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 5D requires MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+
+ggplot2::theme_set(theme_multiome())
+future::plan(future::sequential)
+set.seed(12345)
+```
+
+# 2. Inputs, outputs, and review parameters
+
+```{r define-inputs-and-outputs}
+ANALYSIS_VERSION <- "05d_symmetric_pseudobulk_v1"
+
+STEP5C_DIR <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "gourab_d21_rna_reference_mapping"
+)
+
+STEP5C_TABLE_DIR <- file.path(STEP5C_DIR, "tables")
+
+STEP5D_DIR <- file.path(
+  STEP5C_DIR,
+  "05d_symmetric_pseudobulk_validation"
+)
+
+STEP5D_TABLE_DIR <- file.path(STEP5D_DIR, "tables")
+STEP5D_PLOT_DIR <- file.path(STEP5D_DIR, "plots")
+
+STEP6_OBJECT_PATH <- file.path(
+  OUTPUT_DIR,
+  "06_annotation",
+  "multiome_annotated.rds"
+)
+
+WT_MARKER_PATH <- file.path(
+  OUTPUT_DIR,
+  "06_annotation",
+  "markers",
+  "RNA_all_positive_markers.csv"
+)
+
+SOURCE_REFERENCE_PATH <- file.path(
+  STEP5C_DIR,
+  "Gourab_d21_annotated_scRNA_reference.rds"
+)
+
+INVERSE_ASSIGNMENT_PATH <- file.path(
+  STEP5C_DIR,
+  "Gourab_d21_WT_inverse_label_transfer_assignments.csv"
+)
+
+for (output_directory in c(
+  STEP5D_DIR,
+  STEP5D_TABLE_DIR,
+  STEP5D_PLOT_DIR
+)) {
+  dir.create(output_directory, recursive = TRUE, showWarnings = FALSE)
+}
+
+for (input_path in c(
+  STEP6_OBJECT_PATH,
+  WT_MARKER_PATH,
+  SOURCE_REFERENCE_PATH,
+  INVERSE_ASSIGNMENT_PATH
+)) {
+  assert_file(input_path)
+}
+
+MIN_CELLS_PER_CLUSTER_DIET <- 10L
+TOP_MARKERS_PER_CLUSTER <- 100L
+MIN_PRIMARY_FEATURES <- 100L
+GENE_BOOTSTRAP_ITERATIONS <- 200L
+BOOTSTRAP_SEED <- 20260921L
+
+PRIMARY_WT_CONFIDENCE <- c("high", "moderate")
+SOURCE_EPITHELIAL_STATES <- c(
+  "Stem", "TAC", "DSC", "Goblet", "EC", "EEC", "Tuft"
+)
+
+CRYPT_FOCUS_CLUSTERS <- c("0", "6", "8")
+SECRETORY_FOCUS_CLUSTERS <- c("4", "5", "7", "9", "13", "18")
+FOCUS_WT_CLUSTERS <- c(CRYPT_FOCUS_CLUSTERS, SECRETORY_FOCUS_CLUSTERS)
+
+CELL_CYCLE_GENES <- unique(c(
+  Seurat::cc.genes.updated.2019$s.genes,
+  Seurat::cc.genes.updated.2019$g2m.genes
+))
+
+TECHNICAL_GENE_PATTERN <- paste0(
+  "^(mt-|Rpl|Rps|Gm[0-9]+|Mir[0-9]+|Snor|Hist[0-9]|Hsp[0-9])",
+  "|Rik$"
+)
+
+CURATED_PROGRAMS <- list(
+  ISC_crypt = c(
+    "Lgr5", "Ascl2", "Smoc2", "Axin2", "Olfm4", "Sox9",
+    "Prom1", "Hopx", "Tert", "Lrig1"
+  ),
+  Cycling = c(
+    "Mki67", "Top2a", "Cenpf", "Ube2c", "Cdk1", "Ccnb1",
+    "Tpx2", "Nusap1", "Kif11", "Birc5"
+  ),
+  Crypt_progenitor = c(
+    "Dmbt1", "Cftr", "Htr4", "Kcnq1", "Slc12a2", "Sema5a",
+    "Hmga2", "Clca3a2", "Kitl", "Hmgcs2"
+  ),
+  Reg4_DSC = c(
+    "Reg4", "Spink4", "Kit", "Agr2", "Klk1", "Hepacam2",
+    "Slc12a8", "Sytl2", "Car8", "Plcb4"
+  ),
+  Goblet = c(
+    "Muc2", "Spdef", "Fcgbp", "Clca1", "Zg16", "Agr2",
+    "Tff3", "Scin", "Bcas1", "Clec2h"
+  ),
+  Absorptive = c(
+    "Krt20", "Car4", "Aqp8", "Slc26a3", "Mxd1", "Lama3",
+    "Tgm3", "Trpm6", "Slc9a2", "Muc3"
+  ),
+  Enteroendocrine = c(
+    "Chga", "Chgb", "Neurod1", "Rfx6", "Cpe", "Pcsk1",
+    "Pyy", "Gcg", "Insl5", "Tph1"
+  ),
+  Enterochromaffin = c(
+    "Tph1", "Tac1", "Ddc", "Slc18a1", "Lmx1a", "Chga", "Chgb"
+  ),
+  Distal_L = c(
+    "Gcg", "Pyy", "Insl5", "Pcsk1", "Neurod1", "Chga", "Chgb"
+  ),
+  Tuft = c(
+    "Pou2f3", "Dclk1", "Trpm5", "Gnat3", "Sh2d6", "Rgs13",
+    "Avil", "Ltc4s"
+  )
+)
+
+EXPECTED_WT_FAMILIES <- list(
+  Stem = c("0", "6", "8"),
+  TAC = c("0", "18"),
+  DSC = c("4", "7", "9", "13", "18"),
+  Goblet = c("4", "5", "7", "13"),
+  EC = c("1", "3", "19"),
+  EEC = c("14", "16"),
+  Tuft = c("20")
+)
+
+save_pdf_plot <- function(path, plot_object, width, height) {
+  grDevices::pdf(
+    file = path,
+    width = width,
+    height = height,
+    useDingbats = FALSE
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot_object)
+  invisible(path)
+}
+```
+
+# 3. Formal disposition of the Step 5C inverse transfer
+
+This chunk does not retry the transfer. It quantifies whether the previous
+inverse result is sufficiently diverse and lineage-consistent to be used as
+annotation evidence.
+
+```{r audit-step5c-inverse-transfer}
+inverse_assignments <- suppressMessages(
+  readr::read_csv(INVERSE_ASSIGNMENT_PATH, show_col_types = FALSE)
+)
+
+required_inverse_columns <- c(
+  "source_cell_state",
+  "WT_cell_state_predicted_label",
+  "WT_wnn_cluster_predicted_label"
+)
+
+missing_inverse_columns <- setdiff(
+  required_inverse_columns,
+  colnames(inverse_assignments)
+)
+
+if (length(missing_inverse_columns) > 0L) {
+  stop(
+    "Step 5C inverse assignments are missing column(s): ",
+    paste(missing_inverse_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+inverse_cluster_distribution <- inverse_assignments |>
+  dplyr::count(
+    WT_wnn_cluster_predicted_label,
+    name = "cells",
+    sort = TRUE
+  ) |>
+  dplyr::mutate(percent = 100 * cells / sum(cells))
+
+inverse_state_distribution <- inverse_assignments |>
+  dplyr::count(
+    WT_cell_state_predicted_label,
+    name = "cells",
+    sort = TRUE
+  ) |>
+  dplyr::mutate(percent = 100 * cells / sum(cells))
+
+inverse_expected_family_recovery <- purrr::imap_dfr(
+  EXPECTED_WT_FAMILIES,
+  function(expected_clusters, source_state) {
+    state_data <- inverse_assignments |>
+      dplyr::filter(source_cell_state == source_state)
+
+    tibble::tibble(
+      source_cell_state = source_state,
+      source_cells = nrow(state_data),
+      expected_WT_clusters = paste(expected_clusters, collapse = ";"),
+      expected_family_cells = sum(
+        as.character(state_data$WT_wnn_cluster_predicted_label) %in%
+          expected_clusters
+      ),
+      expected_family_percent = if (nrow(state_data) == 0L) {
+        NA_real_
+      } else {
+        100 * expected_family_cells / nrow(state_data)
+      },
+      dominant_predicted_cluster = if (nrow(state_data) == 0L) {
+        NA_character_
+      } else {
+        names(sort(table(
+          as.character(state_data$WT_wnn_cluster_predicted_label)
+        ), decreasing = TRUE))[[1]]
+      }
+    )
+  }
+)
+
+dominant_cluster_percent <- inverse_cluster_distribution$percent[[1]]
+predicted_cluster_coverage <- dplyr::n_distinct(
+  inverse_assignments$WT_wnn_cluster_predicted_label
+)
+predicted_state_coverage <- dplyr::n_distinct(
+  inverse_assignments$WT_cell_state_predicted_label
+)
+median_expected_family_recovery <- stats::median(
+  inverse_expected_family_recovery$expected_family_percent,
+  na.rm = TRUE
+)
+
+inverse_failed <- (
+  dominant_cluster_percent >= 50 ||
+    predicted_cluster_coverage < 8 ||
+    predicted_state_coverage < 8 ||
+    median_expected_family_recovery < 25
+)
+
+inverse_qc_disposition <- tibble::tibble(
+  metric = c(
+    "dominant_predicted_WT_cluster_percent",
+    "predicted_WT_cluster_coverage",
+    "predicted_WT_state_coverage",
+    "median_expected_family_recovery_percent"
+  ),
+  observed = c(
+    dominant_cluster_percent,
+    predicted_cluster_coverage,
+    predicted_state_coverage,
+    median_expected_family_recovery
+  ),
+  failure_rule = c(">= 50", "< 8", "< 8", "< 25"),
+  failed = c(
+    dominant_cluster_percent >= 50,
+    predicted_cluster_coverage < 8,
+    predicted_state_coverage < 8,
+    median_expected_family_recovery < 25
+  ),
+  overall_disposition = ifelse(
+    inverse_failed,
+    "FAILED_FOR_BIOLOGICAL_INTERPRETATION",
+    "PASSED_DESCRIPTIVE_QC"
+  )
+)
+
+readr::write_csv(
+  inverse_cluster_distribution,
+  file.path(STEP5D_TABLE_DIR, "step5c_inverse_cluster_distribution.csv")
+)
+
+readr::write_csv(
+  inverse_state_distribution,
+  file.path(STEP5D_TABLE_DIR, "step5c_inverse_state_distribution.csv")
+)
+
+readr::write_csv(
+  inverse_expected_family_recovery,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "step5c_inverse_expected_family_recovery.csv"
+  )
+)
+
+readr::write_csv(
+  inverse_qc_disposition,
+  file.path(STEP5D_TABLE_DIR, "step5c_inverse_qc_disposition.csv")
+)
+
+inverse_qc_disposition
+```
+
+# 4. Load and validate both independently annotated datasets
+
+```{r load-and-validate-objects}
+source_reference <- readRDS(SOURCE_REFERENCE_PATH)
+multiome <- readRDS(STEP6_OBJECT_PATH)
+
+source_metadata <- source_reference[[]]
+wt_metadata <- multiome[[]]
+
+required_source_metadata <- c(
+  "source_diet",
+  "source_cell_state",
+  "source_integrated_cluster"
+)
+
+required_wt_metadata <- c(
+  "diet",
+  "wnn_cluster",
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence"
+)
+
+missing_source_metadata <- setdiff(
+  required_source_metadata,
+  colnames(source_metadata)
+)
+
+missing_wt_metadata <- setdiff(
+  required_wt_metadata,
+  colnames(wt_metadata)
+)
+
+if (length(missing_source_metadata) > 0L) {
+  stop(
+    "The source reference is missing metadata column(s): ",
+    paste(missing_source_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (length(missing_wt_metadata) > 0L) {
+  stop(
+    "The WT Step 6 object is missing metadata column(s): ",
+    paste(missing_wt_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!"RNA" %in% names(source_reference) || !"RNA" %in% names(multiome)) {
+  stop("Both objects must contain an RNA assay.", call. = FALSE)
+}
+
+if (!"counts" %in% SeuratObject::Layers(source_reference[["RNA"]])) {
+  stop("The source RNA assay lacks a joined counts layer.", call. = FALSE)
+}
+
+if (!"counts" %in% SeuratObject::Layers(multiome[["RNA"]])) {
+  stop("The WT RNA assay lacks a joined counts layer.", call. = FALSE)
+}
+
+source_counts <- SeuratObject::LayerData(
+  source_reference[["RNA"]],
+  layer = "counts"
+)
+
+wt_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+
+if (!setequal(colnames(source_counts), rownames(source_metadata))) {
+  stop("Source counts and metadata do not contain the same cells.")
+}
+
+if (!setequal(colnames(wt_counts), rownames(wt_metadata))) {
+  stop("WT counts and metadata do not contain the same cells.")
+}
+
+source_counts <- source_counts[, rownames(source_metadata), drop = FALSE]
+wt_counts <- wt_counts[, rownames(wt_metadata), drop = FALSE]
+
+source_metadata <- source_metadata |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::mutate(
+    diet = as.character(source_diet),
+    source_cell_state = as.character(source_cell_state),
+    source_integrated_cluster = as.character(source_integrated_cluster),
+    source_cluster_id = paste0("G", source_integrated_cluster),
+    source_cluster_label = paste0(
+      source_cluster_id,
+      " (", source_cell_state, ")"
+    )
+  )
+
+wt_metadata <- wt_metadata |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::mutate(
+    diet = as.character(diet),
+    wnn_cluster = as.character(wnn_cluster),
+    broad_compartment = as.character(broad_compartment),
+    cell_state = as.character(cell_state),
+    cell_state_full = as.character(cell_state_full),
+    annotation_confidence = tolower(as.character(annotation_confidence)),
+    wt_cluster_id = paste0("W", wnn_cluster),
+    wt_cluster_label = paste0("W", wnn_cluster, " (", cell_state, ")")
+  )
+
+if (!setequal(unique(source_metadata$diet), c("CON", "HFD"))) {
+  stop("Expected exactly CON and HFD in the source reference.")
+}
+
+if (!setequal(unique(wt_metadata$diet), c("CON", "HFD"))) {
+  stop("Expected exactly CON and HFD in the WT object.")
+}
+
+source_keep <- source_metadata$source_cell_state %in%
+  SOURCE_EPITHELIAL_STATES
+
+wt_keep <- (
+  wt_metadata$broad_compartment == "epithelial" &
+    wt_metadata$annotation_confidence %in% PRIMARY_WT_CONFIDENCE
+)
+
+source_metadata_epithelial <- source_metadata[source_keep, , drop = FALSE]
+wt_metadata_epithelial <- wt_metadata[wt_keep, , drop = FALSE]
+
+source_counts_epithelial <- source_counts[
+  , source_keep, drop = FALSE
+]
+
+wt_counts_epithelial <- wt_counts[, wt_keep, drop = FALSE]
+
+dataset_cell_summary <- dplyr::bind_rows(
+  source_metadata_epithelial |>
+    dplyr::count(
+      dataset = "Gourab_d21_scRNA",
+      diet,
+      cluster = source_cluster_label,
+      state = source_cell_state,
+      name = "cells"
+    ),
+  wt_metadata_epithelial |>
+    dplyr::count(
+      dataset = "WT_snMultiome_RNA",
+      diet,
+      cluster = wt_cluster_label,
+      state = cell_state,
+      name = "cells"
+    )
+)
+
+readr::write_csv(
+  dataset_cell_summary,
+  file.path(STEP5D_TABLE_DIR, "epithelial_cluster_cell_counts_by_diet.csv")
+)
+
+dataset_cell_summary
+```
+
+# 5. Audit Gourab's original integrated clusters
+
+The named Gourab labels aggregate multiple integrated clusters. Marker testing
+at the integrated-cluster level reveals whether a named state is internally
+coherent or spans several biological subprograms.
+
+```{r source-integrated-cluster-audit}
+source_epithelial <- subset(
+  source_reference,
+  cells = source_metadata_epithelial$cell_barcode
+)
+
+Seurat::Idents(source_epithelial) <- "source_integrated_cluster"
+
+source_integrated_markers <- Seurat::FindAllMarkers(
+  source_epithelial,
+  assay = "RNA",
+  only.pos = TRUE,
+  test.use = "wilcox",
+  min.pct = 0.10,
+  logfc.threshold = 0.25,
+  return.thresh = 0.05,
+  verbose = FALSE
+)
+
+if (nrow(source_integrated_markers) == 0L) {
+  stop("No Gourab integrated-cluster markers passed the thresholds.")
+}
+
+source_fc_column <- intersect(
+  c("avg_log2FC", "avg_logFC"),
+  colnames(source_integrated_markers)
+)
+
+if (length(source_fc_column) != 1L) {
+  stop("Could not identify the source marker fold-change column.")
+}
+
+source_integrated_markers$effect_size <-
+  source_integrated_markers[[source_fc_column]]
+
+source_integrated_markers$pct_delta <- with(
+  source_integrated_markers,
+  pct.1 - pct.2
+)
+
+source_cluster_annotation <- source_metadata_epithelial |>
+  dplyr::distinct(
+    source_integrated_cluster,
+    source_cluster_id,
+    source_cluster_label,
+    source_cell_state
+  )
+
+source_integrated_markers <- source_integrated_markers |>
+  dplyr::mutate(
+    cluster = as.character(cluster),
+    gene = as.character(gene)
+  ) |>
+  dplyr::left_join(
+    source_cluster_annotation,
+    by = c("cluster" = "source_integrated_cluster")
+  )
+
+source_integrated_top_markers <- source_integrated_markers |>
+  dplyr::filter(!grepl(TECHNICAL_GENE_PATTERN, gene)) |>
+  dplyr::group_by(cluster) |>
+  dplyr::arrange(
+    p_val_adj,
+    dplyr::desc(pct_delta),
+    dplyr::desc(effect_size),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = TOP_MARKERS_PER_CLUSTER) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  source_integrated_markers,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "source_integrated_cluster_all_positive_markers.csv"
+  )
+)
+
+readr::write_csv(
+  source_integrated_top_markers,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "source_integrated_cluster_top_markers.csv"
+  )
+)
+
+source_integrated_top_markers |>
+  dplyr::select(
+    source_cluster_label,
+    gene,
+    effect_size,
+    pct.1,
+    pct.2,
+    p_val_adj
+  )
+```
+
+# 6. Build cluster-by-diet pseudobulks
+
+```{r build-cluster-diet-pseudobulks}
+aggregate_sparse_counts <- function(counts, groups) {
+  groups <- as.character(groups)
+  group_levels <- sort(unique(groups))
+  group_factor <- factor(groups, levels = group_levels)
+  design <- Matrix::sparse.model.matrix(~ 0 + group_factor)
+  colnames(design) <- group_levels
+  counts %*% design
+}
+
+log2_cpm <- function(pseudobulk_counts) {
+  library_sizes <- Matrix::colSums(pseudobulk_counts)
+
+  if (any(library_sizes <= 0)) {
+    stop("A pseudobulk has a non-positive library size.")
+  }
+
+  cpm <- t(t(pseudobulk_counts) / library_sizes) * 1e6
+  log2(cpm + 1)
+}
+
+source_metadata_epithelial <- source_metadata_epithelial |>
+  dplyr::mutate(
+    pseudobulk_id = paste(source_cluster_id, diet, sep = "__")
+  )
+
+wt_metadata_epithelial <- wt_metadata_epithelial |>
+  dplyr::mutate(
+    pseudobulk_id = paste(wt_cluster_id, diet, sep = "__")
+  )
+
+source_pseudobulk_counts <- aggregate_sparse_counts(
+  source_counts_epithelial,
+  source_metadata_epithelial$pseudobulk_id
+)
+
+wt_pseudobulk_counts <- aggregate_sparse_counts(
+  wt_counts_epithelial,
+  wt_metadata_epithelial$pseudobulk_id
+)
+
+source_pb_metadata <- source_metadata_epithelial |>
+  dplyr::count(
+    pseudobulk_id,
+    source_cluster_id,
+    source_cluster_label,
+    source_integrated_cluster,
+    source_cell_state,
+    diet,
+    name = "cells"
+  ) |>
+  dplyr::arrange(match(pseudobulk_id, colnames(source_pseudobulk_counts)))
+
+wt_pb_metadata <- wt_metadata_epithelial |>
+  dplyr::count(
+    pseudobulk_id,
+    wt_cluster_id,
+    wt_cluster_label,
+    wnn_cluster,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    diet,
+    name = "cells"
+  ) |>
+  dplyr::arrange(match(pseudobulk_id, colnames(wt_pseudobulk_counts)))
+
+if (!identical(
+  source_pb_metadata$pseudobulk_id,
+  colnames(source_pseudobulk_counts)
+)) {
+  stop("Source pseudobulk metadata are not aligned with counts.")
+}
+
+if (!identical(
+  wt_pb_metadata$pseudobulk_id,
+  colnames(wt_pseudobulk_counts)
+)) {
+  stop("WT pseudobulk metadata are not aligned with counts.")
+}
+
+source_pb_keep <- source_pb_metadata$cells >= MIN_CELLS_PER_CLUSTER_DIET
+wt_pb_keep <- wt_pb_metadata$cells >= MIN_CELLS_PER_CLUSTER_DIET
+
+source_pseudobulk_counts <- source_pseudobulk_counts[
+  , source_pb_keep, drop = FALSE
+]
+source_pb_metadata <- source_pb_metadata[source_pb_keep, , drop = FALSE]
+
+wt_pseudobulk_counts <- wt_pseudobulk_counts[, wt_pb_keep, drop = FALSE]
+wt_pb_metadata <- wt_pb_metadata[wt_pb_keep, , drop = FALSE]
+
+source_pseudobulk_logcpm <- log2_cpm(source_pseudobulk_counts)
+wt_pseudobulk_logcpm <- log2_cpm(wt_pseudobulk_counts)
+
+readr::write_csv(
+  source_pb_metadata,
+  file.path(STEP5D_TABLE_DIR, "source_pseudobulk_metadata.csv")
+)
+
+readr::write_csv(
+  wt_pb_metadata,
+  file.path(STEP5D_TABLE_DIR, "WT_pseudobulk_metadata.csv")
+)
+
+saveRDS(
+  list(
+    source_counts = source_pseudobulk_counts,
+    source_log2_cpm = source_pseudobulk_logcpm,
+    source_metadata = source_pb_metadata,
+    wt_counts = wt_pseudobulk_counts,
+    wt_log2_cpm = wt_pseudobulk_logcpm,
+    wt_metadata = wt_pb_metadata
+  ),
+  file.path(STEP5D_DIR, "symmetric_pseudobulk_matrices.rds")
+)
+```
+
+# 7. Define independent marker and curated feature panels
+
+```{r define-feature-panels}
+wt_markers <- suppressMessages(
+  readr::read_csv(WT_MARKER_PATH, show_col_types = FALSE)
+)
+
+required_wt_marker_columns <- c("cluster", "gene", "p_val_adj")
+missing_wt_marker_columns <- setdiff(
+  required_wt_marker_columns,
+  colnames(wt_markers)
+)
+
+if (length(missing_wt_marker_columns) > 0L) {
+  stop(
+    "WT marker table is missing column(s): ",
+    paste(missing_wt_marker_columns, collapse = ", ")
+  )
+}
+
+wt_fc_column <- intersect(
+  c("effect_size", "avg_log2FC", "avg_logFC"),
+  colnames(wt_markers)
+)
+
+if (length(wt_fc_column) == 0L) {
+  stop("Could not identify a WT marker fold-change column.")
+}
+
+wt_fc_column <- wt_fc_column[[1]]
+
+eligible_wt_clusters <- sort(unique(wt_pb_metadata$wnn_cluster))
+
+wt_top_markers <- wt_markers |>
+  dplyr::mutate(
+    cluster = as.character(cluster),
+    gene = as.character(gene),
+    effect_size_for_ranking = .data[[wt_fc_column]]
+  ) |>
+  dplyr::filter(
+    cluster %in% eligible_wt_clusters,
+    p_val_adj < 0.05,
+    !grepl(TECHNICAL_GENE_PATTERN, gene)
+  ) |>
+  dplyr::group_by(cluster) |>
+  dplyr::arrange(
+    p_val_adj,
+    dplyr::desc(effect_size_for_ranking),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = TOP_MARKERS_PER_CLUSTER) |>
+  dplyr::ungroup()
+
+shared_expression_genes <- intersect(
+  rownames(source_pseudobulk_logcpm),
+  rownames(wt_pseudobulk_logcpm)
+)
+
+source_marker_genes <- unique(source_integrated_top_markers$gene)
+wt_marker_genes <- unique(wt_top_markers$gene)
+curated_lineage_genes <- unique(unlist(CURATED_PROGRAMS))
+
+feature_panels <- list(
+  shared_identity_no_cell_cycle = setdiff(
+    intersect(source_marker_genes, wt_marker_genes),
+    CELL_CYCLE_GENES
+  ),
+  union_identity_no_cell_cycle = setdiff(
+    union(source_marker_genes, wt_marker_genes),
+    CELL_CYCLE_GENES
+  ),
+  union_identity_with_cell_cycle = union(
+    source_marker_genes,
+    wt_marker_genes
+  ),
+  curated_lineage = curated_lineage_genes
+)
+
+feature_panels <- lapply(
+  feature_panels,
+  function(features) {
+    sort(intersect(unique(features), shared_expression_genes))
+  }
+)
+
+feature_panel_summary <- purrr::imap_dfr(
+  feature_panels,
+  function(features, panel_name) {
+    tibble::tibble(
+      feature_panel = panel_name,
+      genes = length(features),
+      cell_cycle_genes = sum(features %in% CELL_CYCLE_GENES),
+      primary_panel = panel_name == "shared_identity_no_cell_cycle"
+    )
+  }
+)
+
+if (
+  length(feature_panels$shared_identity_no_cell_cycle) <
+    MIN_PRIMARY_FEATURES
+) {
+  stop(
+    "The primary shared marker panel contains only ",
+    length(feature_panels$shared_identity_no_cell_cycle),
+    " genes; expected at least ", MIN_PRIMARY_FEATURES,
+    ". Review the marker inputs before lowering this threshold.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  feature_panel_summary,
+  file.path(STEP5D_TABLE_DIR, "feature_panel_summary.csv")
+)
+
+readr::write_csv(
+  purrr::imap_dfr(
+    feature_panels,
+    ~ tibble::tibble(feature_panel = .y, gene = .x)
+  ),
+  file.path(STEP5D_TABLE_DIR, "feature_panel_genes.csv")
+)
+
+feature_panel_summary
+```
+
+# 8. Standardize expression within each dataset and diet
+
+Gene-wise z-scores compare the relative enrichment pattern among clusters
+within a platform. This reduces global whole-cell-versus-nucleus detection
+differences. It does not make the two technologies identical.
+
+```{r standardize-expression-and-balance-diets}
+zscore_by_diet <- function(expression_matrix, pseudobulk_metadata) {
+  output <- expression_matrix
+
+  for (diet_value in unique(pseudobulk_metadata$diet)) {
+    diet_columns <- which(pseudobulk_metadata$diet == diet_value)
+    diet_matrix <- expression_matrix[, diet_columns, drop = FALSE]
+
+    gene_means <- Matrix::rowMeans(diet_matrix)
+    gene_sds <- apply(diet_matrix, 1, stats::sd)
+    gene_sds[!is.finite(gene_sds) | gene_sds == 0] <- 1
+
+    output[, diet_columns] <- (
+      diet_matrix - gene_means
+    ) / gene_sds
+  }
+
+  output
+}
+
+average_cluster_profiles <- function(
+  standardized_matrix,
+  pseudobulk_metadata,
+  cluster_column,
+  diet_filter = c("CON", "HFD")
+) {
+  metadata_subset <- pseudobulk_metadata |>
+    dplyr::filter(diet %in% diet_filter)
+
+  matrix_subset <- standardized_matrix[
+    , match(metadata_subset$pseudobulk_id, colnames(standardized_matrix)),
+    drop = FALSE
+  ]
+
+  cluster_values <- metadata_subset[[cluster_column]]
+  cluster_levels <- sort(unique(cluster_values))
+
+  profile_matrix <- vapply(
+    cluster_levels,
+    function(cluster_value) {
+      Matrix::rowMeans(
+        matrix_subset[, cluster_values == cluster_value, drop = FALSE]
+      )
+    },
+    numeric(nrow(matrix_subset))
+  )
+
+  rownames(profile_matrix) <- rownames(matrix_subset)
+  colnames(profile_matrix) <- cluster_levels
+  profile_matrix
+}
+
+source_z <- zscore_by_diet(
+  source_pseudobulk_logcpm,
+  source_pb_metadata
+)
+
+wt_z <- zscore_by_diet(
+  wt_pseudobulk_logcpm,
+  wt_pb_metadata
+)
+
+source_profiles_by_scope <- list(
+  diet_balanced = average_cluster_profiles(
+    source_z,
+    source_pb_metadata,
+    "source_cluster_id",
+    c("CON", "HFD")
+  ),
+  CON = average_cluster_profiles(
+    source_z,
+    source_pb_metadata,
+    "source_cluster_id",
+    "CON"
+  ),
+  HFD = average_cluster_profiles(
+    source_z,
+    source_pb_metadata,
+    "source_cluster_id",
+    "HFD"
+  )
+)
+
+wt_profiles_by_scope <- list(
+  diet_balanced = average_cluster_profiles(
+    wt_z,
+    wt_pb_metadata,
+    "wt_cluster_id",
+    c("CON", "HFD")
+  ),
+  CON = average_cluster_profiles(
+    wt_z,
+    wt_pb_metadata,
+    "wt_cluster_id",
+    "CON"
+  ),
+  HFD = average_cluster_profiles(
+    wt_z,
+    wt_pb_metadata,
+    "wt_cluster_id",
+    "HFD"
+  )
+)
+```
+
+# 9. Compute symmetric similarities and mutual-best matches
+
+```{r compute-symmetric-similarities}
+compute_similarity <- function(
+  source_profiles,
+  wt_profiles,
+  features,
+  feature_panel,
+  diet_scope
+) {
+  features <- Reduce(
+    intersect,
+    list(features, rownames(source_profiles), rownames(wt_profiles))
+  )
+
+  if (length(features) < 10L) {
+    stop("Fewer than 10 genes are available for ", feature_panel, ".")
+  }
+
+  correlation_matrix <- stats::cor(
+    source_profiles[features, , drop = FALSE],
+    wt_profiles[features, , drop = FALSE],
+    method = "spearman",
+    use = "pairwise.complete.obs"
+  )
+
+  as.data.frame(as.table(correlation_matrix)) |>
+    tibble::as_tibble() |>
+    dplyr::rename(
+      source_cluster_id = Var1,
+      wt_cluster_id = Var2,
+      spearman_rho = Freq
+    ) |>
+    dplyr::mutate(
+      source_cluster_id = as.character(source_cluster_id),
+      wt_cluster_id = as.character(wt_cluster_id),
+      feature_panel = feature_panel,
+      diet_scope = diet_scope,
+      genes = length(features)
+    )
+}
+
+similarity_all <- purrr::imap_dfr(
+  feature_panels,
+  function(features, panel_name) {
+    purrr::map_dfr(
+      names(source_profiles_by_scope),
+      function(scope_name) {
+        compute_similarity(
+          source_profiles_by_scope[[scope_name]],
+          wt_profiles_by_scope[[scope_name]],
+          features,
+          panel_name,
+          scope_name
+        )
+      }
+    )
+  }
+)
+
+source_lookup <- source_cluster_annotation |>
+  dplyr::select(
+    source_cluster_id,
+    source_cluster_label,
+    source_integrated_cluster,
+    source_cell_state
+  )
+
+wt_lookup <- wt_metadata_epithelial |>
+  dplyr::distinct(
+    wt_cluster_id,
+    wt_cluster_label,
+    wnn_cluster,
+    cell_state,
+    cell_state_full,
+    annotation_confidence
+  )
+
+similarity_all <- similarity_all |>
+  dplyr::left_join(source_lookup, by = "source_cluster_id") |>
+  dplyr::left_join(wt_lookup, by = "wt_cluster_id")
+
+rank_similarity_pairs <- function(similarity_table) {
+  source_ranked <- similarity_table |>
+    dplyr::group_by(feature_panel, diet_scope, source_cluster_id) |>
+    dplyr::arrange(dplyr::desc(spearman_rho), .by_group = TRUE) |>
+    dplyr::mutate(
+      source_to_WT_rank = dplyr::row_number(),
+      source_to_WT_margin = dplyr::first(spearman_rho) -
+        dplyr::nth(spearman_rho, 2, default = dplyr::first(spearman_rho))
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::select(
+      feature_panel,
+      diet_scope,
+      source_cluster_id,
+      wt_cluster_id,
+      source_to_WT_rank,
+      source_to_WT_margin
+    )
+
+  wt_ranked <- similarity_table |>
+    dplyr::group_by(feature_panel, diet_scope, wt_cluster_id) |>
+    dplyr::arrange(dplyr::desc(spearman_rho), .by_group = TRUE) |>
+    dplyr::mutate(
+      WT_to_source_rank = dplyr::row_number(),
+      WT_to_source_margin = dplyr::first(spearman_rho) -
+        dplyr::nth(spearman_rho, 2, default = dplyr::first(spearman_rho))
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::select(
+      feature_panel,
+      diet_scope,
+      source_cluster_id,
+      wt_cluster_id,
+      WT_to_source_rank,
+      WT_to_source_margin
+    )
+
+  similarity_table |>
+    dplyr::left_join(
+      source_ranked,
+      by = c(
+        "feature_panel", "diet_scope",
+        "source_cluster_id", "wt_cluster_id"
+      )
+    ) |>
+    dplyr::left_join(
+      wt_ranked,
+      by = c(
+        "feature_panel", "diet_scope",
+        "source_cluster_id", "wt_cluster_id"
+      )
+    ) |>
+    dplyr::mutate(
+      mutual_top1 = source_to_WT_rank == 1L & WT_to_source_rank == 1L
+    )
+}
+
+similarity_ranked <- rank_similarity_pairs(similarity_all)
+
+readr::write_csv(
+  similarity_ranked,
+  file.path(STEP5D_TABLE_DIR, "symmetric_cluster_similarity_all.csv")
+)
+
+primary_similarity <- similarity_ranked |>
+  dplyr::filter(
+    feature_panel == "shared_identity_no_cell_cycle",
+    diet_scope == "diet_balanced"
+  )
+
+readr::write_csv(
+  primary_similarity,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "primary_diet_balanced_symmetric_similarity.csv"
+  )
+)
+
+primary_similarity |>
+  dplyr::filter(source_to_WT_rank <= 3L | WT_to_source_rank <= 3L) |>
+  dplyr::arrange(source_cluster_id, source_to_WT_rank)
+```
+
+# 10. Gene-bootstrap stability of the primary comparison
+
+```{r bootstrap-primary-similarity}
+primary_features <- feature_panels$shared_identity_no_cell_cycle
+source_primary_profiles <- source_profiles_by_scope$diet_balanced
+wt_primary_profiles <- wt_profiles_by_scope$diet_balanced
+
+set.seed(BOOTSTRAP_SEED)
+
+bootstrap_similarity <- purrr::map_dfr(
+  seq_len(GENE_BOOTSTRAP_ITERATIONS),
+  function(iteration) {
+    sampled_features <- sample(
+      primary_features,
+      size = length(primary_features),
+      replace = TRUE
+    )
+
+    correlation_matrix <- stats::cor(
+      source_primary_profiles[sampled_features, , drop = FALSE],
+      wt_primary_profiles[sampled_features, , drop = FALSE],
+      method = "spearman",
+      use = "pairwise.complete.obs"
+    )
+
+    as.data.frame(as.table(correlation_matrix)) |>
+      tibble::as_tibble() |>
+      dplyr::rename(
+        source_cluster_id = Var1,
+        wt_cluster_id = Var2,
+        spearman_rho = Freq
+      ) |>
+      dplyr::mutate(
+        iteration = iteration,
+        source_cluster_id = as.character(source_cluster_id),
+        wt_cluster_id = as.character(wt_cluster_id)
+      )
+  }
+)
+
+bootstrap_source_top1 <- bootstrap_similarity |>
+  dplyr::group_by(iteration, source_cluster_id) |>
+  dplyr::slice_max(
+    order_by = spearman_rho,
+    n = 1L,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::count(
+    source_cluster_id,
+    wt_cluster_id,
+    name = "source_to_WT_top1_iterations"
+  ) |>
+  dplyr::mutate(
+    source_to_WT_top1_frequency =
+      source_to_WT_top1_iterations / GENE_BOOTSTRAP_ITERATIONS
+  )
+
+bootstrap_wt_top1 <- bootstrap_similarity |>
+  dplyr::group_by(iteration, wt_cluster_id) |>
+  dplyr::slice_max(
+    order_by = spearman_rho,
+    n = 1L,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::count(
+    wt_cluster_id,
+    source_cluster_id,
+    name = "WT_to_source_top1_iterations"
+  ) |>
+  dplyr::mutate(
+    WT_to_source_top1_frequency =
+      WT_to_source_top1_iterations / GENE_BOOTSTRAP_ITERATIONS
+  )
+
+bootstrap_pair_summary <- bootstrap_similarity |>
+  dplyr::group_by(source_cluster_id, wt_cluster_id) |>
+  dplyr::summarise(
+    bootstrap_median_rho = stats::median(spearman_rho),
+    bootstrap_q025_rho = stats::quantile(spearman_rho, 0.025),
+    bootstrap_q975_rho = stats::quantile(spearman_rho, 0.975),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    bootstrap_source_top1,
+    by = c("source_cluster_id", "wt_cluster_id")
+  ) |>
+  dplyr::left_join(
+    bootstrap_wt_top1,
+    by = c("source_cluster_id", "wt_cluster_id")
+  ) |>
+  dplyr::mutate(
+    source_to_WT_top1_frequency = dplyr::coalesce(
+      source_to_WT_top1_frequency,
+      0
+    ),
+    WT_to_source_top1_frequency = dplyr::coalesce(
+      WT_to_source_top1_frequency,
+      0
+    )
+  ) |>
+  dplyr::left_join(source_lookup, by = "source_cluster_id") |>
+  dplyr::left_join(wt_lookup, by = "wt_cluster_id")
+
+primary_similarity_bootstrapped <- primary_similarity |>
+  dplyr::left_join(
+    bootstrap_pair_summary |>
+      dplyr::select(
+        source_cluster_id,
+        wt_cluster_id,
+        bootstrap_median_rho,
+        bootstrap_q025_rho,
+        bootstrap_q975_rho,
+        source_to_WT_top1_frequency,
+        WT_to_source_top1_frequency
+      ),
+    by = c("source_cluster_id", "wt_cluster_id")
+  )
+
+readr::write_csv(
+  bootstrap_pair_summary,
+  file.path(STEP5D_TABLE_DIR, "primary_similarity_gene_bootstrap.csv")
+)
+
+readr::write_csv(
+  primary_similarity_bootstrapped,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "primary_similarity_with_bootstrap_support.csv"
+  )
+)
+```
+
+# 11. Curated lineage-program specificity
+
+```{r curated-lineage-program-specificity}
+score_programs <- function(profile_matrix, programs, dataset_name) {
+  purrr::imap_dfr(
+    programs,
+    function(program_genes, program_name) {
+      detected_genes <- intersect(program_genes, rownames(profile_matrix))
+
+      if (length(detected_genes) == 0L) {
+        return(tibble::tibble())
+      }
+
+      tibble::tibble(
+        dataset = dataset_name,
+        cluster_id = colnames(profile_matrix),
+        program = program_name,
+        mean_relative_expression = Matrix::colMeans(
+          profile_matrix[detected_genes, , drop = FALSE]
+        ),
+        detected_program_genes = length(detected_genes),
+        requested_program_genes = length(program_genes)
+      )
+    }
+  )
+}
+
+curated_program_scores <- dplyr::bind_rows(
+  score_programs(
+    source_profiles_by_scope$diet_balanced,
+    CURATED_PROGRAMS,
+    "Gourab d21 scRNA"
+  ) |>
+    dplyr::left_join(
+      source_lookup,
+      by = c("cluster_id" = "source_cluster_id")
+    ) |>
+    dplyr::mutate(cluster_label = source_cluster_label),
+  score_programs(
+    wt_profiles_by_scope$diet_balanced,
+    CURATED_PROGRAMS,
+    "WT snMultiome RNA"
+  ) |>
+    dplyr::left_join(
+      wt_lookup,
+      by = c("cluster_id" = "wt_cluster_id")
+    ) |>
+    dplyr::mutate(cluster_label = wt_cluster_label)
+)
+
+readr::write_csv(
+  curated_program_scores,
+  file.path(STEP5D_TABLE_DIR, "curated_lineage_program_scores.csv")
+)
+```
+
+# 12. Focused crypt and secretory review tables
+
+```{r focused-crypt-and-secretory-review}
+focus_similarity <- primary_similarity_bootstrapped |>
+  dplyr::filter(wnn_cluster %in% FOCUS_WT_CLUSTERS) |>
+  dplyr::group_by(wt_cluster_id) |>
+  dplyr::arrange(dplyr::desc(spearman_rho), .by_group = TRUE) |>
+  dplyr::mutate(WT_match_rank_within_focus_table = dplyr::row_number()) |>
+  dplyr::filter(
+    WT_match_rank_within_focus_table <= 5L |
+      mutual_top1 |
+      WT_to_source_top1_frequency >= 0.10
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(
+    match(wnn_cluster, FOCUS_WT_CLUSTERS),
+    WT_match_rank_within_focus_table
+  )
+
+focus_panel_sensitivity <- similarity_ranked |>
+  dplyr::filter(wnn_cluster %in% FOCUS_WT_CLUSTERS) |>
+  dplyr::group_by(feature_panel, diet_scope, wt_cluster_id) |>
+  dplyr::slice_max(
+    order_by = spearman_rho,
+    n = 3L,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(
+    match(wnn_cluster, FOCUS_WT_CLUSTERS),
+    feature_panel,
+    diet_scope,
+    dplyr::desc(spearman_rho)
+  )
+
+readr::write_csv(
+  focus_similarity,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "focused_WT_crypt_secretory_primary_matches.csv"
+  )
+)
+
+readr::write_csv(
+  focus_panel_sensitivity,
+  file.path(
+    STEP5D_TABLE_DIR,
+    "focused_WT_crypt_secretory_panel_and_diet_sensitivity.csv"
+  )
+)
+
+focus_similarity
+```
+
+# 13. Visual review
+
+```{r source-integrated-cluster-umap, fig.width=15, fig.height=7}
+if ("umap.source" %in% names(source_reference@reductions)) {
+  source_umap <- Seurat::Embeddings(source_reference, "umap.source") |>
+    as.data.frame() |>
+    tibble::rownames_to_column("cell_barcode") |>
+    dplyr::left_join(
+      source_metadata |>
+        dplyr::select(
+          cell_barcode,
+          diet,
+          source_cell_state,
+          source_integrated_cluster,
+          source_cluster_label
+        ),
+      by = "cell_barcode"
+    )
+
+  p_source_cluster <- ggplot2::ggplot(
+    source_umap,
+    ggplot2::aes(
+      x = .data[[colnames(source_umap)[[2]]]],
+      y = .data[[colnames(source_umap)[[3]]]],
+      color = source_integrated_cluster
+    )
+  ) +
+    ggplot2::geom_point(size = 0.35, alpha = 0.75) +
+    ggplot2::facet_wrap(~ diet, nrow = 1) +
+    ggplot2::coord_equal() +
+    ggplot2::labs(
+      title = "Gourab d21 original integrated clusters",
+      subtitle = "Named states may contain more than one integrated cluster",
+      x = "UMAP 1",
+      y = "UMAP 2",
+      color = "Integrated\ncluster"
+    ) +
+    theme_multiome() +
+    ggplot2::theme(
+      panel.grid = ggplot2::element_blank(),
+      axis.text = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank()
+    )
+
+  print(p_source_cluster)
+  save_pdf_plot(
+    file.path(STEP5D_PLOT_DIR, "01_source_integrated_clusters_by_diet.pdf"),
+    p_source_cluster,
+    15,
+    7
+  )
+}
+```
+
+```{r source-integrated-marker-dotplot, fig.width=18, fig.height=11}
+source_marker_display_genes <- source_integrated_top_markers |>
+  dplyr::group_by(cluster) |>
+  dplyr::slice_head(n = 5L) |>
+  dplyr::ungroup() |>
+  dplyr::pull(gene) |>
+  unique()
+
+source_marker_display_genes <- intersect(
+  source_marker_display_genes,
+  rownames(source_epithelial)
+)
+
+p_source_markers <- Seurat::DotPlot(
+  source_epithelial,
+  features = source_marker_display_genes,
+  group.by = "source_integrated_cluster",
+  assay = "RNA"
+) +
+  ggplot2::coord_flip() +
+  ggplot2::labs(
+    title = "Gourab d21 integrated-cluster marker audit",
+    x = "Integrated cluster",
+    y = NULL
+  ) +
+  theme_multiome() +
+  ggplot2::theme(
+    axis.text.y = ggplot2::element_text(size = 7)
+  )
+
+print(p_source_markers)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "02_source_integrated_cluster_markers.pdf"),
+  p_source_markers,
+  18,
+  11
+)
+```
+
+```{r primary-similarity-heatmap, fig.width=15, fig.height=11}
+p_primary_heatmap <- ggplot2::ggplot(
+  primary_similarity,
+  ggplot2::aes(
+    x = wt_cluster_label,
+    y = source_cluster_label,
+    fill = spearman_rho
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.15) +
+  ggplot2::geom_point(
+    data = primary_similarity |>
+      dplyr::filter(mutual_top1),
+    shape = 21,
+    size = 3,
+    stroke = 0.9,
+    fill = NA,
+    color = "black"
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "white",
+    high = "#B40426",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish
+  ) +
+  ggplot2::labs(
+    title = "Diet-balanced symmetric epithelial similarity",
+    subtitle = paste0(
+      "Spearman correlation of ",
+      length(primary_features),
+      " shared identity markers; circles mark mutual top-1 matches"
+    ),
+    x = "WT snMultiome WNN cluster",
+    y = "Gourab d21 integrated cluster",
+    fill = "Spearman\nrho"
+  ) +
+  theme_multiome() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 55, hjust = 1),
+    axis.text.y = ggplot2::element_text(size = 8)
+  )
+
+print(p_primary_heatmap)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "03_primary_diet_balanced_similarity.pdf"),
+  p_primary_heatmap,
+  15,
+  11
+)
+```
+
+```{r sensitivity-heatmaps, fig.width=18, fig.height=14}
+panel_sensitivity_plot_data <- similarity_ranked |>
+  dplyr::filter(diet_scope == "diet_balanced")
+
+p_panel_sensitivity <- ggplot2::ggplot(
+  panel_sensitivity_plot_data,
+  ggplot2::aes(
+    x = wt_cluster_label,
+    y = source_cluster_label,
+    fill = spearman_rho
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.1) +
+  ggplot2::facet_wrap(~ feature_panel, ncol = 2) +
+  ggplot2::scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "white",
+    high = "#B40426",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish
+  ) +
+  ggplot2::labs(
+    title = "Similarity sensitivity to feature-panel definition",
+    x = "WT cluster",
+    y = "Gourab integrated cluster",
+    fill = "Spearman\nrho"
+  ) +
+  theme_multiome() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 70, hjust = 1, size = 6),
+    axis.text.y = ggplot2::element_text(size = 6)
+  )
+
+print(p_panel_sensitivity)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "04_feature_panel_sensitivity.pdf"),
+  p_panel_sensitivity,
+  18,
+  14
+)
+
+diet_sensitivity_plot_data <- similarity_ranked |>
+  dplyr::filter(feature_panel == "shared_identity_no_cell_cycle")
+
+p_diet_sensitivity <- ggplot2::ggplot(
+  diet_sensitivity_plot_data,
+  ggplot2::aes(
+    x = wt_cluster_label,
+    y = source_cluster_label,
+    fill = spearman_rho
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.1) +
+  ggplot2::facet_wrap(~ diet_scope, ncol = 1) +
+  ggplot2::scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "white",
+    high = "#B40426",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish
+  ) +
+  ggplot2::labs(
+    title = "Similarity sensitivity to diet stratum",
+    subtitle = "CON and HFD are descriptive pooled-library strata",
+    x = "WT cluster",
+    y = "Gourab integrated cluster",
+    fill = "Spearman\nrho"
+  ) +
+  theme_multiome() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 70, hjust = 1, size = 6),
+    axis.text.y = ggplot2::element_text(size = 6)
+  )
+
+print(p_diet_sensitivity)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "05_diet_stratum_sensitivity.pdf"),
+  p_diet_sensitivity,
+  17,
+  18
+)
+```
+
+```{r curated-program-heatmap, fig.width=17, fig.height=14}
+p_curated_programs <- ggplot2::ggplot(
+  curated_program_scores,
+  ggplot2::aes(
+    x = program,
+    y = cluster_label,
+    fill = mean_relative_expression
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.15) +
+  ggplot2::facet_wrap(~ dataset, scales = "free_y", ncol = 1) +
+  ggplot2::scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "white",
+    high = "#B40426",
+    midpoint = 0
+  ) +
+  ggplot2::labs(
+    title = "Curated lineage-program specificity",
+    subtitle = "Mean relative expression in diet-balanced profiles",
+    x = NULL,
+    y = NULL,
+    fill = "Mean relative\nexpression"
+  ) +
+  theme_multiome() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    axis.text.y = ggplot2::element_text(size = 7)
+  )
+
+print(p_curated_programs)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "06_curated_lineage_program_specificity.pdf"),
+  p_curated_programs,
+  17,
+  14
+)
+```
+
+```{r bootstrap-focus-plot, fig.width=13, fig.height=11}
+focus_best_matches <- primary_similarity_bootstrapped |>
+  dplyr::filter(wnn_cluster %in% FOCUS_WT_CLUSTERS) |>
+  dplyr::group_by(wt_cluster_id) |>
+  dplyr::slice_max(
+    order_by = spearman_rho,
+    n = 3L,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    comparison_label = paste0(
+      wt_cluster_label,
+      "  <-  ",
+      source_cluster_label
+    ),
+    comparison_label = factor(
+      comparison_label,
+      levels = rev(unique(comparison_label))
+    )
+  )
+
+p_bootstrap_focus <- ggplot2::ggplot(
+  focus_best_matches,
+  ggplot2::aes(
+    x = bootstrap_median_rho,
+    y = comparison_label,
+    color = WT_to_source_top1_frequency
+  )
+) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      xmin = bootstrap_q025_rho,
+      xmax = bootstrap_q975_rho
+    ),
+    orientation = "y",
+    width = 0.20,
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_vline(xintercept = 0, linetype = 2, color = "grey50") +
+  ggplot2::scale_color_viridis_c(
+    limits = c(0, 1),
+    labels = scales::label_percent()
+  ) +
+  ggplot2::labs(
+    title = "Stability of focused WT crypt and secretory matches",
+    subtitle = paste0(
+      GENE_BOOTSTRAP_ITERATIONS,
+      " gene bootstraps; intervals are 2.5th-97.5th percentiles"
+    ),
+    x = "Bootstrap Spearman correlation",
+    y = NULL,
+    color = "WT-to-source\ntop-1 frequency"
+  ) +
+  theme_multiome()
+
+print(p_bootstrap_focus)
+save_pdf_plot(
+  file.path(STEP5D_PLOT_DIR, "07_focused_match_bootstrap_stability.pdf"),
+  p_bootstrap_focus,
+  13,
+  11
+)
+```
+
+# 14. Save review summary and completion records
+
+```{r save-completion-records}
+primary_mutual_matches <- primary_similarity_bootstrapped |>
+  dplyr::filter(mutual_top1) |>
+  dplyr::arrange(dplyr::desc(spearman_rho))
+
+readr::write_csv(
+  primary_mutual_matches,
+  file.path(STEP5D_TABLE_DIR, "primary_mutual_top1_matches.csv")
+)
+
+step5d_summary <- tibble::tibble(
+  analysis_version = ANALYSIS_VERSION,
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  inverse_transfer_disposition = ifelse(
+    inverse_failed,
+    "FAILED_FOR_BIOLOGICAL_INTERPRETATION",
+    "PASSED_DESCRIPTIVE_QC"
+  ),
+  source_epithelial_cells = nrow(source_metadata_epithelial),
+  source_integrated_clusters = dplyr::n_distinct(
+    source_metadata_epithelial$source_integrated_cluster
+  ),
+  WT_epithelial_nuclei = nrow(wt_metadata_epithelial),
+  WT_clusters = dplyr::n_distinct(wt_metadata_epithelial$wnn_cluster),
+  primary_feature_genes = length(primary_features),
+  primary_mutual_top1_matches = nrow(primary_mutual_matches),
+  bootstrap_iterations = GENE_BOOTSTRAP_ITERATIONS,
+  annotation_overrides_applied = FALSE,
+  biological_diet_inference_performed = FALSE
+)
+
+readr::write_csv(
+  step5d_summary,
+  file.path(STEP5D_DIR, "step5d_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 5D completed:", Sys.time()),
+    paste("Analysis version:", ANALYSIS_VERSION),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste(
+      "Step 5C inverse-transfer disposition:",
+      step5d_summary$inverse_transfer_disposition
+    ),
+    paste("Source epithelial cells:", nrow(source_metadata_epithelial)),
+    paste(
+      "Source integrated clusters:",
+      dplyr::n_distinct(source_metadata_epithelial$source_integrated_cluster)
+    ),
+    paste("WT epithelial nuclei:", nrow(wt_metadata_epithelial)),
+    paste(
+      "WT clusters:",
+      dplyr::n_distinct(wt_metadata_epithelial$wnn_cluster)
+    ),
+    paste("Primary identity genes:", length(primary_features)),
+    paste("Primary mutual top-1 matches:", nrow(primary_mutual_matches)),
+    paste("Gene bootstrap iterations:", GENE_BOOTSTRAP_ITERATIONS),
+    "WT annotation overrides applied: FALSE",
+    "Biological diet inference performed: FALSE"
+  ),
+  con = file.path(STEP5D_DIR, "STEP_05D_COMPLETE.txt")
+)
+
+writeLines(
+  c(
+    "Step 5D symmetric pseudobulk validation is ready for manual review.",
+    paste(
+      "Review inverse-transfer QC:",
+      file.path(STEP5D_TABLE_DIR, "step5c_inverse_qc_disposition.csv")
+    ),
+    paste(
+      "Review primary similarity:",
+      file.path(
+        STEP5D_TABLE_DIR,
+        "primary_similarity_with_bootstrap_support.csv"
+      )
+    ),
+    paste(
+      "Review focused crypt/secretory matches:",
+      file.path(
+        STEP5D_TABLE_DIR,
+        "focused_WT_crypt_secretory_primary_matches.csv"
+      )
+    ),
+    paste(
+      "Review panel/diet sensitivity:",
+      file.path(
+        STEP5D_TABLE_DIR,
+        "focused_WT_crypt_secretory_panel_and_diet_sensitivity.csv"
+      )
+    ),
+    "Do not revise WT annotations until the symmetric matches, curated ",
+    "programs, and bootstrap stability have been reviewed together."
+  ),
+  con = file.path(STEP5D_DIR, "STEP_05D_READY_FOR_REVIEW.txt")
+)
+
+step5d_summary
+```
+
+# 15. Session information
+
+```{r session-information}
+sessionInfo()
+```

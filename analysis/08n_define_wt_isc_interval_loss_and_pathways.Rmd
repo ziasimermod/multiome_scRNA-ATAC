@@ -1,0 +1,336 @@
+---
+title: "Step 08N | WT ISC interval loss in PPAR and IL17"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+Run from the repository root after 08L, with the GRCm39 vM33 GTF. This is a
+descriptive comparison of pooled libraries, not a differential accessibility
+test or a genotype-by-diet interaction. The frozen WT 622 candidates and the
+same consensus coordinates are used in all three cohorts. The primary knockout
+groups are the previously approved top-15% ISC gates. Whole-parent union
+estimates are retained as a sensitivity check. **Promoter means TSS ±2 kb**
+(not ±2,000 kb). The only two reasons to call a WT-direction pattern lost are
+an effect magnitude at most half the WT magnitude, or a nonzero reversal.
+Missing/evaluable-false intervals are never called lost. At most-half and
+reversal are independently recorded; `loss_subtype` gives a disjoint label.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+needed <- c("readr", "dplyr", "tibble", "GenomicRanges", "IRanges",
+  "ChIPseeker", "GenomicFeatures", "AnnotationDbi", "org.Mm.eg.db",
+  "clusterProfiler", "rtracklayer")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing R packages: ", paste(missing, collapse = ", "))
+BASE08L <- file.path(OUTPUT_DIR,
+  "08l_wt_ISC_open_close_motifs")
+OUT <- file.path(OUTPUT_DIR,
+  "08n_wt_ISC_interval_loss_pathways")
+SETS <- file.path(OUT, "sets")
+ORA <- file.path(OUT, "ora")
+dir.create(SETS, recursive = TRUE, showWarnings = FALSE)
+dir.create(ORA, recursive = TRUE, showWarnings = FALSE)
+read_csv <- function(path) readr::read_csv(path, show_col_types = FALSE,
+  progress = FALSE)
+write_csv <- function(x, path) readr::write_csv(x, path)
+assert <- function(ok, why) if (!isTRUE(ok)) stop(why, call. = FALSE)
+input <- file.path(BASE08L,
+  "01_all_622_open_close_genotype_and_support.csv.gz")
+gtf <- GRCM39_GTF
+assert(all(file.exists(c(input, gtf))),
+  paste("Missing:", paste(c(input, gtf)[!file.exists(c(input, gtf))],
+    collapse = "; ")))
+write_csv(tibble::tibble(source = c("08L_622", "GRCm39_vM33_GTF"),
+  path = normalizePath(c(input, gtf)),
+  md5 = unname(tools::md5sum(c(input, gtf)))),
+  file.path(OUT, "00_input_manifest.csv"))
+```
+
+## Classify the exact WT intervals
+
+`loss` is a descriptive screen. A region that remains WT-directed at 60% of
+the WT effect is intermediate even when a previous `clear_effect` call is
+false. A large reversal is listed separately, even if its magnitude is large.
+For the overlap, both knockout gates must be evaluable. `PPAR_only` and
+`IL17_only` are likewise defined among doubly evaluable regions.
+
+```{r classify}
+wide <- read_csv(input)
+assert(nrow(wide) == 622L && !anyDuplicated(wide$feature),
+  "The frozen 622 intervals changed or have duplicate IDs.")
+assert(setequal(unique(wide$WT_direction), c("HFD_open", "HFD_closed")),
+  "Unexpected WT direction labels.")
+prefixes <- c(ppar = "ppar_annotated_union_top15",
+  il17 = "il17_annotated_union_top15")
+parent_prefixes <- c(ppar = "ppar_annotated_union_all",
+  il17 = "il17_annotated_union_all")
+for (p in c(prefixes, parent_prefixes)) {
+  required <- paste0(p, c("_evaluable", "_log2FC_HFD_vs_CON",
+    "_clear_effect"))
+  assert(all(required %in% names(wide)), paste("Missing:", p))
+}
+assert(all(c("feature", "chrom", "start_1based", "end_1based",
+  "anchor_log2FC_HFD_vs_CON", "C0_supported", "count_supported_40") %in%
+    names(wide)), "08L expected evidence columns are absent.")
+assert(all(is.finite(wide$anchor_log2FC_HFD_vs_CON)) &&
+  all(ifelse(wide$WT_direction == "HFD_open", 1, -1) *
+    wide$anchor_log2FC_HFD_vs_CON > 0), "WT direction/effect disagreement.")
+classify <- function(df, genotype, prefix, suffix = "") {
+  e <- df[[paste0(prefix, "_evaluable")]]
+  effect <- df[[paste0(prefix, "_log2FC_HFD_vs_CON")]]
+  clear <- df[[paste0(prefix, "_clear_effect")]]
+  assert(is.logical(e) && !anyNA(e) &&
+    all(is.finite(effect[e])) && !anyNA(clear[e]),
+    paste(genotype, prefix, "has malformed evaluability/effect columns."))
+  ratio <- abs(effect) / abs(df$anchor_log2FC_HFD_vs_CON)
+  atten <- e & ratio <= .5
+  reverse <- e & effect * df$anchor_log2FC_HFD_vs_CON < 0
+  loss <- atten | reverse
+  subtype <- dplyr::case_when(!e ~ "not_evaluable",
+    atten & reverse ~ "attenuated_and_reversed",
+    reverse ~ "reversed", atten ~ "attenuated",
+    TRUE ~ "WT_direction_not_lost")
+  stem <- paste0(genotype, suffix, "_")
+  df[[paste0(stem, "evaluable")]] <- e
+  df[[paste0(stem, "effect")]] <- effect
+  df[[paste0(stem, "clear_effect")]] <- clear
+  df[[paste0(stem, "ratio_abs_to_WT")]] <- ratio
+  df[[paste0(stem, "attenuated_50pct")]] <- atten
+  df[[paste0(stem, "reversed")]] <- reverse
+  df[[paste0(stem, "loss")]] <- loss
+  df[[paste0(stem, "loss_subtype")]] <- subtype
+  df
+}
+region <- wide
+for (g in names(prefixes)) {
+  region <- classify(region, g, prefixes[[g]])
+  region <- classify(region, g, parent_prefixes[[g]], "_parent")
+}
+region$both_evaluable <- region$ppar_evaluable & region$il17_evaluable
+region$comparison <- dplyr::case_when(
+  !region$both_evaluable ~ "not_doubly_evaluable",
+  region$ppar_loss & region$il17_loss ~ "shared_loss",
+  region$ppar_loss ~ "PPAR_only_loss",
+  region$il17_loss ~ "IL17_only_loss",
+  TRUE ~ "retained_in_both")
+region$both_parent_evaluable <- region$ppar_parent_evaluable &
+  region$il17_parent_evaluable
+region$both_parent_loss <- region$both_parent_evaluable &
+  region$ppar_parent_loss & region$il17_parent_loss
+assert(all(!region$ppar_loss | region$ppar_evaluable) &&
+  all(!region$il17_loss | region$il17_evaluable),
+  "Unevaluable region entered a loss set.")
+```
+
+## Annotate all 622 regions against GRCm39 vM33
+
+ChIPseeker's `annotatePeak` assigns promoter, UTR, exon, intron, downstream,
+and intergenic categories and the nearest gene/TSS. We use the same GTF as
+Step 06. A second, explicit `promoter_pm2kb` flag is based on its distance to
+the annotated nearest TSS, which is the restriction used below. The ORA is
+one nearest gene per region, with duplicates removed; distal nearest genes are
+proximity assignments, not peak-to-gene links.
+
+```{r annotate}
+make_txdb <- if (requireNamespace("txdbmaker", quietly = TRUE) &&
+  "makeTxDbFromGFF" %in% getNamespaceExports("txdbmaker"))
+  getExportedValue("txdbmaker", "makeTxDbFromGFF") else
+    getExportedValue("GenomicFeatures", "makeTxDbFromGFF")
+txdb <- make_txdb(gtf, format = "gtf", organism = "Mus musculus")
+gr <- GenomicRanges::GRanges(seqnames = region$chrom,
+  ranges = IRanges::IRanges(start = region$start_1based,
+    end = region$end_1based))
+names(gr) <- region$feature
+assert(all(as.character(GenomicRanges::seqnames(gr)) %in%
+  GenomeInfoDb::seqlevels(txdb)), "GTF sequence names do not match peaks.")
+ap <- ChIPseeker::annotatePeak(gr, TxDb = txdb, tssRegion = c(-2000, 2000),
+  level = "gene", annoDb = NULL, verbose = FALSE)
+anno <- as.data.frame(ap)
+anno$feature <- paste0(as.character(anno$seqnames), "-", anno$start,
+  "-", anno$end)
+assert(nrow(anno) == nrow(region) && !anyDuplicated(anno$feature) &&
+  setequal(anno$feature, region$feature),
+  "ChIPseeker annotations could not be aligned to the 622 intervals.")
+anno <- anno[match(region$feature, anno$feature), , drop = FALSE]
+assert(all(anno$feature == region$feature), "Annotation alignment failed.")
+region$annotation <- as.character(anno$annotation)
+region$distanceToTSS <- as.numeric(anno$distanceToTSS)
+region$nearest_ensembl <- sub("\\.[0-9]+$", "",
+  as.character(anno$geneId))
+region$nearest_ensembl[is.na(anno$geneId) |
+  !grepl("^ENSMUSG", region$nearest_ensembl)] <- NA_character_
+region$promoter_pm2kb <- !is.na(region$distanceToTSS) &
+  abs(region$distanceToTSS) <= 2000
+assert(all(!region$promoter_pm2kb | !is.na(region$nearest_ensembl)),
+  "A promoter interval lacks an Ensembl gene ID.")
+keys <- sort(unique(stats::na.omit(region$nearest_ensembl)))
+mapped <- AnnotationDbi::select(org.Mm.eg.db::org.Mm.eg.db,
+  keys = keys, keytype = "ENSEMBL", columns = c("ENTREZID", "SYMBOL")) |>
+  dplyr::filter(!is.na(.data$ENTREZID)) |>
+  dplyr::arrange(.data$ENSEMBL, as.integer(.data$ENTREZID)) |>
+  dplyr::distinct(.data$ENSEMBL, .keep_all = TRUE)
+region <- dplyr::left_join(region, mapped |>
+  dplyr::transmute(nearest_ensembl = .data$ENSEMBL,
+    nearest_entrez = .data$ENTREZID, nearest_symbol = .data$SYMBOL),
+  by = "nearest_ensembl", relationship = "many-to-one")
+write_csv(region, file.path(OUT, "01_all_622_annotated_loss_audit.csv.gz"))
+write_csv(region |>
+  dplyr::count(.data$WT_direction, .data$comparison,
+    .data$promoter_pm2kb, name = "n_intervals"),
+  file.path(OUT, "02_direction_comparison_promoter_counts.csv"))
+write_csv(region |>
+  dplyr::group_by(.data$WT_direction) |>
+  dplyr::summarise(n_WT = dplyr::n(),
+    ppar_evaluable = sum(.data$ppar_evaluable),
+    ppar_lost = sum(.data$ppar_loss),
+    ppar_attenuated = sum(.data$ppar_attenuated_50pct),
+    ppar_reversed = sum(.data$ppar_reversed),
+    il17_evaluable = sum(.data$il17_evaluable),
+    il17_lost = sum(.data$il17_loss),
+    il17_attenuated = sum(.data$il17_attenuated_50pct),
+    il17_reversed = sum(.data$il17_reversed),
+    both_evaluable = sum(.data$both_evaluable),
+    shared_loss = sum(.data$comparison == "shared_loss"),
+    ppar_only = sum(.data$comparison == "PPAR_only_loss"),
+    il17_only = sum(.data$comparison == "IL17_only_loss"),
+    both_retained = sum(.data$comparison == "retained_in_both"),
+    ppar_whole_parent_loss = sum(.data$ppar_parent_loss),
+    il17_whole_parent_loss = sum(.data$il17_parent_loss),
+    shared_whole_parent_loss = sum(.data$both_parent_loss),
+    shared_top15_and_whole_parent = sum(
+      .data$comparison == "shared_loss" & .data$both_parent_loss),
+    .groups = "drop"), file.path(OUT, "02_primary_summary.csv"))
+```
+
+## Six main sets and exclusivity context
+
+PPAR and IL17 loss sets include their shared intervals; the third set is
+their intersection on doubly evaluable intervals. Extra exclusive sets keep
+the independently affected intervals visible. BED starts are zero-based.
+
+```{r six-sets}
+sets <- list()
+for (direction in c("HFD_open", "HFD_closed")) {
+  d <- region$WT_direction == direction
+  sets[[paste("PPAR", direction, "lost", sep = "_")]] <-
+    region[d & region$ppar_loss, , drop = FALSE]
+  sets[[paste("IL17", direction, "lost", sep = "_")]] <-
+    region[d & region$il17_loss, , drop = FALSE]
+  sets[[paste("shared", direction, "lost", sep = "_")]] <-
+    region[d & region$comparison == "shared_loss", , drop = FALSE]
+  for (key in c("PPAR_only_loss", "IL17_only_loss", "retained_in_both"))
+    sets[[paste(key, direction, sep = "_")]] <-
+      region[d & region$comparison == key, , drop = FALSE]
+}
+for (key in names(sets)) {
+  x <- sets[[key]]
+  write_csv(x, file.path(SETS, paste0(key, ".csv.gz")))
+  bed <- x |>
+    dplyr::transmute(.data$chrom, start0 = .data$start_1based - 1L,
+      end = .data$end_1based, .data$feature)
+  readr::write_tsv(bed, file.path(SETS, paste0(key, ".bed")),
+    col_names = FALSE)
+}
+manifest <- dplyr::bind_rows(lapply(names(sets), function(key)
+  tibble::tibble(set = key, n_intervals = nrow(sets[[key]]),
+    n_promoter_pm2kb = sum(sets[[key]]$promoter_pm2kb),
+    n_C0_supported = sum(sets[[key]]$C0_supported),
+    n_entrez_mapped = sum(!is.na(sets[[key]]$nearest_entrez)))))
+write_csv(manifest, file.path(OUT, "03_set_manifest.csv"))
+print(manifest)
+```
+
+## GO BP/MF/CC and KEGG overrepresentation
+
+For each direction/genotype combination, the background is the WT candidate
+genes for which the respective KO gate is evaluable; for shared, it requires
+both. In the promoter analysis both target **and background** are limited to
+TSS ±2 kb. Each direction/scope/database/test has its own BH correction.
+Nearest-gene ORA is exploratory and sensitive to gene assignment, set size,
+and the small, conditioned universe. KEGG may require connectivity to the
+KEGG service; a failed KEGG request is recorded, not silently omitted.
+
+```{r ora}
+main_keys <- names(sets)[grepl(
+  "^(PPAR|IL17|shared)_HFD_(open|closed)_lost$", names(sets))]
+assert(length(main_keys) == 6L, "Expected exactly six main loss sets.")
+universe_for <- function(key) {
+  direction <- if (grepl("HFD_open", key, fixed = TRUE))
+    "HFD_open" else "HFD_closed"
+  d <- region$WT_direction == direction
+  eligible <- if (startsWith(key, "PPAR_")) region$ppar_evaluable else
+    if (startsWith(key, "IL17_")) region$il17_evaluable else
+      region$both_evaluable
+  region[d & eligible, , drop = FALSE]
+}
+status_rows <- list()
+kegg_unavailable <- FALSE
+previous_timeout <- getOption("timeout")
+options(timeout = min(20L, previous_timeout))
+for (key in main_keys) for (scope in c("all", "promoter_pm2kb")) {
+  target <- sets[[key]]
+  universe <- universe_for(key)
+  if (scope == "promoter_pm2kb") {
+    target <- target[target$promoter_pm2kb, , drop = FALSE]
+    universe <- universe[universe$promoter_pm2kb, , drop = FALSE]
+  }
+  bg <- sort(unique(stats::na.omit(as.character(universe$nearest_entrez))))
+  genes <- intersect(bg, sort(unique(stats::na.omit(
+    as.character(target$nearest_entrez)))))
+  assert(all(target$feature %in% universe$feature),
+    paste("ORA universe does not contain target:", key, scope))
+  write_csv(tibble::tibble(entrez_id = genes),
+    file.path(ORA, paste0(key, "_", scope, "_genes.csv")))
+  write_csv(tibble::tibble(entrez_id = bg),
+    file.path(ORA, paste0(key, "_", scope, "_universe_genes.csv")))
+  for (db in c("GO_BP", "GO_MF", "GO_CC", "KEGG")) {
+    message(key, " / ", scope, " / ", db, ": ", length(genes),
+      " foreground genes and ", length(bg), " background genes")
+    result <- NULL; error <- NA_character_
+    if (db == "KEGG" && kegg_unavailable) {
+      error <- "skipped_after_earlier_KEGG_error"
+    } else if (length(genes) >= 3L && length(bg) >= 10L &&
+        length(setdiff(bg, genes)) >= 3L) {
+      result <- tryCatch({
+        if (db == "KEGG") clusterProfiler::enrichKEGG(
+          gene = genes, organism = "mmu", keyType = "ncbi-geneid",
+          universe = bg, minGSSize = 5L, maxGSSize = 500L,
+          pvalueCutoff = 1, qvalueCutoff = 1) else
+            clusterProfiler::enrichGO(gene = genes,
+              OrgDb = org.Mm.eg.db::org.Mm.eg.db,
+              keyType = "ENTREZID", ont = sub("GO_", "", db),
+              universe = bg, minGSSize = 5L, maxGSSize = 500L,
+              pvalueCutoff = 1, qvalueCutoff = 1, readable = FALSE)
+      }, error = function(e) { error <<- conditionMessage(e); NULL })
+      if (db == "KEGG" && !is.na(error)) kegg_unavailable <- TRUE
+    } else error <- "too_few_mapped_genes_or_non_targets"
+    table <- if (is.null(result))
+      data.frame(ID = character(), Description = character(),
+        GeneRatio = character(), BgRatio = character(), pvalue = numeric(),
+        p.adjust = numeric(), qvalue = numeric(), geneID = character(),
+        Count = integer()) else as.data.frame(result)
+    write_csv(table, file.path(ORA, paste0(key, "_", scope, "_", db,
+      ".csv")))
+    status_rows[[length(status_rows) + 1L]] <- tibble::tibble(set = key,
+      scope = scope, database = db, target_intervals = nrow(target),
+      universe_intervals = nrow(universe), target_genes = length(genes),
+      universe_genes = length(bg), pathways_returned = nrow(table),
+      status = if (!is.na(error)) error else if (!nrow(table))
+        "no_pathways_after_size_filter" else "complete")
+  }
+}
+options(timeout = previous_timeout)
+write_csv(dplyr::bind_rows(status_rows), file.path(OUT, "04_ORA_status.csv"))
+writeLines(c("08N finished; see the audit and six main set CSV/BED files.",
+  "ORA P values describe conditioned gene-set overlap, not diet or interaction significance.",
+  "Run Step 08O for matched-neutral motif tests on these six sets."),
+  file.path(OUT, "STEP_08N_COMPLETE.txt"))
+```

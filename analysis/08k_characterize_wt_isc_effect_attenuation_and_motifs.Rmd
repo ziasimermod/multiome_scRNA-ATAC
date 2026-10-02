@@ -1,0 +1,704 @@
+---
+title: "Step 08K | WT ISC interval attenuation, coverage, and motif context"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+Run from the repository root on SOL after Steps 08H, 08I, and 08J. This
+notebook **does not change** the six-gene UCell definition, approved parent
+clusters, frozen WT GRCm39 intervals, or pooled effect estimates. It compares
+the same genomic intervals across the existing cohorts. WT C0 is compared
+with all annotated ISC parents; the WT C0/W0 top-15% score gate is compared
+with the genotype within-parent top-15% and WT-calibrated gates. These are
+related biological populations, not identical cell labels.
+
+Attenuation means a **smaller absolute depth-normalized log2FC**, including
+effects whose direction reversed but whose magnitude shrank. Direction and
+parent-specific effects are always shown separately. Peak-resampling intervals
+below quantify variation across the selected regions conditional on these
+three pooled datasets; they are not biological confidence intervals or
+genotype-by-diet tests. JASPAR matched-set permutation P values, if
+generated, test motif sequence over-representation against matched peaks,
+**not diet response**.
+Motif presence alone does not establish TF binding or activity.
+
+The motif section requires packages `JASPAR2024`, `TFBSTools`, `motifmatchr`,
+`Biostrings`, `Rsamtools`, `DBI`, and `RSQLite` and an indexed GRCm39 FASTA
+(as used in Step 08D). Install in the active R 4.4 library if absent:
+
+```r
+BiocManager::install(c("JASPAR2024", "TFBSTools", "motifmatchr",
+  "Biostrings", "Rsamtools", "DBI", "RSQLite"), ask = FALSE,
+  update = FALSE)
+```
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Open the repository root before 08K.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(HELPER)) HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(HELPER)) stop("Missing WT follow-up helper.")
+source(HELPER)
+suppressPackageStartupMessages({
+  library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges)
+  library(patchwork)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") &&
+  identical(COHORT_ID, "wt"), "08K expects WT v2_resequenced config.")
+RUN_COVERAGE <- TRUE
+RUN_MOTIFS <- TRUE
+BOOT_DRAWS <- 1000L
+MOTIF_BACKGROUND_PER_TARGET <- 3L
+MOTIF_MATCH_P <- 5e-5
+MOTIF_PERM_DRAWS <- 5000L
+RESULT_ROOT <- file.path(RESULTS_ROOT, DATASET_VERSION,
+  "independent")
+STEP8H <- file.path(OUTPUT_DIR,
+  "08h_wt_ISC_region_freeze_sex_audit")
+STEP8I <- file.path(OUTPUT_DIR,
+  "08i_frozen_WT_peaks_genotype_context")
+STEP8J <- file.path(OUTPUT_DIR,
+  "08j_recount_frozen_WT_intervals")
+OUT <- file.path(OUTPUT_DIR,
+  "08k_wt_ISC_attenuation_motif_context")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+PARENTS <- list(ppar = c("3", "6"), il17 = c("9", "10"))
+EXAMPLES <- tibble::tribble(
+  ~feature, ~why,
+  "chr3-96471088-96472340", "WT C0 effect in both Xist-detection strata; smaller knockout effects",
+  "chr4-40142794-40143817", "smaller knockout effects; WT Xist-proxy sensitivity",
+  "chr15-79166451-79167322", "smaller knockout effects; WT Xist-proxy sensitivity",
+  "chr17-40158319-40159811", "pooled attenuation with opposing PPAR parent effects",
+  "chr2-98497019-98497830", "retained diet response comparator")
+```
+
+## 1. Validate fixed inputs and the fragment-recount parity check
+
+```{r inputs}
+peak_file <- file.path(STEP8H,
+  "02_all_622_top15_ATAC_peaks_with_evidence_flags.csv.gz")
+effect_file <- file.path(STEP8J,
+  "02_recounted_622_interval_genotype_effects.csv.gz")
+parity_file <- file.path(STEP8J,
+  "01_both_cohorts_fragment_recount_parity.csv")
+wt_cell_file <- file.path(STEP8H,
+  "01_nucleus_level_sex_proxy_and_gate_audit.csv.gz")
+wt_sex_file <- file.path(STEP8H,
+  "03_C0_supported_region_effects_by_Xist_detection.csv")
+paths <- c(peak_file, effect_file, parity_file, wt_cell_file,
+  wt_sex_file, file.path(STEP8J, "STEP_08J_COMPLETE.txt"),
+  file.path(RESULT_ROOT, "wt", "06_annotation", "multiome_annotated.rds"))
+for (cohort in names(PARENTS)) paths <- c(paths,
+  file.path(STEP8I, paste0("02_", cohort,
+    "_crypt_nuclei_scores.csv.gz")),
+  file.path(RESULT_ROOT, cohort, "06_annotation",
+    "multiome_annotated.rds"))
+need(all(file.exists(paths)), paste("Missing 08K input(s):",
+  paste(paths[!file.exists(paths)], collapse = "; ")))
+if (RUN_MOTIFS) {
+  motif_packages <- c("JASPAR2024", "TFBSTools", "motifmatchr",
+    "Biostrings", "Rsamtools", "DBI", "RSQLite")
+  missing_motif_packages <- motif_packages[!vapply(motif_packages,
+    requireNamespace, logical(1), quietly = TRUE)]
+  need(!length(missing_motif_packages), paste("Install motif packages:",
+    paste(missing_motif_packages, collapse = ", ")))
+  genome_path <- Sys.getenv("MULTIOME_GRCM39_FASTA",
+    unset = file.path(PROJECT_DIR, "reference", "GRCm39_2024-A",
+      "fasta", "genome.fa"))
+  need(file.exists(genome_path) && file.exists(paste0(genome_path, ".fai")),
+    paste("Indexed GRCm39 FASTA absent:", genome_path))
+}
+info <- file.info(paths)
+manifest <- tibble(path = normalizePath(paths), bytes = info$size,
+  modified = as.character(info$mtime))
+write_table(manifest, OUT, "00_input_manifest.csv")
+parity <- read_csv_checked(parity_file)
+require_columns(parity, c("cohort", "requested_WT_intervals",
+  "previous_exact_name_overlap", "original_shared_peak_count_mismatches",
+  "recount_nonzero_intervals"), "08J parity")
+need(setequal(parity$cohort, names(PARENTS)) && nrow(parity) == 2L &&
+  all(parity$requested_WT_intervals == 622L) &&
+  all(parity$recount_nonzero_intervals == 622L) &&
+  all(parity$previous_exact_name_overlap >= 1L) &&
+  all(parity$original_shared_peak_count_mismatches == 0L),
+  "08J fragment recount parity failed; stop before comparing effects.")
+anchor <- read_csv_checked(peak_file)
+effects <- read_csv_checked(effect_file)
+require_columns(anchor, c("feature", "chrom", "start_1based",
+  "end_1based", "C0_supported", "count_supported_40",
+  "nested_top10", "anchor_log2FC_HFD_vs_CON",
+  "C0_all_log2FC_HFD_vs_CON", "anchor_CON_counts",
+  "anchor_HFD_counts", "anchor_CON_percent"), "08H peaks")
+require_columns(effects, c("cohort", "contrast", "feature", "eligible",
+  "evaluable", "clear_effect", "log2FC_HFD_vs_CON", "CON_counts",
+  "HFD_counts", "CON_percent", "HFD_percent"), "08J effects")
+need(nrow(anchor) == 622L && !anyDuplicated(anchor$feature) &&
+  sum(anchor$C0_supported) == 37L &&
+  sum(anchor$C0_supported & anchor$count_supported_40) == 16L &&
+  all(EXAMPLES$feature %in% anchor$feature),
+  "The frozen WT interval set or example loci changed.")
+need(!anyDuplicated(effects[c("cohort", "contrast", "feature")]) &&
+  all(effects$feature %in% anchor$feature) &&
+  setequal(effects$cohort, names(PARENTS)),
+  "08J effect identifiers differ from the frozen WT intervals.")
+intervals <- GenomicRanges::GRanges(seqnames = anchor$chrom,
+  ranges = IRanges::IRanges(start = anchor$start_1based,
+    end = anchor$end_1based))
+names(intervals) <- anchor$feature
+need(identical(paste0(as.character(GenomicRanges::seqnames(intervals)),
+  "-", BiocGenerics::start(intervals), "-",
+  BiocGenerics::end(intervals)), anchor$feature),
+  "WT interval names and coordinates disagree.")
+```
+
+## 2. Region-level attenuation and parent-state checks
+
+The output retains raw pooled counts, detection percentages, signed effects,
+both parent effects, and eligibility. Categories are a reading aid; ranking
+and plotting always retain continuous values.
+
+```{r attenuation-table}
+fields <- c("log2FC_HFD_vs_CON", "evaluable", "clear_effect",
+  "CON_counts", "HFD_counts", "CON_percent", "HFD_percent")
+add_contrast <- function(data, cohort, contrast, prefix) {
+  x <- dplyr::filter(data, .data$cohort == .env$cohort,
+    .data$contrast == .env$contrast)
+  need(nrow(x) == nrow(anchor) &&
+    setequal(x$feature, anchor$feature) && all(x$eligible),
+    paste("Missing or ineligible genotype contrast:", cohort, contrast))
+  x <- x[match(anchor$feature, x$feature), c("feature", fields)]
+  names(x)[-1] <- paste0(prefix, "_", fields)
+  x
+}
+wide <- dplyr::select(anchor, feature, chrom, start_1based, end_1based,
+  C0_supported, count_supported_40, nested_top10,
+  anchor_log2FC_HFD_vs_CON, C0_all_log2FC_HFD_vs_CON,
+  anchor_CON_counts, anchor_HFD_counts, anchor_CON_percent)
+for (cohort in names(PARENTS)) {
+  keys <- c("annotated_union_all", "annotated_union_top15",
+    "annotated_union_WTcal", paste0("parent_", PARENTS[[cohort]], "_all"))
+  for (key in keys) {
+    prefix <- paste(cohort, key, sep = "_")
+    wide <- dplyr::left_join(wide,
+      add_contrast(effects, cohort, key, prefix), by = "feature",
+      relationship = "one-to-one")
+  }
+}
+need(nrow(wide) == 622L && !anyNA(wide$ppar_annotated_union_all_evaluable),
+  "Region-level join lost frozen intervals.")
+for (cohort in names(PARENTS)) {
+  for (gate in c("all", "top15", "WTcal")) {
+    key <- paste(cohort, "annotated_union", gate, sep = "_")
+    reference <- if (gate == "all")
+      wide$C0_all_log2FC_HFD_vs_CON else
+      wide$anchor_log2FC_HFD_vs_CON
+    value <- wide[[paste0(key, "_log2FC_HFD_vs_CON")]]
+    evaluable <- wide[[paste0(key, "_evaluable")]]
+    need(all(is.finite(reference)) && all(abs(reference) > 0),
+      "An attenuation reference is missing or zero.")
+    wide[[paste0(key, "_magnitude_ratio_to_WT")]] <-
+      ifelse(evaluable, abs(value) / abs(reference), NA_real_)
+    wide[[paste0(key, "_direction_vs_WT")]] <-
+      ifelse(evaluable, ifelse(value * reference > 0,
+        "same", ifelse(value * reference < 0, "opposite", "zero")),
+        "not_evaluable")
+  }
+}
+for (gate in c("all", "top15", "WTcal")) {
+  a <- wide[[paste0("ppar_annotated_union_", gate,
+    "_magnitude_ratio_to_WT")]]
+  b <- wide[[paste0("il17_annotated_union_", gate,
+    "_magnitude_ratio_to_WT")]]
+  wide[[paste0("both_", gate, "_below_WT")]] <-
+    !is.na(a) & !is.na(b) & a < 1 & b < 1
+  wide[[paste0("both_", gate, "_below_half_WT")]] <-
+    !is.na(a) & !is.na(b) & a < .5 & b < .5
+}
+for (cohort in names(PARENTS)) {
+  parent_values <- lapply(PARENTS[[cohort]], function(parent)
+    wide[[paste0(cohort, "_parent_", parent,
+      "_all_log2FC_HFD_vs_CON")]])
+  wide[[paste0(cohort, "_parent_opposite_signs")]] <-
+    parent_values[[1]] * parent_values[[2]] < 0
+}
+write_table(wide, OUT, "01_all_622_region_effects_and_attenuation.csv.gz")
+write_table(dplyr::filter(wide, C0_supported), OUT,
+  "01_C0_supported_37_region_effects_and_attenuation.csv")
+write_table(dplyr::filter(wide, C0_supported, both_all_below_half_WT),
+  OUT, "01_dual_attenuated_22_candidates.csv")
+```
+
+## 3. Descriptive magnitude summaries with region-resampling intervals
+
+These percentile intervals resample **features**, not mice. They only convey
+how the paired median across this selected interval set changes when regions
+are left in or out; peaks may be correlated. They are intentionally labelled
+as descriptive and never used as a diet or genotype interaction P value.
+
+```{r summaries-and-plots}
+set.seed(20260930)
+tiers <- list(all_622 = rep(TRUE, nrow(wide)),
+  C0_supported_37 = wide$C0_supported,
+  count_supported_16 = wide$C0_supported & wide$count_supported_40)
+summary_rows <- list()
+for (tier in names(tiers)) for (gate in c("all", "top15", "WTcal")) {
+  if (tier == "all_622" && gate == "all") next
+  reference <- if (gate == "all")
+    wide$C0_all_log2FC_HFD_vs_CON else
+    wide$anchor_log2FC_HFD_vs_CON
+  for (cohort in names(PARENTS)) {
+    key <- paste(cohort, "annotated_union", gate, sep = "_")
+    evaluable <- wide[[paste0(key, "_evaluable")]]
+    index <- which(tiers[[tier]] & evaluable)
+    effect <- wide[[paste0(key, "_log2FC_HFD_vs_CON")]][index]
+    wt <- reference[index]
+    need(length(index) >= 4L, paste("Insufficient evaluable regions:",
+      tier, gate, cohort))
+    delta <- abs(wt) - abs(effect)
+    draw <- replicate(BOOT_DRAWS, stats::median(
+      delta[sample.int(length(delta), length(delta), replace = TRUE)]))
+    summary_rows[[length(summary_rows) + 1L]] <- tibble(
+      tier = tier, cohort = cohort, gate = gate,
+      reference_group = if (gate == "all") "WT_C0_all" else "WT_C0W0_top15",
+      frozen_n = sum(tiers[[tier]]), evaluable_n = length(index),
+      median_abs_WT_log2FC = stats::median(abs(wt)),
+      median_abs_genotype_log2FC = stats::median(abs(effect)),
+      median_paired_abs_reduction = stats::median(delta),
+      peak_resampling_lo = unname(stats::quantile(draw, .025)),
+      peak_resampling_hi = unname(stats::quantile(draw, .975)),
+      smaller_magnitude_n = sum(abs(effect) < abs(wt)),
+      below_half_magnitude_n = sum(abs(effect) < .5 * abs(wt)),
+      same_direction_n = sum(wt * effect > 0),
+      reverse_direction_n = sum(wt * effect < 0),
+      clear_genotype_n = sum(wide[[paste0(key, "_clear_effect")]][index]))
+  }
+}
+write_table(dplyr::bind_rows(summary_rows), OUT,
+  "02_region_magnitude_descriptive_summary.csv")
+
+primary <- dplyr::filter(wide, C0_supported) |>
+  dplyr::select(feature, count_supported_40,
+    C0_all_log2FC_HFD_vs_CON,
+    ppar_annotated_union_all_log2FC_HFD_vs_CON,
+    il17_annotated_union_all_log2FC_HFD_vs_CON) |>
+  tidyr::pivot_longer(cols = c(ppar_annotated_union_all_log2FC_HFD_vs_CON,
+    il17_annotated_union_all_log2FC_HFD_vs_CON),
+    names_to = "cohort", values_to = "genotype_log2FC") |>
+  dplyr::mutate(cohort = ifelse(grepl("^ppar", cohort), "PPAR", "IL17"))
+p_magnitude <- ggplot2::ggplot(primary,
+  ggplot2::aes(x = abs(C0_all_log2FC_HFD_vs_CON),
+    y = abs(genotype_log2FC), shape = count_supported_40)) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, color = "grey45") +
+  ggplot2::geom_abline(slope = .5, intercept = 0, linetype = "dashed",
+    color = "#B24B3A") +
+  ggplot2::geom_point(size = 2, alpha = .8) +
+  ggplot2::facet_wrap(~cohort) + ggplot2::coord_equal() +
+  ggplot2::scale_shape_manual(values = c(`TRUE` = 19, `FALSE` = 1),
+    labels = c(`TRUE` = "Higher-count 16", `FALSE` = "Other C0-supported")) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "WT C0 region effect magnitude in genotype ISC unions",
+    subtitle = "37 fixed WT regions; dashed line is half the WT magnitude",
+    x = "|WT C0 HFD-versus-CON log2FC|",
+    y = "|Genotype HFD-versus-CON log2FC|", shape = NULL)
+save_vector_plot(p_magnitude, PLOTS,
+  "02_C0_supported_37_magnitude_by_genotype.pdf", 11, 6)
+
+focus <- wide |> dplyr::filter(C0_supported) |>
+  dplyr::select(feature, C0_all_log2FC_HFD_vs_CON,
+    ppar_parent_3_all_log2FC_HFD_vs_CON,
+    ppar_parent_6_all_log2FC_HFD_vs_CON,
+    ppar_annotated_union_all_log2FC_HFD_vs_CON,
+    il17_parent_9_all_log2FC_HFD_vs_CON,
+    il17_parent_10_all_log2FC_HFD_vs_CON,
+    il17_annotated_union_all_log2FC_HFD_vs_CON) |>
+  tidyr::pivot_longer(-feature, names_to = "group", values_to = "log2FC")
+focus$feature <- factor(focus$feature,
+  levels = dplyr::filter(wide, C0_supported) |>
+    dplyr::arrange(C0_all_log2FC_HFD_vs_CON) |>
+    dplyr::pull(feature))
+p_parent <- ggplot2::ggplot(focus,
+  ggplot2::aes(x = feature, y = group, fill = log2FC)) +
+  ggplot2::geom_tile(color = "white", linewidth = .2) +
+  ggplot2::scale_fill_gradient2(low = "#3279A8", mid = "white",
+    high = "#C45F48", midpoint = 0) +
+  ggplot2::theme_bw(base_size = 9) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90,
+    hjust = 1, vjust = .5, size = 6)) +
+  ggplot2::labs(title = "Parent-specific and pooled effects at 37 WT regions",
+    subtitle = "Opposing parent effects can yield a small union estimate",
+    x = "WT interval", y = NULL, fill = "HFD vs CON\nlog2FC")
+save_vector_plot(p_parent, PLOTS,
+  "02_parent_and_union_effects_37_regions.pdf", 16, 5)
+```
+
+## 4. WT sex-proxy context and selected coverage views
+
+Coverage uses the original indexed fragments and highlights the *same WT
+interval* in each cohort. The cohorts have distinct peak calls, so their peak
+tracks are omitted. Signac normalizes coverage within each plotted group;
+compare CON with HFD **within a panel** and use the tabulated interval
+effects for cross-cohort comparison. Coverage is visualization, not a
+statistical test. The `chr17` example gets parent-specific tracks because
+its union effect masks opposing parent responses.
+
+```{r coverage}
+sex_wt <- read_csv_checked(wt_sex_file)
+require_columns(sex_wt, c("group", "Xist_status", "feature",
+  "CON_n", "HFD_n", "evaluable", "clear_effect",
+  "log2FC_HFD_vs_CON"), "08H Xist sensitivity")
+sex_wt <- dplyr::filter(sex_wt, group == "C0_all")
+write_table(dplyr::filter(sex_wt,
+  feature %in% EXAMPLES$feature), OUT,
+  "03_example_WT_Xist_detection_sensitivity.csv")
+write_table(EXAMPLES, OUT, "03_prespecified_coverage_examples.csv")
+wt_cells <- read_csv_checked(wt_cell_file)
+require_columns(wt_cells, c("cell_barcode", "diet", "focused_cluster",
+  "C0W0_top15"), "08H saved WT cell gates")
+need(!anyDuplicated(wt_cells$cell_barcode), "Duplicate WT cell barcode.")
+coverage_status <- list()
+wt_annotation <- NULL
+for (cohort in c("wt", names(PARENTS))) {
+  obj <- readRDS(file.path(RESULT_ROOT, cohort, "06_annotation",
+    "multiome_annotated.rds"))
+  need("ATAC" %in% names(obj) &&
+    length(Signac::Fragments(obj[["ATAC"]])) > 0L,
+    paste(cohort, "has no indexed ATAC fragments for coverage."))
+  meta <- obj[[]]
+  meta$cell_barcode <- rownames(meta)
+  meta$diet <- as.character(meta$diet)
+  need(!anyDuplicated(meta$cell_barcode) &&
+    setequal(unique(meta$diet), c("CON", "HFD")),
+    paste(cohort, "invalid cell barcodes or diet labels."))
+  if (cohort == "wt") {
+    wt_annotation <- Signac::Annotation(obj[["ATAC"]])
+    ix <- match(wt_cells$cell_barcode, meta$cell_barcode)
+    need(!anyNA(ix) && identical(wt_cells$diet, meta$diet[ix]),
+      "08H WT cells do not match the annotated object.")
+    group_cells <- list(
+      C0_all = wt_cells$cell_barcode[
+        as.character(wt_cells$focused_cluster) == "0"],
+      C0W0_top15 = wt_cells$cell_barcode[wt_cells$C0W0_top15])
+  } else {
+    scores <- read_csv_checked(file.path(STEP8I,
+      paste0("02_", cohort, "_crypt_nuclei_scores.csv.gz")))
+    require_columns(scores, c("cell_barcode", "diet", "wnn_cluster",
+      "top15"), paste(cohort, "08I fixed gate table"))
+    ix <- match(scores$cell_barcode, meta$cell_barcode)
+    need(!anyNA(ix) && !anyDuplicated(scores$cell_barcode) &&
+      identical(scores$diet, meta$diet[ix]) &&
+      identical(as.character(scores$wnn_cluster),
+        as.character(meta$wnn_cluster[ix])) &&
+      !anyNA(scores$top15),
+      paste(cohort, "08I scores disagree with annotated cells."))
+    in_parent <- as.character(scores$wnn_cluster) %in% PARENTS[[cohort]]
+    group_cells <- list(
+      annotated_union_all = scores$cell_barcode[in_parent],
+      annotated_union_top15 = scores$cell_barcode[
+        in_parent & scores$top15])
+    for (parent in PARENTS[[cohort]])
+      group_cells[[paste0("parent_", parent, "_all")]] <-
+        scores$cell_barcode[as.character(scores$wnn_cluster) == parent]
+  }
+  for (key in names(group_cells)) {
+    cells <- group_cells[[key]]
+    n_con <- sum(meta$diet[match(cells, meta$cell_barcode)] == "CON")
+    n_hfd <- sum(meta$diet[match(cells, meta$cell_barcode)] == "HFD")
+    need(length(cells) && !anyDuplicated(cells) &&
+      n_con >= 30L && n_hfd >= 30L,
+      paste(cohort, key, "has an ineligible coverage group."))
+    selected <- if (grepl("^parent_", key))
+      "chr17-40158319-40159811" else EXAMPLES$feature
+    for (feature in selected) {
+      status <- "not_attempted"; detail <- ""
+      if (RUN_COVERAGE) {
+        gr <- intervals[match(feature, names(intervals))]
+        span <- GenomicRanges::GRanges(
+          seqnames = as.character(GenomicRanges::seqnames(gr)),
+          ranges = IRanges::IRanges(
+            start = max(1L, as.integer(BiocGenerics::start(gr)) - 5000L),
+            end = as.integer(BiocGenerics::end(gr)) + 5000L))
+        tryCatch({
+          p <- Signac::CoveragePlot(obj, region = span,
+            assay = "ATAC", cells = cells, annotation = "gene",
+            peaks = FALSE, region.highlight = gr, links = FALSE,
+            tile = FALSE, group.by = "diet", ymax = "q95") +
+            patchwork::plot_annotation(title = paste(cohort, key, feature),
+              subtitle = paste("CON", n_con, "/ HFD", n_hfd,
+                "nuclei; identical WT interval highlighted"))
+          ggplot2::ggsave(file.path(PLOTS,
+            paste0("04_", cohort, "_", key, "_", feature, ".pdf")),
+            plot = p, device = grDevices::pdf, useDingbats = FALSE,
+            width = 13, height = 6)
+          status <- "saved"
+        }, error = function(e) {
+          status <<- "plot_failed"
+          detail <<- conditionMessage(e)
+          warning("Coverage failed for ", cohort, " / ", key,
+            " / ", feature, ": ", detail)
+        })
+      }
+      coverage_status[[length(coverage_status) + 1L]] <- tibble(
+        cohort = cohort, group = key, feature = feature,
+        n_CON = n_con, n_HFD = n_hfd, status = status,
+        detail = detail)
+    }
+  }
+  rm(obj, meta, group_cells); invisible(gc())
+}
+coverage_status <- dplyr::bind_rows(coverage_status)
+write_table(coverage_status, OUT, "04_coverage_status.csv")
+```
+
+## 5. Explore motif recurrence and enrichment among attenuated intervals
+
+Target: the fixed WT C0-supported regions whose **full parent union** effect
+is evaluable and less than half the WT C0 magnitude in *both* genotype
+cohorts. Target definition uses no DNA sequence information. Background:
+other intervals in the 622 WT top-15 effect universe, matched to target
+on WT effect direction, promoter/gene-body context where available, GC,
+width, and WT CON detection. Context mismatches are explicitly audited.
+A motif comparison is conditional on this selected WT universe;
+it cannot identify the causal TF, and the small target set limits power.
+
+```{r motif-context}
+if (RUN_MOTIFS) {
+  target <- wide$feature[wide$C0_supported & wide$both_all_below_half_WT]
+  need(length(target) == 22L,
+    "Dual-attenuation target count changed from the reviewed 22; inspect Step 08J before motif analysis.")
+  fa <- Rsamtools::FaFile(genome_path)
+  index <- Rsamtools::scanFaIndex(fa)
+  seq_width <- setNames(as.integer(BiocGenerics::width(index)),
+    as.character(GenomicRanges::seqnames(index)))
+  need(all(anchor$chrom %in% names(seq_width)) &&
+    all(anchor$end_1based <= seq_width[anchor$chrom]),
+    "Frozen WT coordinates do not fit the supplied FASTA index.")
+  Rsamtools::open(fa)
+  seqs <- tryCatch(Rsamtools::scanFa(fa, param = intervals),
+    finally = Rsamtools::close(fa))
+  need(length(seqs) == nrow(anchor) &&
+    all(as.integer(BiocGenerics::width(seqs)) ==
+      anchor$end_1based - anchor$start_1based + 1L),
+    "FASTA sequence retrieval did not preserve interval widths.")
+  names(seqs) <- anchor$feature
+  gc <- 100 * rowSums(Biostrings::letterFrequency(seqs,
+    letters = c("G", "C"), as.prob = TRUE))
+  need(length(wt_annotation) > 0L,
+    "WT Step 06 assay has no gene annotation for motif matching.")
+  promoters <- GenomicRanges::promoters(wt_annotation,
+    upstream = 2000L, downstream = 2000L)
+  in_promoter <- GenomicRanges::countOverlaps(intervals,
+    promoters, ignore.strand = TRUE) > 0
+  in_gene <- GenomicRanges::countOverlaps(intervals, wt_annotation,
+    ignore.strand = TRUE) > 0
+  covars <- tibble(feature = anchor$feature,
+    gc_percent = as.numeric(gc),
+    peak_width = as.integer(BiocGenerics::width(intervals)),
+    wt_CON_detection_percent = anchor$anchor_CON_percent,
+    genomic_context = dplyr::case_when(
+      in_promoter ~ "promoter", in_gene ~ "gene_body",
+      TRUE ~ "intergenic"),
+    WT_direction = ifelse(anchor$anchor_log2FC_HFD_vs_CON > 0,
+      "HFD_open", "HFD_closed"))
+  need(all(is.finite(covars$gc_percent)) &&
+    all(is.finite(covars$wt_CON_detection_percent)) &&
+    all(covars$peak_width > 0L), "Invalid motif matching covariate.")
+  write_table(covars, OUT, "05_all_622_motif_sequence_covariates.csv")
+  # Greedy without-replacement nearest matching, same direction.
+  # Prefer the same genomic context, with an audited fallback.
+  v <- cbind(gc = covars$gc_percent,
+    log_width = log1p(covars$peak_width),
+    CON_detection = covars$wt_CON_detection_percent)
+  center <- colMeans(v)
+  spread <- apply(v, 2, stats::sd)
+  spread[!is.finite(spread) | spread == 0] <- 1
+  z <- sweep(sweep(v, 2, center, "-"), 2, spread, "/")
+  rownames(z) <- covars$feature
+  candidates <- covars$feature[!covars$feature %in% target]
+  # Match scarce direction/context strata first.
+  target_rows <- covars[match(target, covars$feature), ]
+  available_by_stratum <- vapply(seq_len(nrow(target_rows)), function(j)
+    sum(covars$WT_direction[covars$feature %in% candidates] ==
+      target_rows$WT_direction[[j]] &
+      covars$genomic_context[covars$feature %in% candidates] ==
+      target_rows$genomic_context[[j]]), integer(1))
+  target_order <- order(available_by_stratum, target)
+  matches <- list()
+  for (j in target_order) {
+    f <- target[[j]]
+    rr <- covars[match(f, covars$feature), ]
+    pool <- candidates[covars$WT_direction[
+      match(candidates, covars$feature)] == rr$WT_direction]
+    same_context <- covars$genomic_context[
+      match(pool, covars$feature)] == rr$genomic_context
+    if (sum(same_context) >= MOTIF_BACKGROUND_PER_TARGET)
+      pool <- pool[same_context]
+    need(length(pool) >= MOTIF_BACKGROUND_PER_TARGET,
+      paste("Insufficient same-direction background for", f))
+    distance <- rowSums((z[pool, , drop = FALSE] -
+      matrix(z[f, ], nrow = length(pool), ncol = ncol(z),
+        byrow = TRUE))^2) +
+      4 * (covars$genomic_context[
+        match(pool, covars$feature)] != rr$genomic_context)
+    chosen <- pool[order(distance, pool)[seq_len(
+      MOTIF_BACKGROUND_PER_TARGET)]]
+    matches[[length(matches) + 1L]] <- tibble(
+      target_feature = f, background_feature = chosen,
+      context_matched = covars$genomic_context[
+        match(chosen, covars$feature)] == rr$genomic_context,
+      matching_distance = distance[match(chosen, pool)])
+    candidates <- setdiff(candidates, chosen)
+  }
+  match_table <- dplyr::bind_rows(matches)
+  background <- match_table$background_feature
+  need(!anyDuplicated(background) &&
+    length(background) == length(target) * MOTIF_BACKGROUND_PER_TARGET,
+    "Motif matched background has duplicates or wrong size.")
+  write_table(match_table, OUT, "05_target_background_matches.csv")
+  membership <- dplyr::bind_rows(
+    tibble(feature = target, membership = "target"),
+    tibble(feature = background, membership = "background")) |>
+    dplyr::left_join(covars, by = "feature",
+      relationship = "many-to-one")
+  write_table(membership, OUT, "05_motif_membership_and_covariates.csv")
+  balance <- membership |>
+    dplyr::group_by(membership, WT_direction, genomic_context) |>
+    dplyr::summarise(n = dplyr::n(),
+      median_gc = stats::median(gc_percent),
+      median_width = stats::median(peak_width),
+      median_WT_CON_detection = stats::median(wt_CON_detection_percent),
+      .groups = "drop")
+  write_table(balance, OUT, "05_motif_background_balance.csv")
+  print(balance)
+
+  jaspar_db <- JASPAR2024::JASPAR2024()
+  jaspar_conn <- DBI::dbConnect(RSQLite::SQLite(),
+    methods::slot(jaspar_db, "db"))
+  jaspar_pfms <- tryCatch(TFBSTools::getMatrixSet(jaspar_conn,
+    opts = list(collection = "CORE", tax_group = "vertebrates",
+      all_versions = FALSE)), finally = DBI::dbDisconnect(jaspar_conn))
+  need(length(jaspar_pfms) > 0L, "JASPAR returned no CORE vertebrate motifs.")
+  motif_meta <- tibble(motif_id = vapply(jaspar_pfms,
+    TFBSTools::ID, character(1)),
+    motif_name = vapply(jaspar_pfms, TFBSTools::name,
+      character(1)),
+    motif_family = vapply(jaspar_pfms, function(m)
+      paste(TFBSTools::tags(m)$family, collapse = ";"), character(1)))
+  simple_symbol <- grepl("^[A-Za-z][A-Za-z0-9]+$",
+    motif_meta$motif_name)
+  motif_meta$candidate_mouse_symbol <- NA_character_
+  motif_meta$candidate_mouse_symbol[simple_symbol] <- paste0(
+    toupper(substr(motif_meta$motif_name[simple_symbol], 1, 1)),
+    tolower(substr(motif_meta$motif_name[simple_symbol], 2,
+      nchar(motif_meta$motif_name[simple_symbol]))))
+  hits <- motifmatchr::motifMatches(motifmatchr::matchMotifs(
+    pwms = jaspar_pfms, subject = seqs,
+    bg = "subject", out = "matches", p.cutoff = MOTIF_MATCH_P))
+  need(nrow(hits) == nrow(anchor), "Motif matrix lost WT intervals.")
+  rownames(hits) <- anchor$feature
+  motif_id <- vapply(colnames(hits), function(col) {
+    ids <- motif_meta$motif_id[startsWith(col, motif_meta$motif_id)]
+    if (!length(ids)) return(NA_character_)
+    ids[[which.max(nchar(ids))]]
+  }, character(1))
+  need(!anyNA(motif_id), "Motif hit IDs cannot be reconciled with JASPAR.")
+  motif_meta <- dplyr::left_join(tibble(motif_column = colnames(hits),
+    motif_id = motif_id), motif_meta, by = "motif_id",
+    relationship = "many-to-one")
+  target_hits <- as.integer(Matrix::colSums(hits[target, , drop = FALSE]))
+  bg_hits <- as.integer(Matrix::colSums(hits[background, , drop = FALSE]))
+  # Permute one target label among the four matched sequences per locus.
+  # This tests sequence over-representation conditional on matched sets.
+  order4 <- unlist(lapply(target, function(f)
+    c(f, match_table$background_feature[
+      match_table$target_feature == f])), use.names = FALSE)
+  need(length(order4) == 4L * length(target) &&
+    !anyDuplicated(order4), "Motif matched quartets are invalid.")
+  quartet_hits <- hits[order4, , drop = FALSE]
+  set.seed(20260930)
+  null_counts <- matrix(0L, nrow = MOTIF_PERM_DRAWS,
+    ncol = ncol(hits))
+  for (b in seq_len(MOTIF_PERM_DRAWS)) {
+    selected_rows <- 4L * (seq_along(target) - 1L) +
+      sample.int(4L, length(target), replace = TRUE)
+    null_counts[b, ] <- as.integer(Matrix::colSums(
+      quartet_hits[selected_rows, , drop = FALSE]))
+  }
+  matched_permutation_p <- (1 + colSums(sweep(null_counts, 2,
+    target_hits, FUN = ">="))) / (MOTIF_PERM_DRAWS + 1)
+  motif_stats <- motif_meta |>
+    dplyr::mutate(target_n = length(target), background_n = length(background),
+      target_hits = target_hits, background_hits = bg_hits,
+      target_percent = 100 * target_hits / target_n,
+      background_percent = 100 * background_hits / background_n,
+      odds_ratio_Haldane = ((target_hits + .5) *
+        (background_n - background_hits + .5)) /
+        ((target_n - target_hits + .5) * (background_hits + .5)),
+      matched_permutation_p = matched_permutation_p,
+      motif_BH = stats::p.adjust(matched_permutation_p, method = "BH")) |>
+    dplyr::arrange(motif_BH, matched_permutation_p,
+      dplyr::desc(target_hits))
+  write_table(motif_stats, OUT, "05_JASPAR2024_motif_enrichment_exploratory.csv")
+  motif_presence <- tibble(feature = target,
+    matched_motif_ids = vapply(target, function(f)
+      paste(motif_meta$motif_id[as.logical(hits[f, ])],
+        collapse = ";"), character(1)))
+  write_table(motif_presence, OUT,
+    "05_22_attenuated_regions_motif_presence.csv")
+  plot_motifs <- motif_stats |>
+    dplyr::filter(target_hits >= 4) |>
+    dplyr::arrange(dplyr::desc(target_percent - background_percent),
+      matched_permutation_p) |>
+    dplyr::slice_head(n = 20L)
+  if (nrow(plot_motifs)) {
+    p_motif <- ggplot2::ggplot(plot_motifs,
+      ggplot2::aes(x = stats::reorder(paste(motif_name, motif_id),
+        target_percent - background_percent),
+        y = target_percent - background_percent,
+        size = target_hits, color = motif_BH)) +
+      ggplot2::geom_point() + ggplot2::coord_flip() +
+      ggplot2::scale_color_gradient(low = "#AE4D43", high = "#3B718F") +
+      ggplot2::theme_bw(base_size = 10) +
+      ggplot2::labs(title = "Candidate motifs in WT regions with smaller knockout effects",
+        subtitle = "22 targets versus 66 matched WT peaks; motif permutation BH, not diet inference",
+        x = NULL, y = "Target minus background motif prevalence (percentage points)",
+        size = "Targets with motif", color = "Motif BH")
+    save_vector_plot(p_motif, PLOTS,
+      "05_exploratory_motif_prevalence.pdf", 12, 7)
+  }
+}
+```
+
+## 6. Read the results in order
+
+1. `01_C0_supported_37_region_effects_and_attenuation.csv` gives each
+   region's signed effect, detection, count support, magnitude ratio and
+   parent-state effects. The 22-row table is an **exploratory subset**.
+2. `02_region_magnitude_descriptive_summary.csv` and two PDFs show the
+   continuous effect changes. Feature-resampling intervals are descriptive.
+3. Check `04_coverage_status.csv`, then view CON/HFD coverage within each
+   cohort. `chr17` illustrates why a flat pooled estimate need not mean
+   loss in every parent state.
+4. Inspect `05_motif_background_balance.csv` before any motif ranking. A
+   shared motif suggests a candidate family; check TF expression, motif
+   ambiguity, chromatin context, and eventually biological replication.
+
+```{r finish}
+finish_run(OUT, "STEP_08K_COMPLETE.txt", c(
+  "Frozen 08H WT regions, fixed 08I score gates, and validated 08J fragment recount.",
+  "Descriptive effects and feature-resampling intervals; no diet or genotype interaction P values.",
+  "Matched-set motif permutation/BH values describe sequence enrichment only, when RUN_MOTIFS=TRUE.",
+  paste("Results:", OUT)))
+```

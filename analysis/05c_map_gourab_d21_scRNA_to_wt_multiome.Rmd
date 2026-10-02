@@ -1,0 +1,2718 @@
+---
+title: "Step 5C - Bidirectional mapping of Gourab d21 scRNA and WT multiome RNA"
+subtitle: "Version 2 - presto marker testing and reciprocal WT-to-source mapping"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# The goal of this notebook
+
+This auxiliary review maps the independently generated Gourab d21 whole-cell
+scRNA-seq reference onto the RNA component of the reviewed WT snMultiome
+object. The source reference contains matched CON and HFD libraries and 13
+named cell-state annotations recovered from the processed d21 loom file.
+
+The analysis has five purposes:
+
+1. reconstruct the source reference from the full Cell Ranger count matrices
+   while preserving the loom-derived biological labels;
+2. test how the source Stem, TAC, DSC, Goblet, and other identities correspond
+   to the current WT WNN clusters and cell-state annotations;
+3. provide external evidence for the focused review of WT clusters 0, 6, and
+   8 and the related secretory populations;
+4. reverse the mapping direction by projecting the reviewed WT states and WNN
+   clusters onto the Gourab d21 cells, then quantify bidirectional agreement;
+5. visualize cross-platform alignment with Harmony as a secondary sensitivity
+   analysis.
+
+The source labels and transferred labels are evidence, not automatic
+annotation overrides. Harmony is used only for visualization and neighborhood
+alignment. Original uncorrected RNA counts remain the basis for markers and
+all subsequent expression analyses.
+
+Although this notebook is numbered Step 5C to keep it beside the focused
+clustering reviews, it reads the current reviewed Step 6 WT object so that the
+external mapping can be compared directly with the existing annotations. It
+does not modify or replace that object.
+
+A practical SOL allocation is **8 CPU cores, 64-96 GiB memory, 8 hours,
+R 4.4.2, no GPU**.
+
+## Statistical limitation
+
+The recovered source metadata identifies cells only as CON or HFD. It does not
+retain mouse-level assignments. The WT snMultiome likewise contains one pooled
+library per diet. Consequently, this notebook performs no diet-effect
+inference and no abundance testing. Diet-specific summaries are descriptive.
+
+# 1. Setup
+
+Set the active dataset and cohort before running this notebook:
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 7
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(Matrix)
+  library(patchwork)
+  library(scales)
+})
+
+if (!requireNamespace("hdf5r", quietly = TRUE)) {
+  stop("Package 'hdf5r' is required to read the d21 loom metadata.")
+}
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 5C requires MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+
+ggplot2::theme_set(theme_multiome())
+set.seed(12345)
+future::plan(future::sequential)
+```
+
+# 2. Define inputs, outputs, and review parameters
+
+```{r define-inputs-and-outputs}
+ANALYSIS_VERSION <- "05c_v2_bidirectional_presto"
+
+REFERENCE_ROOT <- file.path(
+  PROJECT_DIR,
+  "reference_data",
+  "gourab_vilb_d21_scrna"
+)
+
+CON_H5_PATH <- file.path(
+  REFERENCE_ROOT,
+  "cellranger",
+  "ConCon21",
+  "outs",
+  "filtered_feature_bc_matrix.h5"
+)
+
+HFD_H5_PATH <- file.path(
+  REFERENCE_ROOT,
+  "cellranger",
+  "HFHF21",
+  "outs",
+  "filtered_feature_bc_matrix.h5"
+)
+
+LOOM_PATH <- file.path(
+  REFERENCE_ROOT,
+  "processed",
+  "day21",
+  "Day21_data_POST.loom"
+)
+
+STEP6_OBJECT_PATH <- file.path(
+  OUTPUT_DIR,
+  "06_annotation",
+  "multiome_annotated.rds"
+)
+
+STEP5C_DIR <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "gourab_d21_rna_reference_mapping"
+)
+
+STEP5C_PLOT_DIR <- file.path(STEP5C_DIR, "plots")
+STEP5C_TABLE_DIR <- file.path(STEP5C_DIR, "tables")
+
+SOURCE_REFERENCE_PATH <- file.path(
+  STEP5C_DIR,
+  "Gourab_d21_annotated_scRNA_reference.rds"
+)
+
+WT_TRANSFER_ASSIGNMENT_PATH <- file.path(
+  STEP5C_DIR,
+  "WT_Gourab_d21_label_transfer_assignments.csv"
+)
+
+for (output_directory in c(
+  STEP5C_DIR,
+  STEP5C_PLOT_DIR,
+  STEP5C_TABLE_DIR
+)) {
+  dir.create(
+    output_directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+for (input_path in c(
+  CON_H5_PATH,
+  HFD_H5_PATH,
+  LOOM_PATH,
+  STEP6_OBJECT_PATH
+)) {
+  assert_file(input_path)
+}
+
+SOURCE_VARIABLE_FEATURES <- 3000L
+SOURCE_PCS <- 50L
+TRANSFER_DIMS <- 1:30
+HARMONY_DIMS <- 1:30
+
+# These score bands are descriptive review aids, not biological probabilities
+# or substitutes for the manually assigned annotation-confidence field.
+HIGH_MAPPING_SCORE <- 0.75
+MODERATE_MAPPING_SCORE <- 0.50
+WT_INVERSE_REFERENCE_CONFIDENCE <- c("high", "moderate")
+
+CRYPT_FOCUS_CLUSTERS <- c("0", "6", "8")
+SECRETORY_FOCUS_CLUSTERS <- c("4", "5", "7", "9", "13", "18")
+FOCUS_CLUSTERS <- unique(c(
+  CRYPT_FOCUS_CLUSTERS,
+  SECRETORY_FOCUS_CLUSTERS
+))
+
+SOURCE_MARKER_PANEL <- list(
+  Stem = c("Lgr5", "Ascl2", "Smoc2", "Axin2", "Sox9"),
+  Proliferation = c("Mki67", "Top2a", "Cenpf", "Ube2c"),
+  DSC = c("Reg4", "Spink4", "Kit", "Agr2"),
+  Goblet = c("Muc2", "Spdef", "Fcgbp", "Clca1", "Zg16"),
+  Enterocyte = c("Car4", "Krt20", "Aqp8", "Slc26a3"),
+  Enteroendocrine = c("Chga", "Chgb", "Neurod1", "Pyy"),
+  Tuft = c("Pou2f3", "Dclk1", "Trpm5", "Gnat3"),
+  Immune = c("Ptprc", "Cd3d", "Cd79a", "Nkg7", "Lyz2")
+)
+
+SOURCE_MARKER_GENES <- unique(unlist(SOURCE_MARKER_PANEL))
+
+save_pdf_plot <- function(path, plot_object, width, height) {
+  grDevices::pdf(
+    file = path,
+    width = width,
+    height = height,
+    useDingbats = FALSE
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot_object)
+  invisible(path)
+}
+```
+
+# 3. Recover the loom-derived source annotations
+
+The loom contains the named cell identities and QC metadata but only 2,000
+features. Its expression matrix is therefore not used. The `_1` and `_2`
+suffixes were appended during integration; the original 10x barcode is
+recovered by removing only the final numeric suffix.
+
+```{r recover-source-loom-metadata}
+read_loom_metadata <- function(path) {
+  loom_file <- hdf5r::H5File$new(path, mode = "r")
+  on.exit(loom_file$close_all(), add = TRUE)
+
+  read_attribute <- function(attribute_name) {
+    loom_file[[file.path("col_attrs", attribute_name)]][]
+  }
+
+  tibble::tibble(
+    cell_id = as.character(read_attribute("CellID")),
+    source_diet = as.character(read_attribute("orig.ident")),
+    source_cell_state = as.character(
+      read_attribute("clusters_named")
+    ),
+    source_integrated_cluster = as.character(
+      read_attribute("integrated_snn_res.0.5")
+    ),
+    source_seurat_cluster = as.character(
+      read_attribute("seurat_clusters")
+    ),
+    loom_nCount_RNA = as.numeric(read_attribute("nCount_RNA")),
+    loom_nFeature_RNA = as.numeric(
+      read_attribute("nFeature_RNA")
+    ),
+    loom_percent_mt = as.numeric(read_attribute("percent.mt"))
+  )
+}
+
+source_metadata <- read_loom_metadata(LOOM_PATH) |>
+  dplyr::mutate(
+    raw_barcode = sub("_[0-9]+$", "", cell_id),
+    integration_suffix = sub(
+      "^.*_([0-9]+)$",
+      "\\1",
+      cell_id
+    )
+  )
+
+if (anyDuplicated(source_metadata$cell_id) > 0L) {
+  stop("The d21 loom contains duplicated CellID values.", call. = FALSE)
+}
+
+if (anyDuplicated(
+  paste(source_metadata$source_diet, source_metadata$raw_barcode)
+) > 0L) {
+  stop(
+    "The d21 loom contains duplicated diet-specific raw barcodes.",
+    call. = FALSE
+  )
+}
+
+expected_source_diets <- c("CON", "HFD")
+
+if (!setequal(unique(source_metadata$source_diet), expected_source_diets)) {
+  stop(
+    "Expected exactly CON and HFD in the d21 loom metadata.",
+    call. = FALSE
+  )
+}
+
+suffix_audit <- source_metadata |>
+  dplyr::count(
+    source_diet,
+    integration_suffix,
+    name = "cells"
+  ) |>
+  dplyr::arrange(source_diet, integration_suffix)
+
+suffix_counts_by_diet <- suffix_audit |>
+  dplyr::count(source_diet, name = "suffixes")
+
+if (any(suffix_counts_by_diet$suffixes != 1L)) {
+  stop(
+    "Each source diet must map to exactly one integration suffix.",
+    call. = FALSE
+  )
+}
+
+if (dplyr::n_distinct(suffix_audit$integration_suffix) != 2L) {
+  stop(
+    "CON and HFD must have distinct integration suffixes.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  suffix_audit,
+  file.path(STEP5C_TABLE_DIR, "source_integration_suffix_audit.csv")
+)
+
+source_label_counts <- source_metadata |>
+  dplyr::count(
+    source_diet,
+    source_cell_state,
+    name = "cells"
+  ) |>
+  dplyr::group_by(source_diet) |>
+  dplyr::mutate(
+    percent_within_diet = 100 * cells / sum(cells)
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  source_label_counts,
+  file.path(STEP5C_TABLE_DIR, "source_label_counts_by_diet.csv")
+)
+
+suffix_audit
+source_label_counts
+```
+
+# 4. Reconnect the named cells to the full source count matrices
+
+Barcode matching is performed separately within CON and HFD. This avoids
+ambiguity from the 10x barcode sequences shared between independent runs.
+
+```{r reconstruct-full-source-counts}
+read_gene_expression_h5 <- function(path) {
+  count_object <- Seurat::Read10X_h5(
+    filename = path,
+    use.names = TRUE,
+    unique.features = TRUE
+  )
+
+  if (is.list(count_object)) {
+    if ("Gene Expression" %in% names(count_object)) {
+      count_object <- count_object[["Gene Expression"]]
+    } else if (length(count_object) == 1L) {
+      count_object <- count_object[[1]]
+    } else {
+      stop(
+        "The H5 file contains multiple modalities but no Gene Expression ",
+        "matrix.",
+        call. = FALSE
+      )
+    }
+  }
+
+  count_object
+}
+
+con_counts <- read_gene_expression_h5(CON_H5_PATH)
+hfd_counts <- read_gene_expression_h5(HFD_H5_PATH)
+
+shared_source_genes <- intersect(
+  rownames(con_counts),
+  rownames(hfd_counts)
+)
+
+if (length(shared_source_genes) == 0L) {
+  stop("The source H5 matrices have no shared genes.", call. = FALSE)
+}
+
+con_metadata <- source_metadata |>
+  dplyr::filter(source_diet == "CON")
+
+hfd_metadata <- source_metadata |>
+  dplyr::filter(source_diet == "HFD")
+
+source_cell_recovery_audit <- tibble::tibble(
+  source_diet = c("CON", "HFD"),
+  filtered_matrix_cells = c(ncol(con_counts), ncol(hfd_counts)),
+  annotated_loom_cells = c(nrow(con_metadata), nrow(hfd_metadata)),
+  annotated_barcodes_found = c(
+    sum(con_metadata$raw_barcode %in% colnames(con_counts)),
+    sum(hfd_metadata$raw_barcode %in% colnames(hfd_counts))
+  ),
+  annotated_cell_recovery_percent = 100 *
+    annotated_loom_cells / filtered_matrix_cells
+)
+
+if (any(
+  source_cell_recovery_audit$annotated_barcodes_found !=
+    source_cell_recovery_audit$annotated_loom_cells
+)) {
+  stop(
+    "Not every loom-annotated barcode was recovered from its diet-specific ",
+    "H5 matrix.",
+    call. = FALSE
+  )
+}
+
+con_annotated_counts <- con_counts[
+  shared_source_genes,
+  con_metadata$raw_barcode,
+  drop = FALSE
+]
+
+hfd_annotated_counts <- hfd_counts[
+  shared_source_genes,
+  hfd_metadata$raw_barcode,
+  drop = FALSE
+]
+
+colnames(con_annotated_counts) <- con_metadata$cell_id
+colnames(hfd_annotated_counts) <- hfd_metadata$cell_id
+
+source_counts <- cbind(
+  con_annotated_counts,
+  hfd_annotated_counts
+)
+
+source_counts <- source_counts[
+  ,
+  source_metadata$cell_id,
+  drop = FALSE
+]
+
+if (!identical(colnames(source_counts), source_metadata$cell_id)) {
+  stop(
+    "Reconstructed source counts are not aligned to the loom metadata.",
+    call. = FALSE
+  )
+}
+
+raw_nCount_RNA <- Matrix::colSums(source_counts)
+raw_nFeature_RNA <- Matrix::colSums(source_counts > 0)
+
+source_count_concordance <- source_metadata |>
+  dplyr::mutate(
+    raw_nCount_RNA = as.numeric(.env$raw_nCount_RNA[cell_id]),
+    raw_nFeature_RNA = as.numeric(.env$raw_nFeature_RNA[cell_id]),
+    nCount_difference = raw_nCount_RNA - loom_nCount_RNA,
+    nFeature_difference = raw_nFeature_RNA - loom_nFeature_RNA
+  ) |>
+  dplyr::group_by(source_diet) |>
+  dplyr::summarise(
+    cells = dplyr::n(),
+    exact_nCount_matches = sum(nCount_difference == 0),
+    exact_nFeature_matches = sum(nFeature_difference == 0),
+    median_absolute_nCount_difference = stats::median(
+      abs(nCount_difference)
+    ),
+    median_absolute_nFeature_difference = stats::median(
+      abs(nFeature_difference)
+    ),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  source_cell_recovery_audit,
+  file.path(STEP5C_TABLE_DIR, "source_cell_recovery_audit.csv")
+)
+
+readr::write_csv(
+  source_count_concordance,
+  file.path(STEP5C_TABLE_DIR, "source_count_metadata_concordance.csv")
+)
+
+source_cell_recovery_audit
+source_count_concordance
+```
+
+# 5. Build and independently audit the annotated source reference
+
+```{r build-source-reference}
+source_metadata_frame <- source_metadata |>
+  dplyr::select(
+    cell_id,
+    source_diet,
+    source_cell_state,
+    source_integrated_cluster,
+    source_seurat_cluster,
+    integration_suffix,
+    raw_barcode,
+    loom_nCount_RNA,
+    loom_nFeature_RNA,
+    loom_percent_mt
+  ) |>
+  as.data.frame(stringsAsFactors = FALSE)
+
+rownames(source_metadata_frame) <- source_metadata_frame$cell_id
+source_metadata_frame$cell_id <- NULL
+
+source_reference <- Seurat::CreateSeuratObject(
+  counts = source_counts,
+  assay = "RNA",
+  project = "Gourab_d21_scRNA",
+  meta.data = source_metadata_frame,
+  min.cells = 0,
+  min.features = 0
+)
+
+source_reference$dataset_platform <- "Gourab d21 scRNA"
+source_reference$source_or_query <- "Annotated reference"
+source_reference$mapping_state <- source_reference$source_cell_state
+
+Seurat::Idents(source_reference) <- "source_cell_state"
+
+source_reference <- Seurat::NormalizeData(
+  source_reference,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+source_reference <- Seurat::FindVariableFeatures(
+  source_reference,
+  selection.method = "vst",
+  nfeatures = SOURCE_VARIABLE_FEATURES,
+  verbose = FALSE
+)
+
+source_reference <- Seurat::ScaleData(
+  source_reference,
+  features = Seurat::VariableFeatures(source_reference),
+  verbose = FALSE
+)
+
+source_reference <- Seurat::RunPCA(
+  source_reference,
+  features = Seurat::VariableFeatures(source_reference),
+  npcs = SOURCE_PCS,
+  verbose = FALSE
+)
+
+source_reference <- Seurat::RunUMAP(
+  source_reference,
+  reduction = "pca",
+  dims = TRANSFER_DIMS,
+  reduction.name = "umap.source",
+  reduction.key = "sourceUMAP_",
+  seed.use = 12345,
+  verbose = FALSE
+)
+
+source_state_levels <- sort(unique(
+  as.character(source_reference$source_cell_state)
+))
+
+source_state_colors <- stats::setNames(
+  scales::hue_pal()(length(source_state_levels)),
+  source_state_levels
+)
+
+p_source_state <- Seurat::DimPlot(
+  source_reference,
+  reduction = "umap.source",
+  group.by = "source_cell_state",
+  cols = source_state_colors,
+  label = TRUE,
+  repel = TRUE,
+  raster = TRUE
+) +
+  ggplot2::labs(
+    title = "Reconstructed Gourab d21 scRNA reference",
+    subtitle = "Named identities recovered from the processed d21 loom"
+  ) +
+  ggplot2::theme(legend.position = "right")
+
+p_source_diet <- Seurat::DimPlot(
+  source_reference,
+  reduction = "umap.source",
+  group.by = "source_diet",
+  cols = DIET_COLORS,
+  raster = TRUE
+) +
+  ggplot2::labs(
+    title = "Source reference by diet",
+    subtitle = "Composition is descriptive; mouse-level identity is absent"
+  )
+
+p_source_overview <- p_source_state + p_source_diet +
+  patchwork::plot_layout(widths = c(1.3, 1))
+
+print(p_source_overview)
+
+save_pdf_plot(
+  file.path(STEP5C_PLOT_DIR, "01_source_reference_UMAP.pdf"),
+  p_source_overview,
+  width = 16,
+  height = 7
+)
+
+available_source_markers <- intersect(
+  SOURCE_MARKER_GENES,
+  rownames(source_reference)
+)
+
+missing_source_markers <- setdiff(
+  SOURCE_MARKER_GENES,
+  available_source_markers
+)
+
+source_marker_availability <- tibble::tibble(
+  gene = SOURCE_MARKER_GENES,
+  present = SOURCE_MARKER_GENES %in% available_source_markers
+)
+
+readr::write_csv(
+  source_marker_availability,
+  file.path(STEP5C_TABLE_DIR, "source_marker_panel_availability.csv")
+)
+
+if (length(available_source_markers) > 0L) {
+  p_source_markers <- Seurat::DotPlot(
+    source_reference,
+    features = available_source_markers,
+    group.by = "source_cell_state",
+    assay = "RNA",
+    cols = c("grey90", "#2166AC"),
+    dot.scale = 5
+  ) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title = "Source-reference marker audit",
+      subtitle = paste0(
+        "Full H5 expression; ",
+        length(missing_source_markers),
+        " panel gene(s) absent"
+      ),
+      x = NULL,
+      y = NULL
+    ) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(
+        angle = 45,
+        hjust = 1
+      )
+    )
+
+  print(p_source_markers)
+
+  save_pdf_plot(
+    file.path(STEP5C_PLOT_DIR, "02_source_marker_DotPlot.pdf"),
+    p_source_markers,
+    width = 14,
+    height = 9
+  )
+}
+
+saveRDS(
+  source_reference,
+  SOURCE_REFERENCE_PATH,
+  compress = FALSE
+)
+```
+
+# 6. Recalculate source-reference marker evidence
+
+These markers are calculated from the reconstructed full H5 counts rather
+than the 2,000-gene loom representation. They provide an auditable check of
+the inherited labels; they are not used to redefine those labels here.
+
+```{r discover-source-reference-markers}
+if (!requireNamespace("presto", quietly = TRUE)) {
+  stop(
+    "Source marker discovery requires 'presto' for a tractable Wilcoxon ",
+    "implementation. Run source('setup/install_packages.R') in a fresh ",
+    "R 4.4.2 session, restart R, and rerun this chunk.",
+    call. = FALSE
+  )
+}
+
+message(
+  "presto ",
+  as.character(utils::packageVersion("presto")),
+  " is available; Seurat will use its accelerated Wilcoxon implementation."
+)
+
+Seurat::Idents(source_reference) <- "source_cell_state"
+
+source_all_positive_markers <- Seurat::FindAllMarkers(
+  source_reference,
+  assay = "RNA",
+  only.pos = TRUE,
+  min.pct = 0.10,
+  logfc.threshold = 0.25,
+  test.use = "wilcox",
+  verbose = FALSE
+)
+
+source_top_markers <- source_all_positive_markers |>
+  dplyr::group_by(cluster) |>
+  dplyr::arrange(
+    p_val_adj,
+    dplyr::desc(avg_log2FC),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = 25L) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  source_all_positive_markers,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "source_RNA_all_positive_markers.csv"
+  )
+)
+
+readr::write_csv(
+  source_top_markers,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "source_RNA_top_annotation_candidates.csv"
+  )
+)
+
+source_top_markers |>
+  dplyr::select(
+    cluster,
+    gene,
+    avg_log2FC,
+    pct.1,
+    pct.2,
+    p_val_adj
+  ) |>
+  print(n = 100)
+```
+
+# 7. Build a clean WT RNA query from the reviewed Step 6 object
+
+The query is rebuilt from the original RNA counts so that reference and query
+receive the same log-normalization workflow. Existing WT annotations and WNN
+coordinates are retained only as metadata and independent comparison fields.
+
+```{r build-wt-rna-query}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+wt_metadata <- multiome[[]]
+
+required_wt_metadata <- c(
+  "sample_id",
+  "diet",
+  "wnn_cluster",
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence"
+)
+
+missing_wt_metadata <- setdiff(
+  required_wt_metadata,
+  colnames(wt_metadata)
+)
+
+if (length(missing_wt_metadata) > 0L) {
+  stop(
+    "The WT Step 6 object is missing metadata column(s): ",
+    paste(missing_wt_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!"RNA" %in% names(multiome)) {
+  stop("The WT Step 6 object does not contain an RNA assay.")
+}
+
+rna_layers <- SeuratObject::Layers(multiome[["RNA"]])
+
+if (!"counts" %in% rna_layers) {
+  stop(
+    "The WT RNA assay must contain a joined counts layer.",
+    call. = FALSE
+  )
+}
+
+wt_counts <- SeuratObject::LayerData(
+  multiome[["RNA"]],
+  layer = "counts"
+)
+
+if (!setequal(colnames(wt_counts), rownames(wt_metadata))) {
+  stop(
+    "WT RNA counts and Step 6 metadata do not contain the same cells.",
+    call. = FALSE
+  )
+}
+
+wt_counts <- wt_counts[
+  ,
+  rownames(wt_metadata),
+  drop = FALSE
+]
+
+wt_metadata$wnn_cluster <- as.character(wt_metadata$wnn_cluster)
+wt_metadata$cell_state <- as.character(wt_metadata$cell_state)
+wt_metadata$cell_state_full <- as.character(
+  wt_metadata$cell_state_full
+)
+wt_metadata$annotation_confidence <- tolower(as.character(
+  wt_metadata$annotation_confidence
+))
+
+wt_query <- Seurat::CreateSeuratObject(
+  counts = wt_counts,
+  assay = "RNA",
+  project = "WT_snMultiome_RNA",
+  meta.data = wt_metadata,
+  min.cells = 0,
+  min.features = 0
+)
+
+wt_query$dataset_platform <- "WT snMultiome RNA"
+wt_query$source_or_query <- "WT query"
+
+wt_query <- Seurat::NormalizeData(
+  wt_query,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+wt_query <- Seurat::FindVariableFeatures(
+  wt_query,
+  selection.method = "vst",
+  nfeatures = SOURCE_VARIABLE_FEATURES,
+  verbose = FALSE
+)
+
+wt_query <- Seurat::ScaleData(
+  wt_query,
+  features = Seurat::VariableFeatures(wt_query),
+  verbose = FALSE
+)
+
+wt_query <- Seurat::RunPCA(
+  wt_query,
+  features = Seurat::VariableFeatures(wt_query),
+  npcs = SOURCE_PCS,
+  verbose = FALSE
+)
+
+shared_reference_query_genes <- intersect(
+  rownames(source_reference),
+  rownames(wt_query)
+)
+
+reference_query_feature_audit <- tibble::tibble(
+  source_genes = nrow(source_reference),
+  query_genes = nrow(wt_query),
+  shared_genes = length(shared_reference_query_genes),
+  source_variable_features = length(
+    Seurat::VariableFeatures(source_reference)
+  ),
+  transferable_source_variable_features = sum(
+    Seurat::VariableFeatures(source_reference) %in%
+      shared_reference_query_genes
+  )
+)
+
+readr::write_csv(
+  reference_query_feature_audit,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "reference_query_feature_overlap_audit.csv"
+  )
+)
+
+reference_query_feature_audit
+```
+
+# 8. Transfer Gourab d21 identities onto the WT RNA query
+
+Transfer scores quantify mapping support within this specific reference. They
+are not percentages of biological identity and are not equivalent to the
+manually assigned annotation-confidence field.
+
+```{r transfer-source-identities-to-wt}
+transfer_features <- intersect(
+  Seurat::VariableFeatures(source_reference),
+  shared_reference_query_genes
+)
+
+if (length(transfer_features) < 1000L) {
+  warning(
+    "Fewer than 1,000 source variable features are available for transfer."
+  )
+}
+
+transfer_anchors <- Seurat::FindTransferAnchors(
+  reference = source_reference,
+  query = wt_query,
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  reduction = "pcaproject",
+  features = transfer_features,
+  dims = TRANSFER_DIMS,
+  verbose = TRUE
+)
+
+transfer_predictions <- Seurat::TransferData(
+  anchorset = transfer_anchors,
+  refdata = source_reference$source_cell_state,
+  dims = TRANSFER_DIMS,
+  verbose = TRUE
+)
+
+transfer_predictions <- as.data.frame(
+  transfer_predictions,
+  stringsAsFactors = FALSE
+)
+
+transfer_predictions$gourab_d21_predicted_state <- as.character(
+  transfer_predictions$predicted.id
+)
+
+transfer_predictions$gourab_d21_prediction_score <- as.numeric(
+  transfer_predictions$prediction.score.max
+)
+
+class_score_columns <- grep(
+  "^prediction[.]score[.]",
+  colnames(transfer_predictions),
+  value = TRUE
+)
+
+class_score_columns <- setdiff(
+  class_score_columns,
+  "prediction.score.max"
+)
+
+if (length(class_score_columns) < 2L) {
+  stop(
+    "TransferData did not return at least two class-score columns.",
+    call. = FALSE
+  )
+}
+
+class_score_matrix <- as.matrix(
+  transfer_predictions[, class_score_columns, drop = FALSE]
+)
+
+storage.mode(class_score_matrix) <- "numeric"
+class_score_matrix[!is.finite(class_score_matrix)] <- 0
+
+class_score_sums <- rowSums(class_score_matrix)
+
+normalized_class_scores <- class_score_matrix
+valid_score_rows <- class_score_sums > 0
+
+normalized_class_scores[valid_score_rows, ] <-
+  normalized_class_scores[valid_score_rows, , drop = FALSE] /
+  class_score_sums[valid_score_rows]
+
+normalized_class_scores[!valid_score_rows, ] <- 0
+
+transfer_predictions$gourab_d21_prediction_entropy <- apply(
+  normalized_class_scores,
+  1,
+  function(score_values) {
+    positive_scores <- score_values[score_values > 0]
+
+    if (length(positive_scores) <= 1L) {
+      return(0)
+    }
+
+    -sum(positive_scores * log(positive_scores)) /
+      log(ncol(normalized_class_scores))
+  }
+)
+
+top_two_scores <- t(apply(
+  class_score_matrix,
+  1,
+  function(score_values) {
+    sort(score_values, decreasing = TRUE)[1:2]
+  }
+))
+
+transfer_predictions$gourab_d21_prediction_margin <-
+  top_two_scores[, 1] - top_two_scores[, 2]
+
+transfer_predictions$gourab_d21_mapping_score_band <- dplyr::case_when(
+  transfer_predictions$gourab_d21_prediction_score >=
+    HIGH_MAPPING_SCORE ~ "high_score",
+  transfer_predictions$gourab_d21_prediction_score >=
+    MODERATE_MAPPING_SCORE ~ "moderate_score",
+  TRUE ~ "low_score"
+)
+
+transfer_predictions$predicted.id <- NULL
+transfer_predictions$prediction.score.max <- NULL
+
+wt_query <- Seurat::AddMetaData(
+  wt_query,
+  metadata = transfer_predictions
+)
+
+wt_query$mapping_state <- wt_query$gourab_d21_predicted_state
+
+wt_transfer_assignments <- wt_query[[]] |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::select(
+    cell_barcode,
+    sample_id,
+    diet,
+    wnn_cluster,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    gourab_d21_predicted_state,
+    gourab_d21_prediction_score,
+    gourab_d21_prediction_entropy,
+    gourab_d21_prediction_margin,
+    gourab_d21_mapping_score_band,
+    dplyr::all_of(class_score_columns)
+  )
+
+readr::write_csv(
+  wt_transfer_assignments,
+  WT_TRANSFER_ASSIGNMENT_PATH
+)
+
+mapping_score_summary <- wt_transfer_assignments |>
+  dplyr::summarise(
+    WT_nuclei = dplyr::n(),
+    median_prediction_score = stats::median(
+      gourab_d21_prediction_score
+    ),
+    prediction_score_q25 = stats::quantile(
+      gourab_d21_prediction_score,
+      0.25
+    ),
+    prediction_score_q75 = stats::quantile(
+      gourab_d21_prediction_score,
+      0.75
+    ),
+    high_score_percent = 100 * mean(
+      gourab_d21_mapping_score_band == "high_score"
+    ),
+    low_score_percent = 100 * mean(
+      gourab_d21_mapping_score_band == "low_score"
+    ),
+    median_prediction_entropy = stats::median(
+      gourab_d21_prediction_entropy
+    ),
+    median_prediction_margin = stats::median(
+      gourab_d21_prediction_margin
+    )
+  )
+
+readr::write_csv(
+  mapping_score_summary,
+  file.path(STEP5C_TABLE_DIR, "WT_label_transfer_score_summary.csv")
+)
+
+mapping_score_summary
+```
+
+# 9. Compare transferred identities with the current WT annotations
+
+The primary crosswalk is calculated within each current WNN cluster. No label
+is changed automatically, regardless of mapping score.
+
+```{r create-reference-query-crosswalks}
+wt_cluster_crosswalk <- wt_transfer_assignments |>
+  dplyr::count(
+    wnn_cluster,
+    cell_state,
+    cell_state_full,
+    gourab_d21_predicted_state,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(wnn_cluster) |>
+  dplyr::mutate(
+    percent_within_WT_cluster = 100 * nuclei / sum(nuclei)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(
+    suppressWarnings(as.integer(wnn_cluster)),
+    dplyr::desc(nuclei)
+  )
+
+wt_cluster_mapping_confidence <- wt_transfer_assignments |>
+  dplyr::group_by(
+    wnn_cluster,
+    cell_state,
+    cell_state_full,
+    gourab_d21_predicted_state
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    median_prediction_score = stats::median(
+      gourab_d21_prediction_score
+    ),
+    prediction_score_q25 = stats::quantile(
+      gourab_d21_prediction_score,
+      0.25
+    ),
+    prediction_score_q75 = stats::quantile(
+      gourab_d21_prediction_score,
+      0.75
+    ),
+    median_prediction_entropy = stats::median(
+      gourab_d21_prediction_entropy
+    ),
+    median_prediction_margin = stats::median(
+      gourab_d21_prediction_margin
+    ),
+    high_score_percent = 100 * mean(
+      gourab_d21_mapping_score_band == "high_score"
+    ),
+    CON_percent = 100 * mean(diet == "CON"),
+    HFD_percent = 100 * mean(diet == "HFD"),
+    .groups = "drop"
+  )
+
+wt_cell_state_crosswalk <- wt_transfer_assignments |>
+  dplyr::count(
+    cell_state,
+    gourab_d21_predicted_state,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(cell_state) |>
+  dplyr::mutate(
+    percent_within_current_cell_state = 100 * nuclei / sum(nuclei)
+  ) |>
+  dplyr::ungroup()
+
+wt_focus_crosswalk <- wt_cluster_mapping_confidence |>
+  dplyr::filter(wnn_cluster %in% FOCUS_CLUSTERS) |>
+  dplyr::group_by(wnn_cluster) |>
+  dplyr::mutate(
+    percent_within_WT_cluster = 100 * nuclei / sum(nuclei)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(
+    match(wnn_cluster, FOCUS_CLUSTERS),
+    dplyr::desc(nuclei)
+  )
+
+readr::write_csv(
+  wt_cluster_crosswalk,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "WT_WNN_cluster_by_Gourab_d21_state_crosswalk.csv"
+  )
+)
+
+readr::write_csv(
+  wt_cluster_mapping_confidence,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "WT_WNN_cluster_mapping_confidence.csv"
+  )
+)
+
+readr::write_csv(
+  wt_cell_state_crosswalk,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "WT_current_cell_state_by_Gourab_d21_state_crosswalk.csv"
+  )
+)
+
+readr::write_csv(
+  wt_focus_crosswalk,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "WT_focus_clusters_0_6_8_and_secretory_crosswalk.csv"
+  )
+)
+
+wt_focus_crosswalk |>
+  print(n = Inf, width = Inf)
+```
+
+# 10. Display transferred identities in the original WT WNN space
+
+The WNN coordinates are not recomputed. This plot asks where the independently
+transferred RNA identities fall within the existing multimodal structure.
+
+```{r plot-transferred-identities-in-wt-wnn-space}
+if (!"wnn.umap" %in% names(multiome@reductions)) {
+  stop("The WT Step 6 object does not contain the wnn.umap reduction.")
+}
+
+wnn_embeddings <- Seurat::Embeddings(
+  multiome,
+  reduction = "wnn.umap"
+)
+
+if (!setequal(rownames(wnn_embeddings), rownames(wt_query[[]]))) {
+  stop("WT WNN coordinates and transferred query cells do not match.")
+}
+
+wnn_embeddings <- wnn_embeddings[
+  rownames(wt_query[[]]),
+  ,
+  drop = FALSE
+]
+
+wt_wnn_mapping_data <- wt_query[[]] |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::mutate(
+    wnnUMAP_1 = wnn_embeddings[cell_barcode, 1],
+    wnnUMAP_2 = wnn_embeddings[cell_barcode, 2]
+  )
+
+p_wt_current <- ggplot2::ggplot(
+  wt_wnn_mapping_data,
+  ggplot2::aes(x = wnnUMAP_1, y = wnnUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = cell_state),
+    size = 0.25,
+    alpha = 0.75
+  ) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Current WT annotations",
+    x = "wnnUMAP_1",
+    y = "wnnUMAP_2",
+    color = "WT cell state"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_wt_transferred <- ggplot2::ggplot(
+  wt_wnn_mapping_data,
+  ggplot2::aes(x = wnnUMAP_1, y = wnnUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = gourab_d21_predicted_state),
+    size = 0.25,
+    alpha = 0.75
+  ) +
+  ggplot2::scale_color_manual(values = source_state_colors) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Gourab d21 transferred identities",
+    subtitle = "Reference mapping of RNA; WNN coordinates are unchanged",
+    x = "wnnUMAP_1",
+    y = "wnnUMAP_2",
+    color = "Transferred state"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_wt_mapping_score <- ggplot2::ggplot(
+  wt_wnn_mapping_data,
+  ggplot2::aes(x = wnnUMAP_1, y = wnnUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = gourab_d21_prediction_score),
+    size = 0.25,
+    alpha = 0.80
+  ) +
+  ggplot2::scale_color_viridis_c(
+    option = "C",
+    limits = c(0, 1)
+  ) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Maximum reference-mapping score",
+    subtitle = "Score is algorithmic support, not annotation confidence",
+    x = "wnnUMAP_1",
+    y = "wnnUMAP_2",
+    color = "Maximum score"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_wt_mapping_overview <- p_wt_current +
+  p_wt_transferred +
+  p_wt_mapping_score +
+  patchwork::plot_layout(ncol = 3)
+
+print(p_wt_mapping_overview)
+
+save_pdf_plot(
+  file.path(STEP5C_PLOT_DIR, "03_WT_WNN_reference_mapping_overview.pdf"),
+  p_wt_mapping_overview,
+  width = 22,
+  height = 7
+)
+```
+
+# 11. Plot the focused crypt and secretory crosswalk
+
+```{r plot-focused-crosswalk}
+focus_plot_data <- wt_focus_crosswalk |>
+  dplyr::mutate(
+    wnn_cluster = factor(
+      wnn_cluster,
+      levels = rev(FOCUS_CLUSTERS)
+    ),
+    gourab_d21_predicted_state = factor(
+      gourab_d21_predicted_state,
+      levels = source_state_levels
+    )
+  )
+
+p_focus_crosswalk <- ggplot2::ggplot(
+  focus_plot_data,
+  ggplot2::aes(
+    x = gourab_d21_predicted_state,
+    y = wnn_cluster,
+    fill = percent_within_WT_cluster
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.4) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = ifelse(
+        percent_within_WT_cluster >= 3,
+        paste0(nuclei, "\n", round(percent_within_WT_cluster, 1), "%"),
+        ""
+      )
+    ),
+    size = 3
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "C",
+    limits = c(0, 100)
+  ) +
+  ggplot2::labs(
+    title = "External-reference mapping of focused WT populations",
+    subtitle = paste0(
+      "Crypt review: 0, 6, 8; secretory context: ",
+      paste(SECRETORY_FOCUS_CLUSTERS, collapse = ", ")
+    ),
+    x = "Gourab d21 transferred identity",
+    y = "Current WT WNN cluster",
+    fill = "% of WT cluster"
+  ) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+print(p_focus_crosswalk)
+
+save_pdf_plot(
+  file.path(STEP5C_PLOT_DIR, "04_focused_cluster_mapping_crosswalk.pdf"),
+  p_focus_crosswalk,
+  width = 14,
+  height = 7
+)
+```
+
+# 12. Map the reviewed WT annotations back onto Gourab d21 cells
+
+The reciprocal transfer reverses the reference and query roles. Only WT cells
+with high- or moderate-confidence reviewed annotations are allowed into the WT
+reference. Gourab's observed labels are retained for comparison and are never
+used to train this inverse mapping.
+
+Reciprocal agreement is intentionally conservative. A broad source label may
+capture most cells from one WT state in the forward direction while mapping
+back to several WT states in the reverse direction. Both directions must be
+reviewed before claiming that two annotations represent equivalent
+populations.
+
+```{r transfer-wt-identities-to-source-reference}
+prepare_transfer_predictions <- function(
+  prediction_object,
+  prefix,
+  high_score = HIGH_MAPPING_SCORE,
+  moderate_score = MODERATE_MAPPING_SCORE
+) {
+  prediction_table <- as.data.frame(
+    prediction_object,
+    stringsAsFactors = FALSE
+  )
+
+  score_columns <- grep(
+    "^prediction[.]score[.]",
+    colnames(prediction_table),
+    value = TRUE
+  )
+
+  score_columns <- setdiff(
+    score_columns,
+    "prediction.score.max"
+  )
+
+  if (length(score_columns) < 2L) {
+    stop(
+      "TransferData did not return at least two class-score columns for ",
+      prefix,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  score_matrix <- as.matrix(
+    prediction_table[, score_columns, drop = FALSE]
+  )
+
+  storage.mode(score_matrix) <- "numeric"
+  score_matrix[!is.finite(score_matrix)] <- 0
+
+  score_sums <- rowSums(score_matrix)
+  normalized_scores <- score_matrix
+  valid_rows <- score_sums > 0
+
+  normalized_scores[valid_rows, ] <-
+    normalized_scores[valid_rows, , drop = FALSE] /
+    score_sums[valid_rows]
+
+  normalized_scores[!valid_rows, ] <- 0
+
+  entropy_values <- apply(
+    normalized_scores,
+    1,
+    function(score_values) {
+      positive_scores <- score_values[score_values > 0]
+
+      if (length(positive_scores) <= 1L) {
+        return(0)
+      }
+
+      -sum(positive_scores * log(positive_scores)) /
+        log(ncol(normalized_scores))
+    }
+  )
+
+  top_two_scores <- t(apply(
+    score_matrix,
+    1,
+    function(score_values) {
+      sort(score_values, decreasing = TRUE)[1:2]
+    }
+  ))
+
+  maximum_scores <- as.numeric(
+    prediction_table$prediction.score.max
+  )
+
+  output_table <- as.data.frame(
+    matrix(
+      nrow = nrow(prediction_table),
+      ncol = 0L,
+      dimnames = list(rownames(prediction_table), character())
+    )
+  )
+
+  output_table[[paste0(prefix, "_predicted_label")]] <- as.character(
+    prediction_table$predicted.id
+  )
+
+  output_table[[paste0(prefix, "_prediction_score")]] <- maximum_scores
+  output_table[[paste0(prefix, "_prediction_entropy")]] <- entropy_values
+  output_table[[paste0(prefix, "_prediction_margin")]] <-
+    top_two_scores[, 1] - top_two_scores[, 2]
+
+  output_table[[paste0(prefix, "_mapping_score_band")]] <-
+    dplyr::case_when(
+      maximum_scores >= high_score ~ "high_score",
+      maximum_scores >= moderate_score ~ "moderate_score",
+      TRUE ~ "low_score"
+    )
+
+  renamed_score_table <- prediction_table[
+    ,
+    score_columns,
+    drop = FALSE
+  ]
+
+  colnames(renamed_score_table) <- paste0(
+    prefix,
+    "_class_score_",
+    make.names(
+      sub("^prediction[.]score[.]", "", score_columns),
+      unique = TRUE
+    )
+  )
+
+  cbind(output_table, renamed_score_table)
+}
+
+wt_reference_metadata <- wt_query[[]]
+
+wt_inverse_reference_cells <- rownames(wt_reference_metadata)[
+  wt_reference_metadata$annotation_confidence %in%
+    WT_INVERSE_REFERENCE_CONFIDENCE &
+    !is.na(wt_reference_metadata$cell_state) &
+    nzchar(as.character(wt_reference_metadata$cell_state))
+]
+
+if (length(wt_inverse_reference_cells) == 0L) {
+  stop(
+    "No high- or moderate-confidence WT cells are available for inverse ",
+    "reference mapping.",
+    call. = FALSE
+  )
+}
+
+wt_reference_counts <- SeuratObject::LayerData(
+  wt_query[["RNA"]],
+  layer = "counts"
+)[
+  ,
+  wt_inverse_reference_cells,
+  drop = FALSE
+]
+
+wt_reference_metadata <- wt_reference_metadata[
+  wt_inverse_reference_cells,
+  ,
+  drop = FALSE
+]
+
+wt_reference <- Seurat::CreateSeuratObject(
+  counts = wt_reference_counts,
+  assay = "RNA",
+  project = "WT_reviewed_reference",
+  meta.data = wt_reference_metadata,
+  min.cells = 0,
+  min.features = 0
+)
+
+wt_reference$wt_reference_cell_state <- as.character(
+  wt_reference$cell_state
+)
+wt_reference$wt_reference_wnn_cluster <- as.character(
+  wt_reference$wnn_cluster
+)
+wt_reference$wt_reference_broad_compartment <- as.character(
+  wt_reference$broad_compartment
+)
+
+wt_inverse_reference_composition <- wt_reference[[]] |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::count(
+    wt_reference_wnn_cluster,
+    wt_reference_cell_state,
+    wt_reference_broad_compartment,
+    annotation_confidence,
+    name = "nuclei"
+  ) |>
+  dplyr::arrange(
+    suppressWarnings(as.integer(wt_reference_wnn_cluster))
+  )
+
+readr::write_csv(
+  wt_inverse_reference_composition,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "WT_inverse_reference_composition.csv"
+  )
+)
+
+wt_reference <- Seurat::NormalizeData(
+  wt_reference,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+wt_reference <- Seurat::FindVariableFeatures(
+  wt_reference,
+  selection.method = "vst",
+  nfeatures = SOURCE_VARIABLE_FEATURES,
+  verbose = FALSE
+)
+
+wt_reference <- Seurat::ScaleData(
+  wt_reference,
+  features = Seurat::VariableFeatures(wt_reference),
+  verbose = FALSE
+)
+
+wt_reference <- Seurat::RunPCA(
+  wt_reference,
+  features = Seurat::VariableFeatures(wt_reference),
+  npcs = SOURCE_PCS,
+  verbose = FALSE
+)
+
+source_query <- Seurat::CreateSeuratObject(
+  counts = source_counts,
+  assay = "RNA",
+  project = "Gourab_d21_query",
+  meta.data = source_metadata_frame,
+  min.cells = 0,
+  min.features = 0
+)
+
+source_query <- Seurat::NormalizeData(
+  source_query,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+source_query <- Seurat::FindVariableFeatures(
+  source_query,
+  selection.method = "vst",
+  nfeatures = SOURCE_VARIABLE_FEATURES,
+  verbose = FALSE
+)
+
+source_query <- Seurat::ScaleData(
+  source_query,
+  features = Seurat::VariableFeatures(source_query),
+  verbose = FALSE
+)
+
+source_query <- Seurat::RunPCA(
+  source_query,
+  features = Seurat::VariableFeatures(source_query),
+  npcs = SOURCE_PCS,
+  verbose = FALSE
+)
+
+inverse_shared_genes <- intersect(
+  rownames(wt_reference),
+  rownames(source_query)
+)
+
+inverse_transfer_features <- intersect(
+  Seurat::VariableFeatures(wt_reference),
+  inverse_shared_genes
+)
+
+if (length(inverse_transfer_features) < 1000L) {
+  warning(
+    "Fewer than 1,000 WT variable features are available for inverse ",
+    "reference mapping."
+  )
+}
+
+inverse_transfer_anchors <- Seurat::FindTransferAnchors(
+  reference = wt_reference,
+  query = source_query,
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  reduction = "pcaproject",
+  features = inverse_transfer_features,
+  dims = TRANSFER_DIMS,
+  verbose = TRUE
+)
+
+inverse_cell_state_raw <- Seurat::TransferData(
+  anchorset = inverse_transfer_anchors,
+  refdata = wt_reference$wt_reference_cell_state,
+  dims = TRANSFER_DIMS,
+  verbose = TRUE
+)
+
+inverse_wnn_cluster_raw <- Seurat::TransferData(
+  anchorset = inverse_transfer_anchors,
+  refdata = wt_reference$wt_reference_wnn_cluster,
+  dims = TRANSFER_DIMS,
+  verbose = TRUE
+)
+
+inverse_cell_state_predictions <- prepare_transfer_predictions(
+  inverse_cell_state_raw,
+  prefix = "WT_cell_state"
+)
+
+inverse_wnn_cluster_predictions <- prepare_transfer_predictions(
+  inverse_wnn_cluster_raw,
+  prefix = "WT_wnn_cluster"
+)
+
+source_query <- Seurat::AddMetaData(
+  source_query,
+  metadata = inverse_cell_state_predictions
+)
+
+source_query <- Seurat::AddMetaData(
+  source_query,
+  metadata = inverse_wnn_cluster_predictions
+)
+
+wt_state_to_broad_lookup <- wt_reference[[]] |>
+  dplyr::distinct(
+    wt_reference_cell_state,
+    wt_reference_broad_compartment
+  )
+
+state_broad_multiplicity <- wt_state_to_broad_lookup |>
+  dplyr::count(wt_reference_cell_state, name = "broad_labels")
+
+if (any(state_broad_multiplicity$broad_labels != 1L)) {
+  stop(
+    "At least one reviewed WT cell-state label maps to multiple broad ",
+    "compartments.",
+    call. = FALSE
+  )
+}
+
+wt_state_to_broad_vector <- stats::setNames(
+  wt_state_to_broad_lookup$wt_reference_broad_compartment,
+  wt_state_to_broad_lookup$wt_reference_cell_state
+)
+
+source_query$WT_predicted_broad_compartment <- unname(
+  wt_state_to_broad_vector[
+    source_query$WT_cell_state_predicted_label
+  ]
+)
+
+source_inverse_assignments <- source_query[[]] |>
+  tibble::rownames_to_column("source_cell_id") |>
+  dplyr::select(
+    source_cell_id,
+    source_diet,
+    source_cell_state,
+    source_integrated_cluster,
+    source_seurat_cluster,
+    WT_cell_state_predicted_label,
+    WT_predicted_broad_compartment,
+    WT_cell_state_prediction_score,
+    WT_cell_state_prediction_entropy,
+    WT_cell_state_prediction_margin,
+    WT_cell_state_mapping_score_band,
+    WT_wnn_cluster_predicted_label,
+    WT_wnn_cluster_prediction_score,
+    WT_wnn_cluster_prediction_entropy,
+    WT_wnn_cluster_prediction_margin,
+    WT_wnn_cluster_mapping_score_band,
+    dplyr::starts_with("WT_cell_state_class_score_"),
+    dplyr::starts_with("WT_wnn_cluster_class_score_")
+  )
+
+SOURCE_INVERSE_ASSIGNMENT_PATH <- file.path(
+  STEP5C_DIR,
+  "Gourab_d21_WT_inverse_label_transfer_assignments.csv"
+)
+
+readr::write_csv(
+  source_inverse_assignments,
+  SOURCE_INVERSE_ASSIGNMENT_PATH
+)
+
+inverse_mapping_summary <- source_inverse_assignments |>
+  dplyr::summarise(
+    source_cells = dplyr::n(),
+    WT_reference_nuclei = ncol(wt_reference),
+    WT_reference_cell_states = dplyr::n_distinct(
+      wt_reference$wt_reference_cell_state
+    ),
+    median_cell_state_prediction_score = stats::median(
+      WT_cell_state_prediction_score
+    ),
+    median_cluster_prediction_score = stats::median(
+      WT_wnn_cluster_prediction_score
+    ),
+    high_cell_state_score_percent = 100 * mean(
+      WT_cell_state_mapping_score_band == "high_score"
+    ),
+    low_cell_state_score_percent = 100 * mean(
+      WT_cell_state_mapping_score_band == "low_score"
+    )
+  )
+
+readr::write_csv(
+  inverse_mapping_summary,
+  file.path(STEP5C_TABLE_DIR, "inverse_mapping_score_summary.csv")
+)
+
+inverse_mapping_summary
+```
+
+# 13. Calculate bidirectional annotation agreement
+
+The forward percentage answers: what fraction of a current WT population maps
+to a Gourab label? The inverse percentage answers: what fraction of that
+Gourab label maps back to the same WT population? The conservative minimum is
+the smaller percentage, while the geometric mean summarizes two-way strength
+without allowing one direction to completely dominate.
+
+```{r calculate-reciprocal-mapping-agreement}
+forward_state_pairs <- wt_transfer_assignments |>
+  dplyr::group_by(
+    WT_cell_state = cell_state,
+    Gourab_cell_state = gourab_d21_predicted_state
+  ) |>
+  dplyr::summarise(
+    forward_nuclei = dplyr::n(),
+    forward_median_score = stats::median(
+      gourab_d21_prediction_score
+    ),
+    .groups = "drop_last"
+  ) |>
+  dplyr::mutate(
+    forward_percent_within_WT_state = 100 *
+      forward_nuclei / sum(forward_nuclei)
+  ) |>
+  dplyr::ungroup()
+
+inverse_state_pairs <- source_inverse_assignments |>
+  dplyr::group_by(
+    Gourab_cell_state = source_cell_state,
+    WT_cell_state = WT_cell_state_predicted_label
+  ) |>
+  dplyr::summarise(
+    inverse_cells = dplyr::n(),
+    inverse_median_score = stats::median(
+      WT_cell_state_prediction_score
+    ),
+    .groups = "drop_last"
+  ) |>
+  dplyr::mutate(
+    inverse_percent_within_Gourab_state = 100 *
+      inverse_cells / sum(inverse_cells)
+  ) |>
+  dplyr::ungroup()
+
+reciprocal_state_agreement <- dplyr::full_join(
+  forward_state_pairs,
+  inverse_state_pairs,
+  by = c("WT_cell_state", "Gourab_cell_state")
+) |>
+  dplyr::mutate(
+    dplyr::across(
+      c(
+        forward_nuclei,
+        inverse_cells,
+        forward_percent_within_WT_state,
+        inverse_percent_within_Gourab_state
+      ),
+      ~ tidyr::replace_na(.x, 0)
+    ),
+    reciprocal_geometric_mean_percent = sqrt(
+      forward_percent_within_WT_state *
+        inverse_percent_within_Gourab_state
+    ),
+    reciprocal_conservative_min_percent = pmin(
+      forward_percent_within_WT_state,
+      inverse_percent_within_Gourab_state
+    )
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(reciprocal_conservative_min_percent),
+    dplyr::desc(reciprocal_geometric_mean_percent)
+  )
+
+forward_cluster_pairs <- wt_transfer_assignments |>
+  dplyr::group_by(
+    WT_wnn_cluster = wnn_cluster,
+    Gourab_cell_state = gourab_d21_predicted_state
+  ) |>
+  dplyr::summarise(
+    forward_nuclei = dplyr::n(),
+    forward_median_score = stats::median(
+      gourab_d21_prediction_score
+    ),
+    .groups = "drop_last"
+  ) |>
+  dplyr::mutate(
+    forward_percent_within_WT_cluster = 100 *
+      forward_nuclei / sum(forward_nuclei)
+  ) |>
+  dplyr::ungroup()
+
+inverse_cluster_pairs <- source_inverse_assignments |>
+  dplyr::group_by(
+    Gourab_cell_state = source_cell_state,
+    WT_wnn_cluster = WT_wnn_cluster_predicted_label
+  ) |>
+  dplyr::summarise(
+    inverse_cells = dplyr::n(),
+    inverse_median_score = stats::median(
+      WT_wnn_cluster_prediction_score
+    ),
+    .groups = "drop_last"
+  ) |>
+  dplyr::mutate(
+    inverse_percent_within_Gourab_state = 100 *
+      inverse_cells / sum(inverse_cells)
+  ) |>
+  dplyr::ungroup()
+
+reciprocal_cluster_agreement <- dplyr::full_join(
+  forward_cluster_pairs,
+  inverse_cluster_pairs,
+  by = c("WT_wnn_cluster", "Gourab_cell_state")
+) |>
+  dplyr::mutate(
+    dplyr::across(
+      c(
+        forward_nuclei,
+        inverse_cells,
+        forward_percent_within_WT_cluster,
+        inverse_percent_within_Gourab_state
+      ),
+      ~ tidyr::replace_na(.x, 0)
+    ),
+    reciprocal_geometric_mean_percent = sqrt(
+      forward_percent_within_WT_cluster *
+        inverse_percent_within_Gourab_state
+    ),
+    reciprocal_conservative_min_percent = pmin(
+      forward_percent_within_WT_cluster,
+      inverse_percent_within_Gourab_state
+    )
+  ) |>
+  dplyr::arrange(
+    suppressWarnings(as.integer(WT_wnn_cluster)),
+    dplyr::desc(reciprocal_conservative_min_percent)
+  )
+
+reciprocal_focus_cluster_agreement <- reciprocal_cluster_agreement |>
+  dplyr::filter(WT_wnn_cluster %in% FOCUS_CLUSTERS)
+
+readr::write_csv(
+  reciprocal_state_agreement,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "reciprocal_WT_state_Gourab_state_agreement.csv"
+  )
+)
+
+readr::write_csv(
+  reciprocal_cluster_agreement,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "reciprocal_WT_cluster_Gourab_state_agreement.csv"
+  )
+)
+
+readr::write_csv(
+  reciprocal_focus_cluster_agreement,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "reciprocal_focus_cluster_Gourab_state_agreement.csv"
+  )
+)
+
+reciprocal_focus_cluster_agreement |>
+  print(n = Inf, width = Inf)
+```
+
+# 14. Plot inverse and reciprocal mapping evidence
+
+```{r plot-inverse-and-reciprocal-mapping}
+inverse_state_crosswalk <- source_inverse_assignments |>
+  dplyr::count(
+    source_cell_state,
+    WT_cell_state_predicted_label,
+    name = "cells"
+  ) |>
+  dplyr::group_by(source_cell_state) |>
+  dplyr::mutate(
+    percent_within_Gourab_state = 100 * cells / sum(cells)
+  ) |>
+  dplyr::ungroup()
+
+inverse_cluster_crosswalk <- source_inverse_assignments |>
+  dplyr::count(
+    source_cell_state,
+    WT_wnn_cluster_predicted_label,
+    name = "cells"
+  ) |>
+  dplyr::group_by(source_cell_state) |>
+  dplyr::mutate(
+    percent_within_Gourab_state = 100 * cells / sum(cells)
+  ) |>
+  dplyr::ungroup()
+
+inverse_source_label_score_summary <- source_inverse_assignments |>
+  dplyr::group_by(source_cell_state) |>
+  dplyr::summarise(
+    median_cell_prediction_score = stats::median(
+      WT_cell_state_prediction_score
+    ),
+    median_cell_prediction_entropy = stats::median(
+      WT_cell_state_prediction_entropy
+    ),
+    median_cell_prediction_margin = stats::median(
+      WT_cell_state_prediction_margin
+    ),
+    high_score_percent = 100 * mean(
+      WT_cell_state_mapping_score_band == "high_score"
+    ),
+    low_score_percent = 100 * mean(
+      WT_cell_state_mapping_score_band == "low_score"
+    ),
+    .groups = "drop"
+  )
+
+inverse_reference_state_count <- dplyr::n_distinct(
+  wt_reference$wt_reference_cell_state
+)
+
+inverse_source_label_specificity <- inverse_state_crosswalk |>
+  dplyr::group_by(source_cell_state) |>
+  dplyr::summarise(
+    source_cells = sum(cells),
+    dominant_predicted_WT_state = WT_cell_state_predicted_label[
+      which.max(percent_within_Gourab_state)
+    ],
+    dominant_predicted_WT_state_percent = max(
+      percent_within_Gourab_state
+    ),
+    WT_states_at_least_5_percent = sum(
+      percent_within_Gourab_state >= 5
+    ),
+    WT_states_at_least_10_percent = sum(
+      percent_within_Gourab_state >= 10
+    ),
+    normalized_label_distribution_entropy = {
+      label_probabilities <- percent_within_Gourab_state / 100
+      label_probabilities <- label_probabilities[
+        label_probabilities > 0
+      ]
+
+      if (inverse_reference_state_count <= 1L) {
+        0
+      } else {
+        -sum(label_probabilities * log(label_probabilities)) /
+          log(inverse_reference_state_count)
+      }
+    },
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    inverse_source_label_score_summary,
+    by = "source_cell_state"
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(normalized_label_distribution_entropy),
+    dominant_predicted_WT_state_percent
+  )
+
+readr::write_csv(
+  inverse_state_crosswalk,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "Gourab_state_by_predicted_WT_state_crosswalk.csv"
+  )
+)
+
+readr::write_csv(
+  inverse_cluster_crosswalk,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "Gourab_state_by_predicted_WT_cluster_crosswalk.csv"
+  )
+)
+
+readr::write_csv(
+  inverse_source_label_specificity,
+  file.path(
+    STEP5C_TABLE_DIR,
+    "inverse_source_label_specificity_summary.csv"
+  )
+)
+
+source_umap_embeddings <- Seurat::Embeddings(
+  source_reference,
+  reduction = "umap.source"
+)
+
+if (!setequal(
+  rownames(source_umap_embeddings),
+  source_inverse_assignments$source_cell_id
+)) {
+  stop(
+    "Source UMAP coordinates and inverse-mapping assignments do not match.",
+    call. = FALSE
+  )
+}
+
+source_umap_embeddings <- source_umap_embeddings[
+  source_inverse_assignments$source_cell_id,
+  ,
+  drop = FALSE
+]
+
+inverse_umap_data <- source_inverse_assignments |>
+  dplyr::mutate(
+    sourceUMAP_1 = source_umap_embeddings[source_cell_id, 1],
+    sourceUMAP_2 = source_umap_embeddings[source_cell_id, 2]
+  )
+
+p_inverse_observed <- ggplot2::ggplot(
+  inverse_umap_data,
+  ggplot2::aes(x = sourceUMAP_1, y = sourceUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = source_cell_state),
+    size = 0.25,
+    alpha = 0.75
+  ) +
+  ggplot2::scale_color_manual(values = source_state_colors) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Observed Gourab d21 labels",
+    x = "sourceUMAP_1",
+    y = "sourceUMAP_2",
+    color = "Gourab state"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_inverse_predicted <- ggplot2::ggplot(
+  inverse_umap_data,
+  ggplot2::aes(x = sourceUMAP_1, y = sourceUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = WT_cell_state_predicted_label),
+    size = 0.25,
+    alpha = 0.75
+  ) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Reviewed WT states transferred to d21",
+    subtitle = "Same source RNA embedding",
+    x = "sourceUMAP_1",
+    y = "sourceUMAP_2",
+    color = "Predicted WT state"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_inverse_score <- ggplot2::ggplot(
+  inverse_umap_data,
+  ggplot2::aes(x = sourceUMAP_1, y = sourceUMAP_2)
+) +
+  ggplot2::geom_point(
+    ggplot2::aes(color = WT_cell_state_prediction_score),
+    size = 0.25,
+    alpha = 0.80
+  ) +
+  ggplot2::scale_color_viridis_c(
+    option = "C",
+    limits = c(0, 1)
+  ) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Inverse mapping score",
+    subtitle = "Algorithmic support, not annotation confidence",
+    x = "sourceUMAP_1",
+    y = "sourceUMAP_2",
+    color = "Maximum score"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+p_inverse_overview <- p_inverse_observed +
+  p_inverse_predicted +
+  p_inverse_score +
+  patchwork::plot_layout(ncol = 3)
+
+print(p_inverse_overview)
+
+save_pdf_plot(
+  file.path(
+    STEP5C_PLOT_DIR,
+    "05_inverse_Gourab_to_WT_mapping_overview.pdf"
+  ),
+  p_inverse_overview,
+  width = 22,
+  height = 7
+)
+
+p_inverse_state <- ggplot2::ggplot(
+  inverse_state_crosswalk,
+  ggplot2::aes(
+    x = WT_cell_state_predicted_label,
+    y = source_cell_state,
+    fill = percent_within_Gourab_state
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.35) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = ifelse(
+        percent_within_Gourab_state >= 3,
+        paste0(cells, "\n", round(percent_within_Gourab_state, 1), "%"),
+        ""
+      )
+    ),
+    size = 2.6
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "C",
+    limits = c(0, 100)
+  ) +
+  ggplot2::labs(
+    title = "WT annotations transferred onto Gourab d21 cells",
+    subtitle = paste0(
+      "Rows sum to 100%; WT reference includes only high/moderate-confidence ",
+      "annotations"
+    ),
+    x = "Predicted reviewed WT cell state",
+    y = "Observed Gourab d21 label",
+    fill = "% of Gourab label"
+  ) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+print(p_inverse_state)
+
+save_pdf_plot(
+  file.path(
+    STEP5C_PLOT_DIR,
+    "06_inverse_Gourab_to_WT_state_crosswalk.pdf"
+  ),
+  p_inverse_state,
+  width = 18,
+  height = 8
+)
+
+reciprocal_focus_plot_data <- reciprocal_focus_cluster_agreement |>
+  dplyr::mutate(
+    WT_wnn_cluster = factor(
+      WT_wnn_cluster,
+      levels = rev(FOCUS_CLUSTERS)
+    ),
+    Gourab_cell_state = factor(
+      Gourab_cell_state,
+      levels = source_state_levels
+    )
+  )
+
+p_reciprocal_focus <- ggplot2::ggplot(
+  reciprocal_focus_plot_data,
+  ggplot2::aes(
+    x = Gourab_cell_state,
+    y = WT_wnn_cluster,
+    fill = reciprocal_conservative_min_percent
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.35) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = ifelse(
+        forward_percent_within_WT_cluster >= 3 |
+          inverse_percent_within_Gourab_state >= 3,
+        paste0(
+          "F ", round(forward_percent_within_WT_cluster),
+          " / R ", round(inverse_percent_within_Gourab_state)
+        ),
+        ""
+      )
+    ),
+    size = 2.7
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "C",
+    limits = c(0, 100)
+  ) +
+  ggplot2::labs(
+    title = "Bidirectional agreement for focused WT clusters",
+    subtitle = paste0(
+      "F = % of WT cluster mapping to source label; ",
+      "R = % of source label mapping back"
+    ),
+    x = "Gourab d21 cell state",
+    y = "WT WNN cluster",
+    fill = "Conservative\nminimum (%)"
+  ) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+print(p_reciprocal_focus)
+
+save_pdf_plot(
+  file.path(
+    STEP5C_PLOT_DIR,
+    "07_reciprocal_focused_cluster_agreement.pdf"
+  ),
+  p_reciprocal_focus,
+  width = 15,
+  height = 7
+)
+```
+
+# 15. Harmony co-embedding sensitivity analysis
+
+This section is intentionally secondary. Harmony adjusts the combined PCA
+embedding by platform/study label. It does not replace expression values,
+restore cytoplasmic transcripts missing from nuclei, or justify direct
+cross-platform abundance comparisons.
+
+If the `harmony` package is unavailable, the primary reference mapping remains
+complete and this section is skipped with an explicit audit record.
+
+```{r harmony-coembedding-sensitivity}
+harmony_available <- requireNamespace("harmony", quietly = TRUE)
+harmony_completed <- FALSE
+harmony_error <- NA_character_
+
+if (harmony_available) {
+  harmony_result <- tryCatch(
+    {
+      source_for_harmony <- Seurat::CreateSeuratObject(
+        counts = SeuratObject::LayerData(
+          source_reference[["RNA"]],
+          layer = "counts"
+        ),
+        project = "Gourab_d21_scRNA",
+        meta.data = source_reference[[]],
+        min.cells = 0,
+        min.features = 0
+      )
+
+      query_for_harmony <- Seurat::CreateSeuratObject(
+        counts = SeuratObject::LayerData(
+          wt_query[["RNA"]],
+          layer = "counts"
+        ),
+        project = "WT_snMultiome_RNA",
+        meta.data = wt_query[[]],
+        min.cells = 0,
+        min.features = 0
+      )
+
+      source_for_harmony <- Seurat::RenameCells(
+        source_for_harmony,
+        add.cell.id = "GourabD21"
+      )
+
+      query_for_harmony <- Seurat::RenameCells(
+        query_for_harmony,
+        add.cell.id = "WTMultiome"
+      )
+
+      combined_rna <- merge(
+        source_for_harmony,
+        y = query_for_harmony,
+        merge.data = FALSE
+      )
+
+      combined_rna <- SeuratObject::JoinLayers(
+        combined_rna,
+        assay = "RNA"
+      )
+
+      combined_rna <- Seurat::NormalizeData(
+        combined_rna,
+        normalization.method = "LogNormalize",
+        scale.factor = 10000,
+        verbose = FALSE
+      )
+
+      combined_rna <- Seurat::FindVariableFeatures(
+        combined_rna,
+        selection.method = "vst",
+        nfeatures = SOURCE_VARIABLE_FEATURES,
+        verbose = FALSE
+      )
+
+      combined_rna <- Seurat::ScaleData(
+        combined_rna,
+        features = Seurat::VariableFeatures(combined_rna),
+        verbose = FALSE
+      )
+
+      combined_rna <- Seurat::RunPCA(
+        combined_rna,
+        features = Seurat::VariableFeatures(combined_rna),
+        npcs = SOURCE_PCS,
+        verbose = FALSE
+      )
+
+      combined_rna <- Seurat::RunUMAP(
+        combined_rna,
+        reduction = "pca",
+        dims = HARMONY_DIMS,
+        reduction.name = "umap.unintegrated",
+        reduction.key = "unintegratedUMAP_",
+        seed.use = 12345,
+        verbose = FALSE
+      )
+
+      combined_rna <- harmony::RunHarmony(
+        object = combined_rna,
+        group.by.vars = "dataset_platform",
+        reduction.use = "pca",
+        dims.use = HARMONY_DIMS,
+        reduction.save = "harmony",
+        plot_convergence = FALSE,
+        verbose = FALSE
+      )
+
+      combined_rna <- Seurat::RunUMAP(
+        combined_rna,
+        reduction = "harmony",
+        dims = HARMONY_DIMS,
+        reduction.name = "umap.harmony",
+        reduction.key = "harmonyUMAP_",
+        seed.use = 12345,
+        verbose = FALSE
+      )
+
+      platform_colors <- c(
+        "Gourab d21 scRNA" = "#0072B2",
+        "WT snMultiome RNA" = "#D55E00"
+      )
+
+      p_unintegrated_platform <- Seurat::DimPlot(
+        combined_rna,
+        reduction = "umap.unintegrated",
+        group.by = "dataset_platform",
+        cols = platform_colors,
+        raster = TRUE
+      ) +
+        ggplot2::labs(
+          title = "Uncorrected shared RNA embedding",
+          subtitle = "Platform separation is expected"
+        )
+
+      p_harmony_platform <- Seurat::DimPlot(
+        combined_rna,
+        reduction = "umap.harmony",
+        group.by = "dataset_platform",
+        cols = platform_colors,
+        raster = TRUE
+      ) +
+        ggplot2::labs(
+          title = "Harmony sensitivity embedding",
+          subtitle = "Corrected by dataset/platform only"
+        )
+
+      p_harmony_state <- Seurat::DimPlot(
+        combined_rna,
+        reduction = "umap.harmony",
+        group.by = "mapping_state",
+        cols = source_state_colors,
+        label = TRUE,
+        repel = TRUE,
+        raster = TRUE
+      ) +
+        ggplot2::labs(
+          title = "Harmony embedding by reference/mapped identity",
+          subtitle = paste0(
+            "Reference cells use observed labels; WT cells use ",
+            "transferred labels"
+          )
+        )
+
+      p_harmony_overview <- p_unintegrated_platform +
+        p_harmony_platform +
+        p_harmony_state +
+        patchwork::plot_layout(ncol = 3)
+
+      print(p_harmony_overview)
+
+      save_pdf_plot(
+        file.path(
+          STEP5C_PLOT_DIR,
+          "08_Harmony_cross_platform_sensitivity.pdf"
+        ),
+        p_harmony_overview,
+        width = 23,
+        height = 7
+      )
+
+      harmony_embeddings <- Seurat::Embeddings(
+        combined_rna,
+        reduction = "umap.harmony"
+      )
+
+      harmony_embedding_table <- combined_rna[[]] |>
+        tibble::rownames_to_column("cell_id") |>
+        dplyr::mutate(
+          harmonyUMAP_1 = harmony_embeddings[cell_id, 1],
+          harmonyUMAP_2 = harmony_embeddings[cell_id, 2]
+        ) |>
+        dplyr::select(
+          cell_id,
+          dataset_platform,
+          source_or_query,
+          mapping_state,
+          source_diet,
+          sample_id,
+          diet,
+          wnn_cluster,
+          cell_state,
+          gourab_d21_prediction_score,
+          harmonyUMAP_1,
+          harmonyUMAP_2
+        )
+
+      readr::write_csv(
+        harmony_embedding_table,
+        file.path(
+          STEP5C_TABLE_DIR,
+          "Harmony_cross_platform_embedding.csv"
+        )
+      )
+
+      list(
+        completed = TRUE,
+        error = NA_character_
+      )
+    },
+    error = function(error_condition) {
+      current_harmony_error <- conditionMessage(error_condition)
+      warning(
+        "Harmony sensitivity analysis failed: ",
+        current_harmony_error,
+        call. = FALSE
+      )
+      list(
+        completed = FALSE,
+        error = current_harmony_error
+      )
+    }
+  )
+
+  harmony_completed <- isTRUE(harmony_result$completed)
+  harmony_error <- harmony_result$error
+}
+
+harmony_audit <- tibble::tibble(
+  harmony_package_available = harmony_available,
+  harmony_completed = harmony_completed,
+  harmony_error = harmony_error
+)
+
+readr::write_csv(
+  harmony_audit,
+  file.path(STEP5C_TABLE_DIR, "Harmony_sensitivity_audit.csv")
+)
+
+harmony_audit
+```
+
+# 16. Save completion records
+
+No current WT annotation is changed in this notebook. The transferred-label
+table and focused crosswalk are inputs for the subsequent manual crypt-axis
+review.
+
+```{r save-completion-records}
+step5c_summary <- tibble::tibble(
+  analysis_version = ANALYSIS_VERSION,
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  source_CON_filtered_cells = ncol(con_counts),
+  source_HFD_filtered_cells = ncol(hfd_counts),
+  source_annotated_cells = ncol(source_reference),
+  source_named_states = dplyr::n_distinct(
+    source_reference$source_cell_state
+  ),
+  WT_query_nuclei = ncol(wt_query),
+  shared_reference_query_genes = length(
+    shared_reference_query_genes
+  ),
+  median_transfer_score = stats::median(
+    wt_query$gourab_d21_prediction_score
+  ),
+  high_score_WT_percent = 100 * mean(
+    wt_query$gourab_d21_mapping_score_band == "high_score"
+  ),
+  WT_inverse_reference_nuclei = ncol(wt_reference),
+  inverse_source_cells = nrow(source_inverse_assignments),
+  inverse_median_cell_state_score = stats::median(
+    source_inverse_assignments$WT_cell_state_prediction_score
+  ),
+  inverse_high_score_source_percent = 100 * mean(
+    source_inverse_assignments$WT_cell_state_mapping_score_band ==
+      "high_score"
+  ),
+  presto_version = as.character(utils::packageVersion("presto")),
+  harmony_completed = harmony_completed,
+  annotation_overrides_applied = FALSE,
+  biological_diet_inference_performed = FALSE
+)
+
+readr::write_csv(
+  step5c_summary,
+  file.path(STEP5C_DIR, "step5c_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 5C completed:", Sys.time()),
+    paste("Analysis version:", ANALYSIS_VERSION),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste("Source annotated cells:", ncol(source_reference)),
+    paste(
+      "Source named states:",
+      dplyr::n_distinct(source_reference$source_cell_state)
+    ),
+    paste("WT query nuclei:", ncol(wt_query)),
+    paste(
+      "Shared reference-query genes:",
+      length(shared_reference_query_genes)
+    ),
+    paste(
+      "Median transfer score:",
+      signif(stats::median(
+        wt_query$gourab_d21_prediction_score
+      ), 4)
+    ),
+    paste("presto version:", utils::packageVersion("presto")),
+    paste("WT inverse-reference nuclei:", ncol(wt_reference)),
+    paste(
+      "Inverse median cell-state score:",
+      signif(stats::median(
+        source_inverse_assignments$WT_cell_state_prediction_score
+      ), 4)
+    ),
+    paste("Harmony sensitivity completed:", harmony_completed),
+    "WT annotation overrides applied: FALSE",
+    "Biological diet inference performed: FALSE",
+    paste("Source reference object:", SOURCE_REFERENCE_PATH),
+    paste("WT transfer assignments:", WT_TRANSFER_ASSIGNMENT_PATH),
+    paste("Source inverse assignments:", SOURCE_INVERSE_ASSIGNMENT_PATH)
+  ),
+  con = file.path(STEP5C_DIR, "STEP_05C_COMPLETE.txt")
+)
+
+writeLines(
+  c(
+    "Step 5C external-reference mapping is ready for manual review.",
+    paste(
+      "Review focused crosswalk:",
+      file.path(
+        STEP5C_TABLE_DIR,
+        "WT_focus_clusters_0_6_8_and_secretory_crosswalk.csv"
+      )
+    ),
+    paste(
+      "Review mapping overview:",
+      file.path(
+        STEP5C_PLOT_DIR,
+        "03_WT_WNN_reference_mapping_overview.pdf"
+      )
+    ),
+    paste(
+      "Review inverse mapping overview:",
+      file.path(
+        STEP5C_PLOT_DIR,
+        "05_inverse_Gourab_to_WT_mapping_overview.pdf"
+      )
+    ),
+    paste(
+      "Review reciprocal focus table:",
+      file.path(
+        STEP5C_TABLE_DIR,
+        "reciprocal_focus_cluster_Gourab_state_agreement.csv"
+      )
+    ),
+    "Do not overwrite WT annotations without a separate reviewed decision."
+  ),
+  con = file.path(STEP5C_DIR, "STEP_05C_READY_FOR_REVIEW.txt")
+)
+
+step5c_summary
+```
+
+# 17. Session information
+
+```{r session-information}
+sessionInfo()
+```

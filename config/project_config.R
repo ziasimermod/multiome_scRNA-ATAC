@@ -8,6 +8,12 @@ set.seed(20260727)
 
 PROJECT_DIR <- "/scratch/dsaiz/Yesenia_scData2026"
 
+# New analyses write independently of captured reference provenance.
+RESULTS_ROOT <- Sys.getenv("MULTIOME_RESULTS_DIR",
+  unset = file.path(PROJECT_DIR, "results"))
+if (!nzchar(RESULTS_ROOT)) stop("MULTIOME_RESULTS_DIR must not be empty.")
+
+
 # -------------------------------------------------------------------------
 # Dataset version and biological cohort
 # -------------------------------------------------------------------------
@@ -98,9 +104,7 @@ ANNOTATION_DECISION_PATH <- file.path(
   "cell_state_annotations.csv"
 )
 
-OUTPUT_DIR <- file.path(
-  PROJECT_DIR,
-  "results",
+OUTPUT_DIR <- file.path(RESULTS_ROOT,
   DATASET_VERSION,
   "independent",
   COHORT_ID

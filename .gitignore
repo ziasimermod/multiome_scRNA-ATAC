@@ -41,3 +41,10 @@ results/*
 Thumbs.db
 
 .positai
+
+# Handoff-generated artifacts
+*.knit.md
+*.tar.gz
+*.zip
+provenance/
+cleanup_backups/

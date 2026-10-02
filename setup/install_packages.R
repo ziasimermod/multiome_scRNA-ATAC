@@ -1,5 +1,9 @@
 #!/usr/bin/env Rscript
 
+# Installer version: 2.0.0
+# Uses command-line git for pinned GitHub sources so it does not depend on the
+# R curl/remotes download path on SOL.
+
 # One-time package installation/repair for the ASU SOL R 4.4.2 environment.
 #
 # Run this interactively from the RStudio Console with:
@@ -63,6 +67,14 @@ cran_packages <- c(
   "fastmatch"
 )
 
+github_packages <- c(
+  presto = "https://github.com/immunogenomics/presto.git"
+)
+
+github_package_refs <- c(
+  presto = "v1.1.0"
+)
+
 bioconductor_packages <- c(
   "rtracklayer",
   "EnsDb.Mmusculus.v79",
@@ -86,6 +98,98 @@ is_loadable <- function(package_name) {
   )
 }
 
+install_git_source_package <- function(
+  package_name,
+  repository_url,
+  repository_ref,
+  library_path
+) {
+  git_binary <- Sys.which("git")
+
+  if (!nzchar(git_binary)) {
+    stop(
+      "Command-line git is required to install ",
+      package_name,
+      " without the broken R curl/remotes download path.",
+      call. = FALSE
+    )
+  }
+
+  source_root <- tempfile(pattern = paste0(package_name, "-git-source-"))
+  dir.create(source_root, recursive = TRUE, showWarnings = FALSE)
+  on.exit(
+    unlink(source_root, recursive = TRUE, force = TRUE),
+    add = TRUE
+  )
+
+  source_directory <- file.path(source_root, package_name)
+
+  clone_output <- system2(
+    git_binary,
+    args = c(
+      "clone",
+      "--depth",
+      "1",
+      "--branch",
+      repository_ref,
+      repository_url,
+      source_directory
+    ),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+
+  clone_status <- attr(clone_output, "status")
+  if (is.null(clone_status)) clone_status <- 0L
+
+  if (!identical(as.integer(clone_status), 0L)) {
+    stop(
+      "Command-line git could not clone ",
+      package_name,
+      " at ",
+      repository_ref,
+      ":\n",
+      paste(clone_output, collapse = "\n"),
+      call. = FALSE
+    )
+  }
+
+  r_binary <- file.path(R.home("bin"), "R")
+  normalized_library <- normalizePath(
+    library_path,
+    mustWork = TRUE
+  )
+
+  install_output <- system2(
+    r_binary,
+    args = c(
+      "CMD",
+      "INSTALL",
+      paste0("--library=", normalized_library),
+      "--no-multiarch",
+      source_directory
+    ),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+
+  install_status <- attr(install_output, "status")
+  if (is.null(install_status)) install_status <- 0L
+
+  cat(paste(install_output, collapse = "\n"), "\n")
+
+  if (!identical(as.integer(install_status), 0L)) {
+    stop(
+      "R CMD INSTALL failed for ",
+      package_name,
+      " at ",
+      repository_ref,
+      ". Review the installation output above.",
+      call. = FALSE
+    )
+  }
+}
+
 cran_to_install <- cran_packages[
   !vapply(cran_packages, is_loadable, logical(1))
 ]
@@ -97,6 +201,26 @@ if (length(cran_to_install) > 0L) {
       lib = target_library,
       dependencies = NA,
       Ncpus = 1L
+    )
+  }
+}
+
+github_to_install <- names(github_packages)[
+  !vapply(names(github_packages), is_loadable, logical(1))
+]
+
+if (length(github_to_install) > 0L) {
+  message(
+    "Installing pinned Git source packages without R curl/remotes: ",
+    paste(github_to_install, collapse = ", ")
+  )
+
+  for (package_name in github_to_install) {
+    install_git_source_package(
+      package_name = package_name,
+      repository_url = github_packages[[package_name]],
+      repository_ref = github_package_refs[[package_name]],
+      library_path = target_library
     )
   }
 }
@@ -128,7 +252,11 @@ if (length(bioc_to_install) > 0L) {
   )
 }
 
-all_packages <- c(cran_packages, bioconductor_packages)
+all_packages <- c(
+  cran_packages,
+  bioconductor_packages,
+  names(github_packages)
+)
 status <- vapply(all_packages, is_loadable, logical(1))
 
 cat("\nFinal namespace preflight\n")

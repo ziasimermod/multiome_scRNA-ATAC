@@ -1,0 +1,362 @@
+---
+title: "Step 08E | Refined WT crypt diet benchmarks"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This release compares CON and HFD **within the refined WT focused r0.3
+populations** identified in Step 05E and reviewed in 05F. C0 is the
+ISC-enriched primary population and C2 the Dmbt1/Hmgcs2 progenitor-like
+primary population. C1 and C4 are exploratory comparators; C3 and C5, plus
+the historical global 8+6 grouping, are sensitivity contexts. Step 05E,
+Step 06 and previous Steps 08–08D are unchanged.
+
+One pooled CON library and one pooled HFD library means fold changes,
+classification and resampling are **descriptive**. Repeated draws of nuclei
+measure dependence on the included nuclei and depth; they are not biological
+replicates and yield no sample-level P value or FDR. No claim of differential
+expression, differential accessibility, fetal conversion, enhancer targeting
+or causal genotype effect follows from this notebook.
+
+Run after the completed 05F notebook from the project root in the WT R
+session. Recommended SOL allocation: 8 CPUs, 96 GB, 8 hours.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
+  fig.width = 11, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else stop("Open the project root before running 08E.", call. = FALSE)
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+source(file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R"))
+suppressPackageStartupMessages({
+  library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+  "08E requires the v2_resequenced WT run.")
+set.seed(12345)
+```
+
+```{r inputs-and-working-map}
+STEP5E <- file.path(OUTPUT_DIR, "05_wnn", "focused_wt_crypt_stem_progenitor")
+ROOT_FOLLOWUP <- file.path(OUTPUT_DIR, "05_wnn", FOLLOWUP_RELEASE)
+STEP5F <- file.path(ROOT_FOLLOWUP, "05f_review")
+OBJECT <- file.path(STEP5E, "objects", "WT_crypt_core_0_6_8_focused.rds")
+ANNOTATED <- file.path(OUTPUT_DIR, "06_annotation", "multiome_annotated.rds")
+DECISION <- file.path(STEP5F, "refined_working_labels.csv")
+COMPLETE <- file.path(STEP5F, "STEP_05F_COMPLETE.txt")
+REFERENCE <- file.path(DATASET_CONFIG_DIR, "reference_programs",
+  "persistent_hfd_genes.csv")
+OUT <- file.path(OUTPUT_DIR, "08e_refined_wt_crypt_diet")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+for (path in c(OBJECT, ANNOTATED, DECISION, COMPLETE, REFERENCE))
+  need(file.exists(path), paste("Required input absent:", path))
+
+map <- read_csv_checked(DECISION) |>
+  dplyr::mutate(
+    focused_cluster = as.character(focused_cluster)
+  )
+
+require_columns(map, c("focused_cluster", "analysis_unit", "working_label",
+  "analysis_role", "label_status", "approved_for_global_annotation",
+  "focused_annotation_confidence"),
+  "working decision")
+
+need(setequal(as.character(map$focused_cluster), as.character(0:5)) &&
+  !anyDuplicated(map$focused_cluster), "Expected exactly one working row for C0-C5.")
+need(all(!map$approved_for_global_annotation) &&
+  all(map$label_status == "provisional_working"),
+  "The working map was modified into an annotation approval; review it separately.")
+manifest <- capture_manifest(c(OBJECT, ANNOTATED, DECISION, COMPLETE, REFERENCE), OUT)
+```
+
+```{r align-focused-matrices}
+focused <- load_focused(OBJECT)
+obj <- focused$object
+meta <- focused$metadata
+rna <- focused$matrices$RNA_counts
+atac <- focused$matrices$ATAC_counts
+write_table(focused$alignment, OUT, "matrix_cell_alignment_audit.csv")
+require_columns(meta, "annotation_confidence", "Step 05E metadata")
+meta <- dplyr::left_join(
+  dplyr::rename(meta, parent_annotation_confidence = annotation_confidence),
+  map, by = "focused_cluster",
+  relationship = "many-to-one")
+need(!anyNA(meta$analysis_unit), "Some nuclei have no provisional working mapping.")
+require_columns(meta,
+  c("parent_annotation_confidence", "focused_annotation_confidence"),
+  "joined 08E metadata")
+reference <- read_csv_checked(REFERENCE) |>
+  dplyr::mutate(gene_original = gene,
+    gene = dplyr::if_else(gene == "Atpif1", "Atp5if1", gene))
+require_columns(reference, c("gene", "reference_direction", "reference_program",
+  "avg_log2FC_day21"), "persistent source")
+need(!anyDuplicated(reference$gene), "Duplicate persistent genes after canonicalization.")
+need(all(reference$reference_direction %in% c("HFD_higher", "CON_higher")),
+  "Unrecognized source direction.")
+write_table(reference, OUT, "persistent_reference_gene_canonicalization.csv")
+```
+
+```{r define-contrasts}
+# Separate within-state effects from changes in cluster abundance. Preserve
+# previous global 8+6 definition as a sensitivity, not as the new ISC label.
+contrast <- tibble::tribble(
+  ~contrast, ~population, ~member, ~role,
+  "C0_ISC_enriched", "C0", "0", "primary",
+  "C2_progenitor_like", "C2", "2", "primary",
+  "C1_Htr4_Fut9", "C1", "1", "exploratory",
+  "C3_unresolved", "C3", "3", "sensitivity",
+  "C4_secretory", "C4", "4", "secretory_comparator",
+  "C5_stem_associated", "C5", "5", "sensitivity",
+  "C0_C3_C5_broad_crypt_sensitivity", "C0+C3+C5", "0;3;5", "sensitivity",
+  "legacy_global_8_6", "global_8+6", "8;6", "historical_sensitivity"
+)
+contrast$n_CON <- integer(nrow(contrast)); contrast$n_HFD <- integer(nrow(contrast))
+contrast$member_definition <- ifelse(contrast$contrast == "legacy_global_8_6",
+  "parent_wnn_cluster", "focused_cluster")
+contrast_indices <- vector("list", nrow(contrast))
+for (i in seq_len(nrow(contrast))) {
+  members <- strsplit(contrast$member[i], ";", fixed = TRUE)[[1]]
+  key <- contrast$member_definition[i]
+  ix <- which(as.character(meta[[key]]) %in% members)
+  contrast_indices[[i]] <- ix
+  contrast$n_CON[i] <- sum(meta$diet[ix] == "CON")
+  contrast$n_HFD[i] <- sum(meta$diet[ix] == "HFD")
+}
+need(all(contrast$n_CON >= 30L & contrast$n_HFD >= 30L),
+  "A requested contrast has fewer than 30 nuclei per diet.")
+write_table(contrast, OUT, "refined_diet_contrast_definition_and_counts.csv")
+```
+
+```{r pooled-rna-atac-effects}
+# Every effect is HFD minus CON. Evaluable filters follow Step 08B, but no
+# individual-nucleus inferential P values are reported as biological evidence.
+all_effects <- list()
+for (modality in c("RNA", "ATAC")) {
+  counts <- if (modality == "RNA") rna else atac
+  effects <- dplyr::bind_rows(lapply(seq_len(nrow(contrast)), function(i) {
+    contrast_id <- contrast$contrast[[i]]
+contrast_role <- contrast$role[[i]]
+message("Pooled ", modality, " effects: ", contrast_id)
+
+effect <- pooled_effect(counts, meta, contrast_indices[[i]], modality)
+effect$contrast <- contrast_id
+effect$role <- contrast_role
+dplyr::relocate(effect, contrast, role)
+  }))
+  filename <- paste0(modality, "_all_refined_pooled_effects.csv.gz")
+  write_table(effects, OUT, filename)
+  all_effects[[modality]] <- effects
+  top <- effects |>
+    dplyr::filter(evaluable) |>
+    dplyr::group_by(contrast, direction) |>
+    dplyr::arrange(dplyr::desc(abs(log2FC_HFD_vs_CON)), .by_group = TRUE) |>
+    dplyr::slice_head(n = if (modality == "RNA") 250L else 500L) |>
+    dplyr::ungroup()
+  write_table(top, OUT, paste0(modality, "_top_descriptive_effects.csv"))
+  rm(effects, top); invisible(gc())
+}
+```
+
+```{r source-persistent-concordance}
+persistent <- tidyr::crossing(contrast = contrast$contrast,
+    feature = reference$gene) |>
+  dplyr::left_join(reference, by = c("feature" = "gene"),
+    relationship = "many-to-one") |>
+  dplyr::left_join(all_effects$RNA |>
+    dplyr::select(contrast, feature, evaluable, clear_effect,
+      CON_counts, HFD_counts, CON_CPM, HFD_CPM,
+      CON_percent, HFD_percent, detection_delta_pp,
+      log2FC_HFD_vs_CON), by = c("contrast", "feature"),
+    relationship = "many-to-one") |>
+  dplyr::mutate(observation = dplyr::case_when(
+    is.na(evaluable) ~ "gene_not_in_RNA_assay",
+    !evaluable ~ "too_sparse_for_effect_threshold",
+    !clear_effect ~ "direction_weak_or_detection_change_small",
+    reference_direction == "HFD_higher" & log2FC_HFD_vs_CON > 0 ~ "concordant",
+    reference_direction == "CON_higher" & log2FC_HFD_vs_CON < 0 ~ "concordant",
+    TRUE ~ "discordant"),
+    source_aligned_log2FC = dplyr::if_else(reference_direction == "HFD_higher",
+      log2FC_HFD_vs_CON, -log2FC_HFD_vs_CON))
+write_table(persistent, OUT, "persistent_genes_refined_WT_concordance.csv")
+counts <- persistent |>
+  dplyr::count(contrast, reference_program, observation, name = "genes")
+write_table(counts, OUT, "persistent_gene_concordance_counts.csv")
+```
+
+```{r balanced-sensitivity}
+# Select a bounded, fixed set before resampling; never select separately for
+# each draw. This avoids full-genome recomputation across repeated subsets.
+set.seed(12345)
+anchors <- c("C0_ISC_enriched", "C2_progenitor_like", "C1_Htr4_Fut9",
+  "C0_C3_C5_broad_crypt_sensitivity")
+stability <- list()
+for (modality in c("RNA", "ATAC")) {
+  full <- all_effects[[modality]]
+  matrix_data <- if (modality == "RNA") rna else atac
+  bound <- if (modality == "RNA") 150L else 250L
+  for (key in anchors) {
+    i <- match(key, contrast$contrast)
+    t <- full[full$contrast == key & full$evaluable, , drop = FALSE]
+    t <- t[order(-abs(t$log2FC_HFD_vs_CON)), , drop = FALSE]
+    top <- head(t$feature, bound)
+    if (modality == "RNA") top <- union(top, reference$gene)
+    message("Resampling ", modality, ": ", key, " (", length(top), " features)")
+    x <- resampling_effects(matrix_data, meta, contrast_indices[[i]], t,
+      top, modality, iterations = 20L)
+    if (!nrow(x)) next
+    stability[[length(stability) + 1L]] <- x |>
+      dplyr::mutate(contrast = key, modality = modality,
+        .before = 1)
+  }
+}
+stability <- dplyr::bind_rows(stability)
+write_table(stability, OUT, "equal_cell_and_depth_matched_resampling.csv.gz")
+```
+
+```{r phase-composition-sensitivity}
+# Phase from Step 05E is RNA-derived. Common phase strata with >=10 nuclei
+# per diet are assigned equal weights; no causal or biological variance claim.
+phase_effect <- list(); phase_audit <- list()
+for (key in c("C0_ISC_enriched", "C2_progenitor_like", "C1_Htr4_Fut9")) {
+  i <- match(key, contrast$contrast)
+  ranked <- all_effects$RNA |>
+    dplyr::filter(contrast == key, evaluable) |>
+    dplyr::arrange(dplyr::desc(abs(log2FC_HFD_vs_CON)))
+  selected <- intersect(union(head(ranked$feature, 150L), reference$gene),
+    rownames(rna))
+  result <- standardize_strata(rna, meta, contrast_indices[[i]],
+    meta$Phase, "RNA", selected, min_per_diet = 10L)
+  phase_audit[[key]] <- result$audit |>
+    dplyr::mutate(contrast = key, .before = 1)
+  if (nrow(result$effects)) phase_effect[[key]] <- result$effects |>
+    dplyr::mutate(contrast = key, .before = 1)
+}
+write_table(dplyr::bind_rows(phase_audit), OUT, "phase_stratum_eligibility.csv")
+write_table(dplyr::bind_rows(phase_effect), OUT,
+  "RNA_equal_phase_weight_effect_sensitivity.csv")
+```
+
+```{r promoter-and-rna-integration}
+# One consensus peak can overlap several genes/TSSs, and one gene can have
+# several TSSs or peaks. Each row below is a gene–peak hypothesis, not proof of
+# regulation. Whole consensus peak counts, not clipped ±2 kb counts, enter
+# ATAC effects. Missing overlapping peak is not evidence of closed chromatin.
+peak_map <- promoter_peak_map(obj, window = 2000L)
+map_all <- peak_map$map
+interesting <- union(c(reference$gene,
+    "Olfm4", "Clu", "Ly6a", "Anxa1", "Tacstd2"), #just checking for fetal signature, tom asked to see if there was any signature for it
+  all_effects$RNA |>
+    dplyr::filter(contrast %in% c("C0_ISC_enriched", "C2_progenitor_like"),
+      clear_effect) |>
+    dplyr::group_by(contrast) |>
+    dplyr::slice_max(abs(log2FC_HFD_vs_CON), n = 250,
+      with_ties = FALSE) |>
+    dplyr::pull(feature))
+map_target <- map_all[map_all$gene %in% interesting, , drop = FALSE]
+write_table(map_target, OUT, "target_gene_promoter_overlapping_peak_map.csv.gz")
+availability <- tibble::tibble(gene = interesting,
+  RNA_feature_present = interesting %in% rownames(rna),
+  gene_annotated = interesting %in% peak_map$annotated_genes,
+  promoter_overlapping_peak_count = vapply(interesting,
+    function(g) length(unique(map_target$peak[map_target$gene == g])), integer(1))) |>
+  dplyr::mutate(ATAC_assessment = dplyr::case_when(
+    !gene_annotated ~ "gene_not_in_annotation",
+    promoter_overlapping_peak_count == 0 ~ "not_assayed_no_overlapping_peak",
+    TRUE ~ "promoter_overlapping_peak_present"))
+write_table(availability, OUT, "target_gene_promoter_assay_availability.csv")
+
+rna_primary <- all_effects$RNA |>
+  dplyr::filter(contrast %in% c("C0_ISC_enriched", "C2_progenitor_like"),
+    feature %in% interesting) |>
+  dplyr::select(contrast, feature, RNA_evaluable = evaluable,
+    RNA_clear_effect = clear_effect,
+    RNA_log2FC_HFD_vs_CON = log2FC_HFD_vs_CON,
+    RNA_detection_delta_pp = detection_delta_pp,
+    RNA_CON_percent = CON_percent, RNA_HFD_percent = HFD_percent)
+atac_primary <- all_effects$ATAC |>
+  dplyr::filter(contrast %in% c("C0_ISC_enriched", "C2_progenitor_like")) |>
+  dplyr::select(contrast, peak = feature, ATAC_evaluable = evaluable,
+    ATAC_clear_effect = clear_effect,
+    ATAC_log2FC_HFD_vs_CON = log2FC_HFD_vs_CON,
+    ATAC_CON_percent = CON_percent, ATAC_HFD_percent = HFD_percent)
+paired <- dplyr::left_join(rna_primary, map_target,
+  by = c("feature" = "gene"), relationship = "many-to-many") |>
+  dplyr::left_join(atac_primary, by = c("contrast", "peak"),
+    relationship = "many-to-one") |>
+  dplyr::left_join(availability,
+    by = c("feature" = "gene"), relationship = "many-to-one") |>
+  dplyr::mutate(evidence_class = dplyr::case_when(
+    ATAC_assessment == "not_assayed_no_overlapping_peak" ~ "promoter_peak_not_assayed",
+    ATAC_assessment == "gene_not_in_annotation" ~ "no_gene_TSS_annotation",
+    !RNA_evaluable | is.na(RNA_evaluable) ~ "RNA_not_evaluable",
+    !ATAC_evaluable | is.na(ATAC_evaluable) ~ "ATAC_not_evaluable",
+    !RNA_clear_effect | !ATAC_clear_effect ~ "one_or_both_effects_weak",
+    sign(RNA_log2FC_HFD_vs_CON) == sign(ATAC_log2FC_HFD_vs_CON) ~
+      "RNA_and_promoter_peak_same_direction",
+    TRUE ~ "RNA_and_promoter_peak_opposite_direction"))
+write_table(paired, OUT, "refined_C0_C2_RNA_promoter_peak_evidence.csv.gz")
+```
+
+```{r presentation-plots-and-finish}
+plot_ref <- persistent |>
+  dplyr::filter(contrast %in% c("C0_ISC_enriched", "C2_progenitor_like"),
+    is.finite(avg_log2FC_day21), is.finite(log2FC_HFD_vs_CON)) |>
+  ggplot2::ggplot(ggplot2::aes(x = avg_log2FC_day21,
+    y = log2FC_HFD_vs_CON, color = observation)) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+  ggplot2::geom_point(size = 1.7, alpha = .8) +
+  ggplot2::facet_wrap(~ contrast, nrow = 1) +
+  ggplot2::scale_color_manual(values = c(concordant = "#009E73",
+    discordant = "#D55E00", gene_not_in_RNA_assay = "grey60",
+    too_sparse_for_effect_threshold = "grey70",
+    direction_weak_or_detection_change_small = "#7570B3")) +
+  ggplot2::labs(title = "Persistent source d21 versus refined WT d21 crypt effects",
+    subtitle = "Pooled-library descriptive HFD/CON log2 effects; gene availability is retained",
+    x = "Gourab d21 source log2 HFD/CON",
+    y = "Refined WT d21 pooled log2 HFD/CON", color = "Evidence") +
+  ggplot2::theme_bw(base_size = 12)
+save_vector_plot(plot_ref, PLOTS, "01_source_d21_vs_refined_WT_d21_RNA.pdf", 12, 6)
+
+plot_depth <- stability |>
+  dplyr::filter(method == "depth_matched", is.finite(median_log2FC)) |>
+  dplyr::left_join(all_effects$RNA |>
+    dplyr::transmute(contrast, modality,
+      feature, full_effect = log2FC_HFD_vs_CON),
+    by = c("contrast", "modality", "feature")) |>
+  dplyr::filter(modality == "RNA", is.finite(full_effect)) |>
+  ggplot2::ggplot(ggplot2::aes(full_effect, median_log2FC)) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = .2) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = .2) +
+  ggplot2::geom_point(ggplot2::aes(color = sign_agreement_percent), size = .8) +
+  ggplot2::facet_wrap(~ contrast, scales = "free") +
+  ggplot2::scale_color_viridis_c(limits = c(0, 100)) +
+  ggplot2::labs(title = "RNA effect stability under ATAC/RNA depth matching",
+    subtitle = "Depth matched using RNA counts for RNA effects; draws are not mouse replicates",
+    x = "Full pooled RNA log2FC", y = "Median resampled RNA log2FC",
+    color = "Sign match %") +
+  ggplot2::theme_bw(base_size = 11)
+save_vector_plot(plot_depth, PLOTS, "02_refined_RNA_depth_sensitivity.pdf", 11, 7)
+
+finish_run(OUT, "STEP_08E_COMPLETE.txt", c(
+  paste("Focused nuclei:", ncol(obj)),
+  paste("Contrasts:", paste(contrast$contrast, collapse = ";")),
+  "Global Step 06 annotation altered: FALSE",
+  "Biological diet replication or inferential FDR: FALSE"))
+```
+
+Review `persistent_genes_refined_WT_concordance.csv` beside the older Step 08
+strict unit-8 and Step 08B broad 8+6 results. Before motif enrichment or
+cross-genotype projection, inspect gene expression, gene–peak overlap,
+minimum detection and the matching sensitivities together.

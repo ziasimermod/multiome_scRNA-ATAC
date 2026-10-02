@@ -1,0 +1,431 @@
+---
+title: "Step 08T v3 | All Gourab program gene-region coverage"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+params:
+  run_coverage: true
+---
+
+Run from the repository root after Step 08N:
+
+```sh
+Rscript -e 'rmarkdown::render("analysis/08t_gourab_gene_region_overlay.Rmd")'
+```
+
+For a quick table-only pass, supply `params = list(run_coverage = FALSE)` to
+`rmarkdown::render()`. The frozen 622 WT intervals and the Step 08N loss rule
+remain unchanged. This is a **post hoc overlay**, not a new differential peak
+call or a peak-to-gene regulatory link. A promoter overlap, gene-body overlap,
+nearest-gene assignment, and proximity to a TSS are recorded separately. The
+panel image's readable qPCR targets are prioritized; several are not in the
+original curated lists and are explicitly labeled `qPCR_only` if matched.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+packages <- c("readr", "dplyr", "tibble", "tidyr", "ggplot2", "IRanges",
+  "GenomicRanges", "rtracklayer", "SeuratObject", "Signac", "patchwork")
+missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+need <- function(test, why) if (!isTRUE(test)) stop(why, call. = FALSE)
+read <- function(path) {
+  need(file.exists(path), paste("Missing:", path))
+  readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
+}
+BASE <- file.path(RESULTS_ROOT, DATASET_VERSION, "independent")
+INPUT <- file.path(OUTPUT_DIR, "08n_wt_ISC_interval_loss_pathways",
+  "01_all_622_annotated_loss_audit.csv.gz")
+OUT <- file.path(OUTPUT_DIR, "08t_gourab_gene_region_overlay")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+need(file.exists(GRCM39_GTF), paste("Missing GRCm39 GTF:", GRCM39_GTF))
+```
+
+## Reference genes and matching rule
+
+The curated lists below are the user-supplied sets. The image lists qPCR
+targets; the image's Fc receptor label is too small to transcribe confidently
+and is omitted pending confirmation. The qPCR comparison is descriptive: the
+paper measured crypt RNA, whereas this step measures accessibility in
+ISC-enriched nuclei.
+
+```{r reference-genes}
+hyper <- scan(text = paste(
+  "Mgst1 Gstm1 Idh1 Gss Gsta4 Gclm Sod1 Sult1a1 Hmgcs2 Acsm3 Csad Acss2",
+  "Shmt1 Impdh2 Akr7a5 Adk Aprt Hao2 Hadh Mecr Scd2 Mif Fads2 Acads Sox9",
+  "Aldob Atpif1 Uqcrc1 Slc4a4 Hspd1 Eef1a1 Nox1 Cyba Tkt Gpx2 Gsto1 Adh1"),
+  what = "", quiet = TRUE)
+hypo <- scan(text = paste(
+  "Nupr1 Crip1 Atp2a3 Cdkn1a Cd74 Herpud1 Dnajc10 Ern2 Itpr1 Xbp1 P4hb",
+  "Selenok Selenos Creb3l1 Serinc3 Sh3glb1 H2-K1 H2-D1 B2m H2-T23 Psmb8",
+  "Calr Ceacam1 Klf4 Mia3 Cd24a Rap1gap Pla2g2f Spint2 Trp53inp1 Gabarap",
+  "Gabarapl2 Camk2n1 S100a13 Oit1 Syt7 Serp1 Rab3d Rab15 Agr2 Hspa5",
+  "Manf Dnajc3 Creb3l4 Pdia3 Pdia6 Sdf2l1 Sec61b Ramp1 Galnt7 C1galt1",
+  "Gfpt1 Gcnt3 St3gal6 Tmem59 St6galnac6 Galnt10 C1galt1c1 Fut2 Galnt3",
+  "Rpn1 Krtcap2 Pmm2 Prdx6 Qsox1 Sh3bgrl3 Txndc5 Pdia5 Dap Foxa3 Clca1",
+  "Tspan13 Atp2c2 P2rx4 Stim2 Asph Fxyd3 Lrrc26 Kit Plpp1 Pdxdc1 Rrbp1",
+  "Tram1 Sec62 Ssr1 Bag1 Lman1 Actb Fos Il13ra1 Ifngr1"),
+  what = "", quiet = TRUE)
+qpcr_hyper <- c("Gsta4", "Mgst1", "Hmgcs2", "Idh1", "Aldob", "Shmt1",
+  "Hadh", "Hao2")
+qpcr_hypo <- c("H2-Eb1", "H2-Ab1", "Ifngr1", "Cd3e", "Tnfaip2",
+  "Itgal", "Nox1", "Fos", "Tgfb1")
+genes <- dplyr::bind_rows(
+  tibble::tibble(gene = hyper, program = "HyperMetab", curated = TRUE,
+    qpcr = hyper %in% qpcr_hyper),
+  tibble::tibble(gene = hypo, program = "HypoImmune", curated = TRUE,
+    qpcr = hypo %in% qpcr_hypo),
+  tibble::tibble(gene = setdiff(qpcr_hyper, hyper), program = "HyperMetab",
+    curated = FALSE, qpcr = TRUE),
+  tibble::tibble(gene = setdiff(qpcr_hypo, hypo), program = "HypoImmune",
+    curated = FALSE, qpcr = TRUE)) |>
+  dplyr::distinct(.data$gene, .data$program, .keep_all = TRUE)
+need(!anyDuplicated(genes[c("gene", "program")]), "Duplicate reference gene")
+readr::write_csv(genes, file.path(OUT, "00_reference_gene_sets.csv"))
+
+r <- read(INPUT)
+need(nrow(r) == 622L && !anyDuplicated(r$feature),
+  "Step 08N frozen 622 candidates changed")
+required <- c("feature", "chrom", "start_1based", "end_1based",
+  "nearest_symbol", "distanceToTSS", "annotation", "promoter_pm2kb",
+  "WT_direction", "comparison", "anchor_log2FC_HFD_vs_CON", "C0_supported",
+  "count_supported_40", "ppar_evaluable", "il17_evaluable", "ppar_loss",
+  "il17_loss", "ppar_effect", "il17_effect", "ppar_loss_subtype",
+  "il17_loss_subtype", "anchor_CON_counts", "anchor_HFD_counts")
+need(all(required %in% names(r)), "Step 08N annotated audit schema changed")
+need(all(r$ppar_loss <= r$ppar_evaluable) && all(r$il17_loss <= r$il17_evaluable),
+  "An unevaluable knockout interval was called lost")
+peaks <- GenomicRanges::GRanges(seqnames = r$chrom,
+  ranges = IRanges::IRanges(r$start_1based, r$end_1based))
+
+# Retain one GTF gene record per Ensembl ID; multi-transcript entries are
+# deliberately ignored. Match overlapping gene bodies and TSS +/-2 kb; allow
+# TSS +/-20 kb only as an explicitly weaker proximity match.
+gtf <- rtracklayer::import(GRCM39_GTF)
+gtf <- gtf[as.character(S4Vectors::mcols(gtf)$type) == "gene"]
+need(length(gtf) > 0L && all(c("gene_name", "gene_id") %in%
+  names(S4Vectors::mcols(gtf))), "GTF gene_id/gene_name unavailable")
+gtf_symbol <- as.character(S4Vectors::mcols(gtf)$gene_name)
+gtf <- gtf[!is.na(gtf_symbol) & gtf_symbol %in% genes$gene]
+gtf_symbol <- as.character(S4Vectors::mcols(gtf)$gene_name)
+gtf_id <- as.character(S4Vectors::mcols(gtf)$gene_id)
+gtf <- gtf[!duplicated(gtf_id)]
+gtf_symbol <- as.character(S4Vectors::mcols(gtf)$gene_name)
+need(length(gtf) > 0L, "None of the curated genes were found in the GTF")
+tss_pos <- ifelse(as.character(GenomicRanges::strand(gtf)) == "-",
+  BiocGenerics::end(gtf), BiocGenerics::start(gtf))
+tss <- GenomicRanges::GRanges(GenomicRanges::seqnames(gtf),
+  IRanges::IRanges(tss_pos, tss_pos))
+prom <- GenomicRanges::resize(tss, width = 4001L, fix = "center")
+IRanges::start(prom) <- pmax(1L, IRanges::start(prom))
+near <- GenomicRanges::resize(tss, width = 40001L, fix = "center")
+IRanges::start(near) <- pmax(1L, IRanges::start(near))
+body_hits <- GenomicRanges::findOverlaps(peaks, gtf, ignore.strand = TRUE)
+prom_hits <- GenomicRanges::findOverlaps(peaks, prom, ignore.strand = TRUE)
+near_hits <- GenomicRanges::findOverlaps(peaks, near, ignore.strand = TRUE)
+hit_keys <- function(h) {
+  if (!length(h)) return(tibble::tibble(feature = character(), gene = character()))
+  tibble::tibble(feature = r$feature[S4Vectors::queryHits(h)],
+    gene = gtf_symbol[S4Vectors::subjectHits(h)]) |> dplyr::distinct()
+}
+body_keys <- hit_keys(body_hits)
+prom_keys <- hit_keys(prom_hits)
+near_keys <- hit_keys(near_hits)
+nearest_keys <- r |>
+  dplyr::filter(!is.na(.data$nearest_symbol),
+    .data$nearest_symbol %in% genes$gene) |>
+  dplyr::transmute(feature = .data$feature, gene = .data$nearest_symbol) |>
+  dplyr::distinct()
+matches <- dplyr::bind_rows(body_keys, prom_keys, near_keys, nearest_keys) |>
+  dplyr::distinct() |>
+  dplyr::left_join(genes, by = "gene", relationship = "many-to-many") |>
+  dplyr::left_join(r, by = "feature", relationship = "many-to-one") |>
+  dplyr::mutate(
+    promoter_overlap = paste(.data$feature, .data$gene) %in%
+      paste(prom_keys$feature, prom_keys$gene),
+    gene_body_overlap = paste(.data$feature, .data$gene) %in%
+      paste(body_keys$feature, body_keys$gene),
+    within_20kb_TSS = paste(.data$feature, .data$gene) %in%
+      paste(near_keys$feature, near_keys$gene),
+    assigned_nearest_gene = paste(.data$feature, .data$gene) %in%
+      paste(nearest_keys$feature, nearest_keys$gene),
+    evidence = dplyr::case_when(.data$promoter_overlap ~ "promoter_overlap_pm2kb",
+      .data$gene_body_overlap ~ "gene_body_overlap",
+      .data$assigned_nearest_gene & !is.na(.data$distanceToTSS) &
+        abs(.data$distanceToTSS) <= 20000 ~ "nearest_gene_TSS_20kb",
+      .data$assigned_nearest_gene ~ "nearest_gene_more_distant",
+      TRUE ~ "other_gene_TSS_20kb"),
+    evidence_rank = match(.data$evidence,
+      c("promoter_overlap_pm2kb", "gene_body_overlap", "nearest_gene_TSS_20kb",
+        "nearest_gene_more_distant", "other_gene_TSS_20kb")),
+    loss_group = dplyr::case_when(.data$ppar_loss & .data$il17_loss ~ "shared",
+      .data$ppar_loss ~ "PPAR_only", .data$il17_loss ~ "IL17_only",
+      TRUE ~ "neither"),
+    expected_RNA_direction = ifelse(.data$program == "HyperMetab",
+      "HFD_higher", "HFD_lower"),
+    matching_ATAC_direction = (.data$program == "HyperMetab" &
+      .data$WT_direction == "HFD_open") | (.data$program == "HypoImmune" &
+      .data$WT_direction == "HFD_closed"),
+    list_origin = ifelse(.data$curated, "curated", "qPCR_only")) |>
+  dplyr::arrange(.data$program, .data$gene, .data$evidence_rank,
+    .data$feature)
+need(!anyDuplicated(matches[c("feature", "gene", "program")]),
+  "Multiple unresolved associations per peak/gene/program")
+readr::write_csv(matches, file.path(OUT, "01_all_candidate_gene_matches.csv.gz"))
+attenuated <- matches |>
+  dplyr::filter(.data$ppar_loss | .data$il17_loss) |>
+  dplyr::arrange(dplyr::desc(.data$qpcr), .data$evidence_rank,
+    dplyr::desc(.data$matching_ATAC_direction),
+    dplyr::desc(.data$C0_supported), dplyr::desc(.data$count_supported_40),
+    dplyr::desc(abs(.data$anchor_log2FC_HFD_vs_CON)), .data$feature)
+readr::write_csv(attenuated, file.path(OUT, "02_attenuated_gene_matches.csv"))
+coverage <- genes |>
+  dplyr::left_join(matches |>
+    dplyr::group_by(.data$program, .data$gene) |>
+    dplyr::summarise(n_candidate = dplyr::n(),
+      n_attenuated = sum(.data$ppar_loss | .data$il17_loss),
+      n_shared = sum(.data$loss_group == "shared"),
+      best_match = .data$evidence[which.min(.data$evidence_rank)],
+      .groups = "drop"), by = c("program", "gene")) |>
+  dplyr::mutate(dplyr::across(c("n_candidate", "n_attenuated", "n_shared"),
+    ~ tidyr::replace_na(.x, 0L)))
+readr::write_csv(coverage, file.path(OUT, "03_all_genes_including_zero_hits.csv"))
+print(attenuated |>
+  dplyr::count(.data$program, .data$WT_direction, .data$loss_group,
+    .data$evidence, name = "n_peak_gene_matches"))
+```
+
+## All matched region effects
+
+Include every peak-gene match in the two programs, including opposite-direction
+and genotype-specific losses. The match table also preserves `qpcr`, evidence
+class, and the expected RNA direction. A peak is plotted once per matched
+gene/program, so multiple peaks at the same gene get separate coverage PDFs.
+Unevaluable knockout effects remain missing in the effect plot.
+
+```{r select-and-plot}
+pick <- matches |>
+  dplyr::arrange(.data$program, .data$gene, .data$feature)
+readr::write_csv(pick, file.path(OUT, "04_all_coverage_candidates.csv"))
+if (nrow(pick)) {
+  effect <- dplyr::bind_rows(lapply(seq_len(nrow(pick)), function(j) {
+    v <- pick[j, ]
+    tibble::tibble(program = v$program, gene = v$gene, feature = v$feature,
+      locus = paste(v$gene, v$feature),
+      genotype = c("WT", "PPAR", "IL17"),
+      log2FC = c(v$anchor_log2FC_HFD_vs_CON,
+        if (v$ppar_evaluable) v$ppar_effect else NA_real_,
+        if (v$il17_evaluable) v$il17_effect else NA_real_),
+      status = c("WT candidate", v$ppar_loss_subtype,
+        v$il17_loss_subtype))
+  }))
+  readr::write_csv(effect, file.path(OUT, "04_all_pooled_ATAC_effects.csv"))
+  p <- ggplot2::ggplot(effect, ggplot2::aes(.data$genotype, .data$log2FC,
+    color = .data$genotype)) +
+    ggplot2::geom_hline(yintercept = 0, color = "grey65") +
+    ggplot2::geom_point(size = 2.8, na.rm = TRUE) +
+    ggplot2::facet_wrap(~ program + locus, scales = "free_x", ncol = 2) +
+    ggplot2::scale_color_manual(values = c(WT = "#E69F00", PPAR = "#5A3E9A",
+      IL17 = "#56B4E9")) +
+    ggplot2::labs(title = "All Gourab gene overlays: pooled ATAC effects at exact peaks",
+      subtitle = "Matched genes identify loci; a nearby peak does not establish regulatory coupling",
+      x = NULL, y = "ATAC log2(HFD / CON)",
+      caption = "One pooled library per diet and genotype; descriptive effects only. Missing points are unevaluable.") +
+    ggplot2::theme_bw(base_size = 10)
+  ggplot2::ggsave(file.path(PLOTS, "01_all_locus_effects.pdf"), p,
+    width = 11, height = max(5, 3 * ceiling(nrow(pick) / 2)),
+    device = grDevices::pdf, useDingbats = FALSE)
+}
+```
+
+## Coverage on the same coordinates across cohorts
+
+Use the recorded top-15% nuclei that generated the Step 08N effects (WT
+C0/W0, PPAR 3/6, IL17 9/10). A common y-axis for the three normalized tracks
+within each locus avoids independent `q95` clipping. Signac's group scaling
+accounts for cell number and sequencing depth; sparse signals and unequal
+fragment quality can still limit interpretation. We record any failure.
+
+```{r coverage}
+gate_files <- c(wt = file.path(OUTPUT_DIR,
+    "08h_wt_ISC_region_freeze_sex_audit",
+    "01_nucleus_level_sex_proxy_and_gate_audit.csv.gz"),
+  ppar = file.path(OUTPUT_DIR,
+    "08i_frozen_WT_peaks_genotype_context",
+    "02_ppar_crypt_nuclei_scores.csv.gz"),
+  il17 = file.path(OUTPUT_DIR,
+    "08i_frozen_WT_peaks_genotype_context",
+    "02_il17_crypt_nuclei_scores.csv.gz"))
+get_cells <- function(cohort) {
+  gate <- read(gate_files[[cohort]])
+  need(!anyDuplicated(gate$cell_barcode), paste("Duplicate gate cells", cohort))
+  if (cohort == "wt") {
+    need(all(c("C0W0_top15", "cell_barcode") %in% names(gate)),
+      "WT gate columns changed")
+    selected <- as.logical(gate$C0W0_top15)
+  } else {
+    need(all(c("top15", "wnn_cluster", "cell_barcode") %in% names(gate)),
+      paste("KO gate columns changed:", cohort))
+    parents <- if (cohort == "ppar") c("3", "6") else c("9", "10")
+    selected <- as.logical(gate$top15) &
+      as.character(gate$wnn_cluster) %in% parents
+  }
+  need(!anyNA(selected), paste("Gate has missing selection:", cohort))
+  unique(gate$cell_barcode[selected])
+}
+status <- list()
+if (isTRUE(params$run_coverage) && nrow(pick)) {
+  need(all(file.exists(gate_files)), "Recorded Step 08H/08I gate table is missing")
+  # Preserve cohort names so every plot uses its recorded top-15% gate.
+  cells_by_cohort <- stats::setNames(lapply(names(gate_files), get_cells),
+    names(gate_files))
+  gate_counts <- dplyr::bind_rows(lapply(names(gate_files), function(cohort) {
+    gate <- read(gate_files[[cohort]])
+    need("diet" %in% names(gate), paste("Missing diet in gate:", cohort))
+    selected_diets <- as.character(gate$diet[match(cells_by_cohort[[cohort]],
+      gate$cell_barcode)])
+    need(!anyNA(selected_diets) &&
+      all(selected_diets %in% c("CON", "HFD")),
+      paste("Selected cells absent from gate or have unknown diet:", cohort))
+    # Compute before tibble(): its diet column would otherwise shadow the
+    # selected_diets vector and produce the misleading counts 1 and 1.
+    diet_counts <- table(factor(selected_diets, levels = c("CON", "HFD")))
+    need(sum(diet_counts) == length(cells_by_cohort[[cohort]]),
+      paste("Incomplete selected-nucleus diet count:", cohort))
+    tibble::tibble(cohort = cohort, diet = names(diet_counts),
+      n_selected = as.integer(diet_counts))
+  }))
+  readr::write_csv(gate_counts,
+    file.path(OUT, "05_recorded_gate_nuclei_by_diet.csv"))
+  print(gate_counts)
+  need(all(gate_counts$n_selected >= 30L), paste(
+    "Recorded top-15% gate below 30 nuclei per diet:",
+    paste(gate_counts$cohort[gate_counts$n_selected < 30L],
+      gate_counts$diet[gate_counts$n_selected < 30L],
+      gate_counts$n_selected[gate_counts$n_selected < 30L],
+      collapse = "; ")))
+  for (j in seq_len(nrow(pick))) {
+    x <- pick[j, ]
+    loss_label <- switch(as.character(x$loss_group),
+      shared = "PPAR_and_IL17_loss", PPAR_only = "PPAR_only_loss",
+      IL17_only = "IL17_only_loss", neither = "no_recorded_loss")
+    need(!is.null(loss_label), paste("Unexpected loss label:", x$loss_group))
+    stem <- paste0(x$program, "_", x$gene, "_", x$feature, "_", loss_label)
+    loc <- GenomicRanges::GRanges(x$chrom,
+      IRanges::IRanges(x$start_1based, x$end_1based))
+    span <- GenomicRanges::GRanges(x$chrom,
+      IRanges::IRanges(max(1L, x$start_1based - 5000L),
+        x$end_1based + 5000L))
+    prelim <- list()
+    for (cohort in names(gate_files)) {
+      tryCatch({
+        obj <- readRDS(file.path(BASE, cohort, "06_annotation",
+          "multiome_annotated.rds"))
+        SeuratObject::DefaultAssay(obj) <- "ATAC"
+        cells <- cells_by_cohort[[cohort]]
+        m <- obj[[]]
+        need(all(cells %in% rownames(m)), paste("Missing selected cells:", cohort))
+        n <- table(factor(as.character(m[cells, "diet"]),
+          levels = c("CON", "HFD")))
+        expected_n <- gate_counts$n_selected[gate_counts$cohort == cohort]
+        need(identical(as.integer(n), as.integer(expected_n)),
+          paste("Recorded gate and object diet counts disagree:", cohort,
+            "object", paste(as.integer(n), collapse = "/"),
+            "gate", paste(expected_n, collapse = "/")))
+        need(length(Signac::Fragments(obj[["ATAC"]])) > 0L,
+          paste("Missing ATAC fragments:", cohort))
+        p0 <- Signac::CoveragePlot(obj, region = span, assay = "ATAC",
+          cells = cells, group.by = "diet", annotation = FALSE,
+          peaks = FALSE, links = FALSE, tile = FALSE,
+          region.highlight = loc, window = 100L,
+          max.downsample = 3000L, downsample.rate = 1, ymax = NULL)
+        yy <- p0[[1]]$data$score
+        if (is.null(yy) || !length(yy)) {
+          b <- ggplot2::ggplot_build(p0[[1]])$data
+          yy <- unlist(lapply(b, function(a)
+            if ("y" %in% names(a)) a$y else numeric()), use.names = FALSE)
+        }
+        yy <- yy[is.finite(yy)]
+        need(length(yy) > 0L, paste("Cannot read normalized track:", cohort))
+        prelim[[cohort]] <- list(max = max(yy), n = n)
+      }, error = function(e) {
+        status[[length(status) + 1L]] <<- tibble::tibble(
+          feature = x$feature, gene = x$gene, cohort = cohort,
+          status = "preflight_failed", detail = conditionMessage(e))
+      })
+      if (exists("obj", inherits = FALSE)) rm(obj)
+      invisible(gc())
+    }
+    if (!length(prelim)) next
+    ymax <- max(1e-3, max(vapply(prelim, `[[`, numeric(1), "max")) * 1.04)
+    pages <- list()
+    for (cohort in names(prelim)) {
+      tryCatch({
+        obj <- readRDS(file.path(BASE, cohort, "06_annotation",
+          "multiome_annotated.rds"))
+        SeuratObject::DefaultAssay(obj) <- "ATAC"
+        p1 <- Signac::CoveragePlot(obj, region = span, assay = "ATAC",
+          cells = cells_by_cohort[[cohort]], group.by = "diet",
+          annotation = FALSE, peaks = FALSE, links = FALSE, tile = FALSE,
+          region.highlight = loc, window = 100L, max.downsample = 3000L,
+          downsample.rate = 1, ymax = ymax) +
+          patchwork::plot_annotation(title = paste(toupper(cohort), "CON",
+            prelim[[cohort]]$n[["CON"]], "/ HFD",
+            prelim[[cohort]]$n[["HFD"]]),
+            subtitle = paste("Common normalized y max", signif(ymax, 3)))
+        pages[[cohort]] <- p1
+        filename <- paste0("02_", stem, "_", cohort, "_coverage.pdf")
+        ggplot2::ggsave(file.path(PLOTS, filename), p1, width = 13,
+          height = 6, device = grDevices::pdf, useDingbats = FALSE)
+        status[[length(status) + 1L]] <- tibble::tibble(
+          feature = x$feature, gene = x$gene, cohort = cohort,
+          status = "saved_cohort", detail = filename)
+      }, error = function(e) {
+        status[[length(status) + 1L]] <<- tibble::tibble(
+          feature = x$feature, gene = x$gene, cohort = cohort,
+          status = "plot_failed", detail = conditionMessage(e))
+      })
+      if (exists("obj", inherits = FALSE)) rm(obj)
+      invisible(gc())
+    }
+    if (length(pages) >= 2L) {
+      fig <- patchwork::wrap_plots(pages, ncol = 1L) +
+        patchwork::plot_annotation(
+          title = paste(x$program, x$gene, x$feature),
+          subtitle = paste("GTF match:", x$evidence, "|", loss_label,
+            "| WT", x$WT_direction),
+          caption = "Same genomic interval highlighted in three pooled, depth-normalized cohort tracks. Gene proximity does not imply regulation.")
+      filename <- paste0("03_", stem, "_common_scale_coverage.pdf")
+      tryCatch({
+        ggplot2::ggsave(file.path(PLOTS, filename), fig,
+          width = 13, height = 4.7 * length(pages), device = grDevices::pdf,
+          useDingbats = FALSE)
+        status[[length(status) + 1L]] <- tibble::tibble(
+          feature = x$feature, gene = x$gene, cohort = "combined",
+          status = "saved_combined", detail = filename)
+      }, error = function(e) {
+        status[[length(status) + 1L]] <<- tibble::tibble(
+          feature = x$feature, gene = x$gene, cohort = "combined",
+          status = "save_failed", detail = conditionMessage(e))
+      })
+    }
+    rm(prelim, pages); invisible(gc())
+  }
+}
+status_table <- if (length(status)) dplyr::bind_rows(status) else
+  tibble::tibble(feature = character(), gene = character(), cohort = character(),
+    status = character(), detail = character())
+readr::write_csv(status_table, file.path(OUT, "05_coverage_status.csv"))
+writeLines(c("Step 08T v3 complete", paste("matches", nrow(matches)),
+  paste("attenuated_matches", nrow(attenuated)),
+  paste("all_matched_tracks", nrow(pick)),
+  paste("coverage_requested", isTRUE(params$run_coverage)),
+  "Review 03_all_genes_including_zero_hits.csv and 05_coverage_status.csv before presenting."),
+  file.path(OUT, "STEP_08T_V3_COMPLETE.txt"))
+```

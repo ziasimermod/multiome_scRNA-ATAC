@@ -1,0 +1,270 @@
+---
+title: "Step 08O | Motifs in WT ISC interval loss sets"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+Run from the repository root after 08N. Each of six predefined sets uses
+the corresponding 08L GC/width/WT CON-detection/context matched neutral
+accessible intervals. The main test is a one-sided paired discordance test
+for motif occurrence, with BH across all JASPAR profiles separately in each
+set. An additional exploratory Fisher comparison asks whether a motif is more
+common among lost than retained WT candidates in the same direction and
+evaluable knockout group. This second comparison lacks matching and can be
+underpowered. For shared loss its comparator comprises intervals evaluable in
+both genotypes that are **not** shared-loss; it can include one-genotype loss.
+The six sets overlap by design, so tests across sets are not independent.
+Motif occurrence neither establishes TF binding nor a genotype-by-diet effect.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+needed <- c("readr", "dplyr", "tibble", "GenomicRanges", "IRanges",
+  "Rsamtools", "Biostrings", "TFBSTools", "motifmatchr", "Matrix")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing R packages: ", paste(missing, collapse = ", "))
+BASE08L <- file.path(OUTPUT_DIR,
+  "08l_wt_ISC_open_close_motifs")
+BASE08N <- file.path(OUTPUT_DIR,
+  "08n_wt_ISC_interval_loss_pathways")
+OUT <- file.path(OUTPUT_DIR,
+  "08o_wt_ISC_loss_group_motifs")
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+read_csv <- function(path) readr::read_csv(path, show_col_types = FALSE,
+  progress = FALSE)
+write_csv <- function(x, path) readr::write_csv(x, path)
+assert <- function(ok, why) if (!isTRUE(ok)) stop(why, call. = FALSE)
+FASTA <- Sys.getenv("MULTIOME_GRCM39_FASTA", unset = file.path(
+  PROJECT_DIR, "reference", "GRCm39_2024-A", "fasta", "genome.fa"))
+PFM <- file.path(PROJECT_DIR, "reference", "JASPAR2024",
+  "JASPAR2024_CORE_vertebrates_non-redundant_pfms_jaspar.txt")
+files <- c(region = file.path(BASE08N,
+    "01_all_622_annotated_loss_audit.csv.gz"),
+  pairs = file.path(BASE08L, "02_all_622_target_neutral_matches.csv"),
+  universe = file.path(BASE08L,
+    "02_evaluable_WT_universe_sequence_covariates.csv.gz"),
+  complete08n = file.path(BASE08N, "STEP_08N_COMPLETE.txt"),
+  fasta = FASTA, fai = paste0(FASTA, ".fai"), pfm = PFM)
+assert(all(file.exists(files)), paste("Missing:",
+  paste(files[!file.exists(files)], collapse = "; ")))
+assert(file.info(PFM)$size > 100000L,
+  "The local JASPAR2024 PFM file is unexpectedly small.")
+write_csv(tibble::tibble(source = names(files),
+  path = normalizePath(files),
+  bytes = file.info(files)$size,
+  md5 = unname(tools::md5sum(files))),
+  file.path(OUT, "00_input_manifest.csv"))
+```
+
+## Verify frozen inputs, match coverage, and GRCm39 sequences
+
+Unmatched 08L targets remain in the denominator of match coverage; they do
+not enter paired motif tests. We do not rematch after seeing the loss labels.
+Within each set, less than 80% matched is flagged as insufficient matching.
+Sets below ten matched pairs are descriptive.
+
+```{r sequences}
+region <- read_csv(files[["region"]])
+pairs <- read_csv(files[["pairs"]])
+universe <- read_csv(files[["universe"]])
+assert(nrow(region) == 622L && nrow(pairs) == 622L &&
+  !anyDuplicated(region$feature) &&
+  !anyDuplicated(pairs$target_feature) &&
+  setequal(pairs$target_feature, region$feature),
+  "08N/08L frozen target IDs disagree.")
+assert(!anyDuplicated(universe$feature) &&
+  all(region$feature %in% universe$feature),
+  "08L sequence covariates do not cover the candidates.")
+ix <- match(pairs$target_feature, region$feature)
+assert(all(pairs$WT_direction == region$WT_direction[ix]) &&
+  all(is.na(pairs$background_feature) |
+    pairs$background_feature %in% universe$feature),
+  "Direction or matched background does not agree with 08N/08L.")
+matched <- pairs[!is.na(pairs$background_feature), , drop = FALSE]
+assert(!anyDuplicated(matched$background_feature) &&
+  all(matched$target_context == matched$background_context),
+  "08L matched controls were duplicated or mismatched.")
+scan_features <- unique(c(region$feature, matched$background_feature))
+seq_table <- universe[match(scan_features, universe$feature), , drop = FALSE]
+assert(all(!is.na(seq_table$chrom)) &&
+  all(seq_table$start_1based >= 1L) &&
+  all(seq_table$end_1based >= seq_table$start_1based),
+  "Missing or invalid GRCm39 coordinates.")
+gr <- GenomicRanges::GRanges(seqnames = seq_table$chrom,
+  ranges = IRanges::IRanges(start = seq_table$start_1based,
+    end = seq_table$end_1based))
+names(gr) <- scan_features
+fa <- Rsamtools::FaFile(FASTA)
+index <- Rsamtools::scanFaIndex(fa)
+width_by_chr <- setNames(as.integer(BiocGenerics::width(index)),
+  as.character(GenomicRanges::seqnames(index)))
+assert(all(seq_table$chrom %in% names(width_by_chr)) &&
+  all(seq_table$end_1based <= width_by_chr[seq_table$chrom]),
+  "A motif interval lies outside the GRCm39 FASTA.")
+seqs <- Rsamtools::scanFa(fa, param = gr)
+assert(length(seqs) == length(scan_features) &&
+  all(as.integer(BiocGenerics::width(seqs)) ==
+    seq_table$end_1based - seq_table$start_1based + 1L),
+  "Retrieved FASTA widths differ from frozen interval coordinates.")
+names(seqs) <- scan_features
+```
+
+## Scan the offline JASPAR 2024 profiles
+
+The PFM file avoids the JASPAR2024 SQLite download/BiocFileCache problem
+observed on SOL. It is the same file and matching method as 08L.
+
+```{r motifs}
+raw <- readLines(PFM, warn = FALSE)
+raw <- raw[nzchar(trimws(raw))]
+assert(length(raw) %% 5L == 0L,
+  "Expected five nonblank lines per local JASPAR motif.")
+headers <- seq.int(1L, length(raw), by = 5L)
+assert(all(grepl("^>MA[0-9]+\\.[0-9]+[[:space:]]+", raw[headers])),
+  "Unexpected JASPAR PFM motif ID format.")
+raw[headers] <- sub("^>(MA[0-9]+\\.[0-9]+)[[:space:]]+(.+)$",
+  ">\\1\t\\2", raw[headers])
+normalized <- tempfile("jaspar2024_", fileext = ".txt")
+writeLines(raw, normalized)
+pfms <- tryCatch(TFBSTools::readJASPARMatrix(normalized,
+  matrixClass = "PFM"), finally = unlink(normalized))
+ids <- vapply(pfms, TFBSTools::ID, character(1))
+motif_names <- vapply(pfms, TFBSTools::name, character(1))
+assert(length(ids) == length(headers) && !anyDuplicated(ids),
+  "Imported PFM count/IDs disagree with the local file.")
+hits <- motifmatchr::motifMatches(motifmatchr::matchMotifs(
+  pwms = pfms, subject = seqs, bg = "subject", out = "matches",
+  p.cutoff = 5e-5))
+expected <- names(pfms)
+observed <- colnames(hits)
+assert(nrow(hits) == length(scan_features) && ncol(hits) == length(ids) &&
+  (identical(observed, expected) ||
+   identical(observed, make.unique(expected)) ||
+   identical(observed, paste0(ids, "_", motif_names))),
+  paste("Unexpected motif hit labels/order:",
+    paste(utils::head(observed), collapse = ", ")))
+rownames(hits) <- scan_features
+colnames(hits) <- ids
+motif_info <- tibble::tibble(motif_id = ids, motif_name = motif_names)
+```
+
+## Six matched tests and six exploratory within-candidate tests
+
+`loss_vs_nonloss` is not a substitute for matched neutral testing: its
+comparison group is conditioned on genotype effects and not sequence matched.
+The main matched test assesses the selected regions' motif composition
+relative to accessible WT neutral peaks, which can also reflect a generic
+WT HFD program. Neither test shows TF binding.
+
+```{r tests}
+keys <- as.vector(outer(c("PPAR", "IL17", "shared"),
+  c("HFD_open", "HFD_closed"),
+  FUN = function(g, d) paste(g, d, "lost", sep = "_")))
+assert(length(keys) == 6L && !anyDuplicated(keys),
+  "Six motif comparisons were not enumerated.")
+set_files <- file.path(BASE08N, "sets", paste0(keys, ".csv.gz"))
+assert(all(file.exists(set_files)), paste("Missing 08N set files:",
+  paste(set_files[!file.exists(set_files)], collapse = "; ")))
+audit <- list()
+for (j in seq_along(keys)) {
+  key <- keys[[j]]
+  genotype <- sub("_HFD_.*$", "", key)
+  direction <- if (grepl("_HFD_open_", key)) "HFD_open" else "HFD_closed"
+  eligible <- if (genotype == "PPAR") region$ppar_evaluable else
+    if (genotype == "IL17") region$il17_evaluable else
+      region$both_evaluable
+  foreground <- if (genotype == "PPAR") region$ppar_loss else
+    if (genotype == "IL17") region$il17_loss else
+      region$comparison == "shared_loss"
+  candidates <- region$feature[region$WT_direction == direction & eligible]
+  target <- region$feature[region$WT_direction == direction & foreground]
+  recorded <- read_csv(set_files[[j]])
+  assert(!anyDuplicated(recorded$feature) &&
+    setequal(recorded$feature, target),
+    paste("08N set file and loss audit disagree:", key))
+  control <- setdiff(candidates, target)
+  assert(all(target %in% candidates),
+    paste("Loss contains unevaluable intervals:", key))
+  pairs_here <- matched[matched$target_feature %in% target, , drop = FALSE]
+  matched_n <- nrow(pairs_here)
+  match_fraction <- if (length(target)) matched_n / length(target) else NA_real_
+  status <- if (!length(target)) "empty_set" else
+    if (match_fraction < .8) "insufficient_matching" else
+      if (matched_n < 10L) "small_descriptive_subset" else
+        "conditional_sequence_test"
+  audit[[key]] <- tibble::tibble(set = key, direction = direction,
+    n_evaluable_candidates = length(candidates),
+    n_lost = length(target), n_nonloss_candidates = length(control),
+    n_matched_pairs = matched_n, match_fraction = match_fraction,
+    status = status)
+
+  if (matched_n) {
+    a <- hits[pairs_here$target_feature, , drop = FALSE]
+    b <- hits[pairs_here$background_feature, , drop = FALSE]
+    a_only <- as.integer(Matrix::colSums(a & !b))
+    b_only <- as.integer(Matrix::colSums(!a & b))
+    p <- stats::pbinom(a_only - 1L, a_only + b_only, .5,
+      lower.tail = FALSE)
+    target_hits <- as.integer(Matrix::colSums(a))
+    background_hits <- as.integer(Matrix::colSums(b))
+    matched_result <- motif_info |>
+      dplyr::mutate(set = key, n_pairs = matched_n,
+        target_hits = target_hits, background_hits = background_hits,
+        target_only = a_only, background_only = b_only,
+        target_percent = 100 * target_hits / matched_n,
+        background_percent = 100 * background_hits / matched_n,
+        prevalence_difference_pp = target_percent - background_percent,
+        paired_one_sided_p = p, paired_BH = stats::p.adjust(p, "BH"),
+        interpretation_status = status) |>
+      dplyr::arrange(.data$paired_BH, .data$paired_one_sided_p,
+        dplyr::desc(.data$prevalence_difference_pp))
+  } else matched_result <- tibble::tibble(motif_id = character(),
+    motif_name = character(), set = character(), n_pairs = integer(),
+    target_hits = integer(), background_hits = integer(),
+    target_only = integer(), background_only = integer(),
+    target_percent = numeric(), background_percent = numeric(),
+    prevalence_difference_pp = numeric(), paired_one_sided_p = numeric(),
+    paired_BH = numeric(), interpretation_status = character())
+  write_csv(matched_result, file.path(OUT,
+    paste0("01_", key, "_matched_neutral_JASPAR.csv.gz")))
+
+  if (length(target) >= 3L && length(control) >= 3L) {
+    target_hits <- as.integer(Matrix::colSums(hits[target, , drop = FALSE]))
+    control_hits <- as.integer(Matrix::colSums(hits[control, , drop = FALSE]))
+    p <- vapply(seq_along(ids), function(i)
+      stats::fisher.test(matrix(c(target_hits[i], length(target) - target_hits[i],
+        control_hits[i], length(control) - control_hits[i]), nrow = 2L,
+        byrow = TRUE), alternative = "greater")$p.value, numeric(1))
+    within_result <- motif_info |>
+      dplyr::mutate(set = key, n_lost = length(target),
+        n_nonloss = length(control), lost_hits = target_hits,
+        nonloss_hits = control_hits,
+        lost_percent = 100 * target_hits / length(target),
+        nonloss_percent = 100 * control_hits / length(control),
+        prevalence_difference_pp = lost_percent - nonloss_percent,
+        fisher_one_sided_p = p, fisher_BH = stats::p.adjust(p, "BH")) |>
+      dplyr::arrange(.data$fisher_BH, .data$fisher_one_sided_p)
+  } else within_result <- tibble::tibble(motif_id = character(),
+    motif_name = character(), set = character(), n_lost = integer(),
+    n_nonloss = integer(), lost_hits = integer(), nonloss_hits = integer(),
+    lost_percent = numeric(), nonloss_percent = numeric(),
+    prevalence_difference_pp = numeric(), fisher_one_sided_p = numeric(),
+    fisher_BH = numeric())
+  write_csv(within_result, file.path(OUT,
+    paste0("02_", key, "_loss_vs_nonloss_exploratory.csv.gz")))
+}
+audit <- dplyr::bind_rows(audit)
+write_csv(audit, file.path(OUT, "00_six_set_motif_audit.csv"))
+print(audit)
+writeLines(c("08O finished; six matched-neutral and six loss-vs-nonloss motif tables.",
+  "BH correction is within each motif table across all JASPAR profiles.",
+  "Motifs test sequence occurrence, not diet interaction or TF occupancy."),
+  file.path(OUT, "STEP_08O_COMPLETE.txt"))
+```

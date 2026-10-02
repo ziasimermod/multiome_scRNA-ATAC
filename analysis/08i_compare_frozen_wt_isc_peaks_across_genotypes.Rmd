@@ -1,0 +1,679 @@
+---
+title: "Step 08I | Frozen WT crypt peaks across PPAR and IL17"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This notebook follows the completed WT 08H audit. It carries **all 622**
+top-15 WT candidate peaks forward. The **37** peaks with a same-direction
+effect in WT C0 are a labeled subset; the 16 with stronger pooled counts are
+another flag, not a new discovery list. None is a significant DAR.
+
+The WT C0/W0 score gate is preserved. In PPAR, approved WNN clusters 3
+(cycling ISC/early TA) and 6 (ISC-like) are inspected separately. In IL17,
+approved clusters 9 (cycling ISC/TA) and 10 (ISC-like) are inspected
+separately. Their unions are shown with parent-by-diet composition. Approved
+crypt progenitors PPAR 2 and IL17 0 are context comparisons. Labels are
+checked against the approved Step 6 decision files; numeric cluster IDs are
+never transferred from WT to another genotype.
+
+All new scores use the **same six genes** (`Lgr5`, `Ascl2`, `Smoc2`, `Axin2`,
+`Lrig1`, `Rnf43`) on joined raw RNA counts with UCell `maxRank=400`.
+Each parent's top 15% is ranked across both diets together. A second gate
+uses the *observed WT top-15 minimum score* as a fixed reference threshold;
+it is diagnostic because different cohorts can have different RNA sensitivity.
+The combined score gate is the union of separately gated parents. Neither
+diet effects nor Gourab's genes determine gate membership.
+
+For WT, the notebook additionally computes the same 622-region effects in
+**Xist-only** and **Y-only** nuclei within C0. These transcript categories
+are suggestive sex proxies, not mouse sex calls. One pooled library per diet
+per cohort means that all effects and cross-genotype comparisons remain
+descriptive. Separate nuclei, nested gates, and within-library subsampling
+do not create mouse replicates or enable genotype-by-diet inference.
+
+Run chunks in order from the repository root on SOL, with R 4.4 and at least
+96 GB RAM available. PPAR and IL17 objects are loaded and released in turn.
+Outputs go to the WT `08i_frozen_WT_peaks_genotype_context`
+directory. Input objects, annotations, and Step 08G/H outputs are not modified.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Open the repository root before running 08I.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) stop("Missing WT follow-up helper.")
+source(FOLLOWUP_HELPER)
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges)
+})
+need(requireNamespace("UCell", quietly = TRUE), "Install UCell in the active R library.")
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+  "08I expects the WT v2_resequenced configuration.")
+CORE6 <- c("Lgr5", "Ascl2", "Smoc2", "Axin2", "Lrig1", "Rnf43")
+Y_GENES <- c("Uty", "Ddx3y", "Eif2s3y", "Kdm5d")
+UCELL_MAX_RANK <- 400L
+MIN_PER_DIET <- 30L
+COHORT_STATES <- list(
+  ppar = list(primary = c("3", "6"), context = "2"),
+  il17 = list(primary = c("9", "10"), context = "0"))
+WT_ROOT <- OUTPUT_DIR
+RESULT_ROOT <- file.path(RESULTS_ROOT, DATASET_VERSION, "independent")
+STEP5E <- file.path(WT_ROOT, "05_wnn", "focused_wt_crypt_stem_progenitor",
+  "objects", "WT_crypt_core_0_6_8_focused.rds")
+STEP8G <- file.path(WT_ROOT, "08g_C0_C2_and_C0W0_ISC")
+STEP8H <- file.path(WT_ROOT, "08h_wt_ISC_region_freeze_sex_audit")
+OUT <- file.path(WT_ROOT, "08i_frozen_WT_peaks_genotype_context")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Freeze the inputs and verify the WT reference
+
+All coordinate matching below uses the exact Step 03 GRCm39 peak name and
+interval. A peak absent from a cohort's filtered ATAC assay is reported as
+missing, never as a zero effect. The WT score threshold comes from the
+saved 08G gate rather than a value typed into this notebook.
+
+```{r inputs}
+PEAK_PATH <- file.path(STEP8H,
+  "02_all_622_top15_ATAC_peaks_with_evidence_flags.csv.gz")
+GATE_PATH <- file.path(STEP8G, "02_C0W0_gate_size_and_score_sensitivity.csv")
+NUCLEI_PATH <- file.path(STEP8H,
+  "01_nucleus_level_sex_proxy_and_gate_audit.csv.gz")
+source_paths <- c(STEP5E, PEAK_PATH, GATE_PATH, NUCLEI_PATH,
+  file.path(STEP8G, "STEP_08G_COMPLETE.txt"),
+  file.path(STEP8H, "STEP_08H_COMPLETE.txt"), SAMPLE_SHEET_PATH)
+for (cohort in names(COHORT_STATES)) {
+  source_paths <- c(source_paths,
+    file.path(RESULT_ROOT, cohort, "06_annotation", "multiome_annotated.rds"),
+    file.path(DATASET_CONFIG_DIR, "cohorts", cohort,
+      "cell_state_annotations.csv"))
+}
+need(all(file.exists(source_paths)), paste("Missing input(s):",
+  paste(source_paths[!file.exists(source_paths)], collapse = "; ")))
+# Hash small tables; hashing several large Seurat RDS files needlessly repeats
+# expensive I/O. Record their full paths, sizes, and timestamps instead.
+info <- file.info(source_paths)
+manifest <- tibble(path = normalizePath(source_paths), bytes = info$size,
+  modified = as.character(info$mtime), md5 = NA_character_)
+small <- !grepl("\\.rds$", source_paths, ignore.case = TRUE)
+manifest$md5[small] <- unname(tools::md5sum(source_paths[small]))
+write_table(manifest, OUT, "00_input_manifest.csv")
+sample_sheet <- read_csv_checked(SAMPLE_SHEET_PATH)
+require_columns(sample_sheet, c("cohort_id", "sample_id", "diet",
+  "mice_pooled", "female_mice", "male_mice"), "sample sheet")
+write_table(sample_sheet |>
+  dplyr::filter(cohort_id %in% c("wt", names(COHORT_STATES))) |>
+  dplyr::select(cohort_id, sample_id, diet, mice_pooled,
+    female_mice, male_mice), OUT, "00_pooled_mouse_sex_composition.csv")
+
+anchor <- read_csv_checked(PEAK_PATH)
+require_columns(anchor, c("feature", "chrom", "start_1based", "end_1based",
+  "anchor_log2FC_HFD_vs_CON", "anchor_CON_counts", "anchor_HFD_counts",
+  "anchor_CON_percent", "anchor_HFD_percent", "C0_all_log2FC_HFD_vs_CON",
+  "C0_supported", "count_supported_40", "nested_top10",
+  "anchor_evaluable", "anchor_clear_effect"), "08H peak table")
+need(nrow(anchor) == 622L && !anyDuplicated(anchor$feature) &&
+  sum(anchor$C0_supported) == 37L &&
+  sum(anchor$C0_supported & anchor$count_supported_40) == 16L &&
+  sum(anchor$nested_top10) == 6L &&
+  all(anchor$anchor_evaluable & anchor$anchor_clear_effect),
+  "Frozen WT 622/37/16/6 peak contract changed. Inspect Step 08H before rerunning.")
+gate <- read_csv_checked(GATE_PATH)
+require_columns(gate, c("gate", "minimum_primary_score", "selected_n",
+  "CON_n", "HFD_n"), "08G gate table")
+need(sum(gate$gate == "top15") == 1L, "Expected one top15 WT gate row.")
+WT_SCORE_CUTOFF <- gate$minimum_primary_score[gate$gate == "top15"]
+need(is.finite(WT_SCORE_CUTOFF) && WT_SCORE_CUTOFF > 0 &&
+  gate$selected_n[gate$gate == "top15"] == 174L,
+  "WT top15 reference gate changed.")
+write_table(tibble(signature = paste(CORE6, collapse = ";"),
+  maxRank = UCELL_MAX_RANK, WT_top15_minimum_score = WT_SCORE_CUTOFF,
+  WT_top15_CON_n = gate$CON_n[gate$gate == "top15"],
+  WT_top15_HFD_n = gate$HFD_n[gate$gate == "top15"],
+  gate_rule = "Within each approved genotype parent, rank all diets together; positive score; ceiling(0.15*n)."),
+  OUT, "00_fixed_signature_and_WT_gate.csv")
+write_table(anchor, OUT, "00_frozen_WT_622_peak_reference.csv.gz")
+write_table(dplyr::filter(anchor, C0_supported), OUT,
+  "00_frozen_WT_37_C0_supported_reference.csv")
+```
+
+## 2. WT exclusive sex-proxy sensitivity for all 622 peaks
+
+Xist-only and Y-only are more specific transcript patterns than Xist
+non-detection, but neither assigns a mouse's sex. We only calculate a
+stratum's effect with at least 30 nuclei in **each** diet. Top-15 Y-only is
+expected to be too small; it is marked ineligible rather than treated as
+having zero diet-associated peaks. The 37 and 16 are reported as subsets
+of the unchanged 622.
+
+```{r wt-exclusive-proxy}
+focused <- load_focused(STEP5E)
+wt_meta <- focused$metadata
+wt_atac <- focused$matrices$ATAC_counts
+recorded <- read_csv_checked(NUCLEI_PATH)
+require_columns(recorded, c("cell_barcode", "diet", "focused_cluster",
+  "parent_wnn_cluster", "C0W0_top15", "sex_proxy_status"),
+  "08H nucleus sex/gate table")
+need(!anyDuplicated(recorded$cell_barcode) &&
+  setequal(recorded$cell_barcode, wt_meta$cell_barcode),
+  "08H nuclei do not match the WT focused object.")
+recorded <- recorded[match(wt_meta$cell_barcode, recorded$cell_barcode), ]
+need(identical(recorded$cell_barcode, wt_meta$cell_barcode) &&
+  identical(as.character(recorded$diet), wt_meta$diet) &&
+  identical(as.character(recorded$focused_cluster), wt_meta$focused_cluster) &&
+  identical(as.character(recorded$parent_wnn_cluster),
+    wt_meta$parent_wnn_cluster) &&
+  identical(colnames(wt_atac), wt_meta$cell_barcode),
+  "WT 08H assignments and ATAC counts are not aligned.")
+wt_meta$sex_proxy_status <- recorded$sex_proxy_status
+wt_meta$C0W0_top15 <- as.logical(recorded$C0W0_top15)
+need(!anyNA(wt_meta$C0W0_top15) &&
+  all(anchor$feature %in% rownames(wt_atac)),
+  "WT focused assay lacks frozen peaks or recorded score gate.")
+wt_ix <- list(C0_all = which(wt_meta$focused_cluster == "0"),
+  C0W0_top15 = which(wt_meta$C0W0_top15))
+wt_specs <- dplyr::bind_rows(lapply(names(wt_ix), function(key) {
+  dplyr::bind_rows(lapply(c("Xist_only", "Y_only"), function(status) {
+    ix <- wt_ix[[key]][wt_meta$sex_proxy_status[wt_ix[[key]]] == status]
+    tibble(group = key, sex_proxy_status = status, indices = list(ix),
+      n_CON = sum(wt_meta$diet[ix] == "CON"),
+      n_HFD = sum(wt_meta$diet[ix] == "HFD"))
+  }))
+})) |>
+  dplyr::mutate(eligible = n_CON >= MIN_PER_DIET & n_HFD >= MIN_PER_DIET)
+need(all(wt_specs$eligible[wt_specs$group == "C0_all"]),
+  "The two C0 exclusive-proxy groups no longer meet the minimum size.")
+write_table(dplyr::select(wt_specs, -indices), OUT,
+  "01_WT_exclusive_sex_proxy_eligibility.csv")
+wt_depth <- Matrix::colSums(wt_atac)
+wt_sex_effects <- dplyr::bind_rows(lapply(which(wt_specs$eligible), function(i) {
+  key <- wt_specs$group[[i]]
+  proxy <- wt_specs$sex_proxy_status[[i]]
+  message("WT exclusive proxy: ", key, " / ", proxy)
+  pooled_effect(wt_atac, wt_meta, wt_specs$indices[[i]], "ATAC",
+    features = anchor$feature, total_depth = wt_depth) |>
+    dplyr::mutate(group = .env$key, sex_proxy_status = .env$proxy, .before = 1)
+}))
+need(!anyDuplicated(wt_sex_effects[c("group", "sex_proxy_status", "feature")]),
+  "WT sex-proxy effect rows are duplicated.")
+wt_sex_effects <- dplyr::left_join(wt_sex_effects,
+  dplyr::select(anchor, feature, C0_supported, count_supported_40,
+    nested_top10, anchor_log2FC_HFD_vs_CON), by = "feature",
+  relationship = "many-to-one") |>
+  dplyr::mutate(same_WT_direction = evaluable &
+    sign(log2FC_HFD_vs_CON) == sign(anchor_log2FC_HFD_vs_CON))
+write_table(wt_sex_effects, OUT,
+  "01_WT_622_peak_effects_by_exclusive_proxy.csv.gz")
+wt_sex_summary <- dplyr::bind_rows(lapply(c("all_622", "C0_supported_37",
+  "count_supported_16", "nested_top10_6"), function(tier) {
+  z <- dplyr::filter(wt_sex_effects,
+    if (tier == "all_622") TRUE else if (tier == "C0_supported_37")
+      C0_supported else if (tier == "count_supported_16")
+      C0_supported & count_supported_40 else nested_top10)
+  z |>
+    dplyr::group_by(group, sex_proxy_status) |>
+    dplyr::summarise(tier = tier, n_regions = dplyr::n(),
+      evaluable_n = sum(evaluable), same_direction_n = sum(same_WT_direction),
+      clear_same_n = sum(clear_effect & same_WT_direction), .groups = "drop")
+}))
+write_table(wt_sex_summary, OUT, "01_WT_exclusive_proxy_peak_summary.csv")
+wt_pair <- wt_sex_effects |>
+  dplyr::filter(group == "C0_all") |>
+  dplyr::select(feature, sex_proxy_status, log2FC_HFD_vs_CON,
+    CON_counts, HFD_counts, evaluable, clear_effect) |>
+  tidyr::pivot_wider(names_from = sex_proxy_status,
+    values_from = c(log2FC_HFD_vs_CON, CON_counts, HFD_counts,
+      evaluable, clear_effect)) |>
+  dplyr::left_join(dplyr::select(anchor, feature, chrom, start_1based,
+    end_1based, C0_supported, count_supported_40, nested_top10,
+    anchor_log2FC_HFD_vs_CON), by = "feature", relationship = "one-to-one") |>
+  dplyr::mutate(both_proxy_evaluable = evaluable_Xist_only & evaluable_Y_only,
+    both_proxy_clear_same = both_proxy_evaluable &
+      clear_effect_Xist_only & clear_effect_Y_only &
+      sign(log2FC_HFD_vs_CON_Xist_only) ==
+        sign(anchor_log2FC_HFD_vs_CON) &
+      sign(log2FC_HFD_vs_CON_Y_only) ==
+        sign(anchor_log2FC_HFD_vs_CON))
+write_table(wt_pair, OUT, "01_WT_C0_622_peak_exclusive_proxy_pair.csv.gz")
+wt_37_review <- wt_pair |>
+  dplyr::filter(C0_supported) |>
+  dplyr::arrange(dplyr::desc(both_proxy_clear_same),
+    dplyr::desc(count_supported_40), feature)
+write_table(wt_37_review, OUT,
+  "01_WT_37_C0_supported_exclusive_proxy_review.csv")
+print(wt_sex_summary)
+cat("WT C0 regions clear and same-direction in both exclusive proxy strata:",
+  sum(wt_37_review$both_proxy_clear_same), "of 37; higher-count subset:",
+  sum(wt_37_review$both_proxy_clear_same &
+    wt_37_review$count_supported_40), "of 16.\n")
+rm(focused, wt_meta, wt_atac, wt_depth, recorded, wt_sex_effects)
+invisible(gc())
+```
+
+## 3. Fixed cohort labels, six-gene score, and comparable peak effects
+
+Each candidate parent has its own top-15 gate. We also export the entire
+parent, a WT-calibrated score gate, the union of primary parents, and one
+separate crypt progenitor context group. An ineligible group or missing
+peak produces `NA` effects and a specific status. The full cohort ATAC
+matrix supplies each nucleus's sequencing-depth denominator, even when
+only the frozen 622 peaks are evaluated.
+
+```{r genotype-cohorts}
+check_interval_identity <- function(object, features, reference) {
+  gr <- Signac::granges(object[["ATAC"]])
+  names(gr) <- rownames(object[["ATAC"]])
+  ix <- match(features, names(gr))
+  present <- !is.na(ix)
+  if (any(present)) {
+    x <- gr[ix[present]]
+    ref <- reference[match(features[present], reference$feature), ]
+    need(all(as.character(GenomicRanges::seqnames(x)) == ref$chrom) &&
+      all(as.integer(BiocGenerics::start(x)) == ref$start_1based) &&
+      all(as.integer(BiocGenerics::end(x)) == ref$end_1based),
+      "A cohort peak name maps to a different genomic interval.")
+  }
+  present
+}
+build_spec <- function(meta, states) {
+  out <- list()
+  add <- function(key, role, ix) {
+    out[[length(out) + 1L]] <<- tibble(contrast = key, role = role,
+      indices = list(as.integer(ix)))
+  }
+  selected <- list()
+  for (parent in states$primary) {
+    ix <- which(meta$wnn_cluster == parent)
+    need(length(ix) > 0L, paste("Missing approved ISC parent:", parent))
+    ranked <- ix[order(-meta$ISC_core6_UCell[ix], meta$cell_barcode[ix])]
+    top <- ranked[seq_len(ceiling(.15 * length(ranked)))]
+    top <- top[meta$ISC_core6_UCell[top] > 0]
+    calibrated <- ix[meta$ISC_core6_UCell[ix] >= WT_SCORE_CUTOFF]
+    add(paste0("parent_", parent, "_all"), "approved_ISC_parent", ix)
+    add(paste0("parent_", parent, "_top15"), "within_parent_top15", top)
+    add(paste0("parent_", parent, "_WTcal"), "WT_reference_score_gate", calibrated)
+    selected[[parent]] <- list(all = ix, top15 = top, WTcal = calibrated)
+  }
+  for (gate_name in c("all", "top15", "WTcal")) {
+    ix <- sort(unique(unlist(lapply(selected, `[[`, gate_name),
+      use.names = FALSE)))
+    add(paste0("annotated_union_", gate_name),
+      paste0("union_of_parent_", gate_name), ix)
+  }
+  add("crypt_progenitor_context", "approved_nonprimary_crypt_progenitor",
+    which(meta$wnn_cluster %in% states$context))
+  dplyr::bind_rows(out) |>
+    dplyr::mutate(n_CON = vapply(indices, function(ix)
+      as.integer(sum(meta$diet[ix] == "CON")), integer(1)),
+      n_HFD = vapply(indices, function(ix)
+        as.integer(sum(meta$diet[ix] == "HFD")), integer(1)),
+      eligible = n_CON >= MIN_PER_DIET & n_HFD >= MIN_PER_DIET)
+}
+
+all_effects <- list()
+all_balance <- list()
+all_score_audit <- list()
+all_presence <- list()
+all_marker_audit <- list()
+all_marker_detection <- list()
+for (cohort in names(COHORT_STATES)) {
+  message("08I cohort: ", toupper(cohort))
+  obj_path <- file.path(RESULT_ROOT, cohort, "06_annotation",
+    "multiome_annotated.rds")
+  decision_path <- file.path(DATASET_CONFIG_DIR, "cohorts", cohort,
+    "cell_state_annotations.csv")
+  decisions <- read_csv_checked(decision_path)
+  require_columns(decisions, c("cluster", "approved", "broad_compartment",
+    "cell_state", "annotation_confidence"), paste(cohort, "annotation decision"))
+  decisions$cluster <- as.character(decisions$cluster)
+  chosen <- c(COHORT_STATES[[cohort]]$primary,
+    COHORT_STATES[[cohort]]$context)
+  map <- decisions[match(chosen, decisions$cluster), ]
+  need(!anyNA(map$cluster) && all(map$approved) &&
+    all(map$broad_compartment == "epithelial") &&
+    all(map$annotation_confidence %in% c("high", "moderate")),
+    paste("Approved primary/context annotations changed in", cohort))
+  write_table(dplyr::mutate(map, cohort = .env$cohort, .before = 1),
+    OUT, paste0("02_", cohort, "_approved_crypt_parent_decisions.csv"))
+
+  obj <- readRDS(obj_path)
+  need(all(c("RNA", "ATAC") %in% names(obj)) &&
+    "counts" %in% SeuratObject::Layers(obj[["RNA"]]) &&
+    "counts" %in% SeuratObject::Layers(obj[["ATAC"]]),
+    paste("Missing joined RNA/ATAC counts in", cohort))
+  meta <- obj[[]]
+  require_columns(meta, c("wnn_cluster", "cell_state", "sample_id", "diet",
+    "nCount_RNA", "nCount_ATAC", "nFeature_RNA"),
+    paste(cohort, "annotated metadata"))
+  meta$cell_barcode <- rownames(meta)
+  meta$wnn_cluster <- as.character(meta$wnn_cluster)
+  meta$cell_state <- as.character(meta$cell_state)
+  meta$diet <- as.character(meta$diet)
+  meta$sample_id <- as.character(meta$sample_id)
+  cohort_samples <- sample_sheet |>
+    dplyr::filter(cohort_id == .env$cohort) |>
+    dplyr::select(sample_id, diet)
+  need(!anyDuplicated(meta$cell_barcode) && !anyNA(meta$diet) &&
+    setequal(unique(meta$diet), c("CON", "HFD")) &&
+    setequal(meta$cell_barcode, colnames(obj)) &&
+    nrow(cohort_samples) == 2L &&
+    setequal(cohort_samples$diet, c("CON", "HFD")) &&
+    !anyDuplicated(cohort_samples$sample_id) &&
+    setequal(unique(meta$sample_id), cohort_samples$sample_id) &&
+    identical(meta$diet, cohort_samples$diet[
+      match(meta$sample_id, cohort_samples$sample_id)]),
+    paste("Unexpected samples/diets/barcodes in", cohort))
+  for (j in seq_len(nrow(map))) {
+    ix <- meta$wnn_cluster == map$cluster[[j]]
+    need(any(ix) && all(meta$cell_state[ix] == map$cell_state[[j]]),
+      paste(cohort, "stored annotation differs from the approved decision:",
+        map$cluster[[j]]))
+  }
+  rna_aligned <- align_columns(SeuratObject::LayerData(obj[["RNA"]],
+    layer = "counts"), meta$cell_barcode, paste0(cohort, " RNA"))
+  atac_aligned <- align_columns(SeuratObject::LayerData(obj[["ATAC"]],
+    layer = "counts"), meta$cell_barcode, paste0(cohort, " ATAC"))
+  rna <- rna_aligned$matrix
+  atac <- atac_aligned$matrix
+  write_table(dplyr::bind_rows(rna_aligned$audit, atac_aligned$audit),
+    OUT, paste0("02_", cohort, "_matrix_alignment.csv"))
+  availability <- tibble(cohort = cohort, gene = CORE6,
+    present_in_RNA = CORE6 %in% rownames(rna))
+  all_marker_audit[[cohort]] <- availability
+  need(all(availability$present_in_RNA),
+    paste("An ISC signature gene is absent in", cohort,
+      "- cannot compare a shortened score."))
+  scores <- UCell::ScoreSignatures_UCell(rna,
+    features = list(ISC_core6 = CORE6), maxRank = UCELL_MAX_RANK)
+  need(setequal(rownames(scores), meta$cell_barcode) &&
+    "ISC_core6_UCell" %in% colnames(scores),
+    paste("Unexpected UCell score format in", cohort))
+  meta$ISC_core6_UCell <- as.numeric(scores[meta$cell_barcode,
+    "ISC_core6_UCell"])
+  meta$ISC_core_genes_detected <- as.integer(Matrix::colSums(
+    rna[CORE6, meta$cell_barcode, drop = FALSE] > 0))
+  need(all(is.finite(meta$ISC_core6_UCell)),
+    paste("Nonfinite UCell scores in", cohort))
+  all_marker_detection[[cohort]] <- dplyr::bind_rows(lapply(CORE6, function(gene) {
+    meta |>
+      dplyr::filter(wnn_cluster %in% chosen) |>
+      dplyr::mutate(detected = as.numeric(rna[gene, cell_barcode]) > 0) |>
+      dplyr::group_by(wnn_cluster, cell_state, diet) |>
+      dplyr::summarise(cohort = cohort, gene = gene, nuclei = dplyr::n(),
+        detected_n = sum(detected), detected_percent = 100 * mean(detected),
+        .groups = "drop")
+  }))
+  meta$Xist_detected <- if ("Xist" %in% rownames(rna)) {
+    as.numeric(rna["Xist", meta$cell_barcode]) > 0
+  } else {
+    rep(NA, nrow(meta))
+  }
+  y_present <- intersect(Y_GENES, rownames(rna))
+  meta$Y_any_detected <- if (length(y_present)) {
+    Matrix::colSums(rna[y_present, meta$cell_barcode, drop = FALSE] > 0) > 0
+  } else {
+    rep(NA, nrow(meta))
+  }
+  spec <- build_spec(meta, COHORT_STATES[[cohort]])
+  need(!anyDuplicated(spec$contrast) &&
+    all(spec$eligible[spec$contrast %in%
+      paste0("parent_", COHORT_STATES[[cohort]]$primary, "_all")]),
+    paste("An approved ISC parent has fewer than 30 nuclei per diet in", cohort))
+
+  # Keep the universe as 622 exact WT intervals; never equate a filtered-out
+  # peak with a zero effect in the genotype cohort.
+  present <- check_interval_identity(obj, anchor$feature, anchor)
+  all_presence[[cohort]] <- tibble(cohort = cohort,
+    feature = anchor$feature, feature_present = present)
+  selected_features <- anchor$feature[present]
+  need(length(selected_features) > 0L &&
+    all(selected_features %in% rownames(atac)),
+    paste("No comparable WT peaks in the", cohort, "ATAC assay."))
+  depth <- Matrix::colSums(atac)
+  all_balance[[cohort]] <- dplyr::bind_rows(lapply(seq_len(nrow(spec)), function(i) {
+    ix <- spec$indices[[i]]
+    dplyr::bind_rows(lapply(c("CON", "HFD"), function(diet_value) {
+      k <- ix[meta$diet[ix] == diet_value]
+      tibble(cohort = cohort, contrast = spec$contrast[[i]],
+        role = spec$role[[i]], diet = diet_value, n = length(k),
+        eligible = spec$eligible[[i]],
+        median_ISC_UCell = if (length(k)) median(meta$ISC_core6_UCell[k]) else NA_real_,
+        median_detected_six = if (length(k)) median(meta$ISC_core_genes_detected[k]) else NA_real_,
+        median_RNA_features = if (length(k)) median(meta$nFeature_RNA[k]) else NA_real_,
+        median_RNA_counts = if (length(k)) median(meta$nCount_RNA[k]) else NA_real_,
+        median_ATAC_counts = if (length(k)) median(meta$nCount_ATAC[k]) else NA_real_,
+        Xist_detected_percent = if (length(k)) 100 * mean(meta$Xist_detected[k]) else NA_real_,
+        Y_detected_percent = if (length(k)) 100 * mean(meta$Y_any_detected[k]) else NA_real_)
+    }))
+  }))
+  write_table(dplyr::select(spec, -indices) |>
+    dplyr::mutate(cohort = .env$cohort, .before = 1), OUT,
+    paste0("02_", cohort, "_contrast_eligibility.csv"))
+  top15_ix <- sort(unique(unlist(spec$indices[
+    grepl("^parent_.*_top15$", spec$contrast)], use.names = FALSE)))
+  top15_cells <- meta$cell_barcode[top15_ix]
+  write_table(meta |>
+    dplyr::filter(wnn_cluster %in% c(COHORT_STATES[[cohort]]$primary,
+      COHORT_STATES[[cohort]]$context)) |>
+    dplyr::transmute(cohort = .env$cohort, cell_barcode, sample_id, diet,
+      wnn_cluster, cell_state, ISC_core6_UCell, ISC_core_genes_detected,
+      Xist_detected, Y_any_detected, nFeature_RNA, nCount_RNA, nCount_ATAC,
+      top15 = cell_barcode %in% .env$top15_cells,
+      WTcal = ISC_core6_UCell >= WT_SCORE_CUTOFF),
+    OUT, paste0("02_", cohort, "_crypt_nuclei_scores.csv.gz"))
+
+  cohort_effect <- dplyr::bind_rows(lapply(which(spec$eligible), function(i) {
+    key <- spec$contrast[[i]]
+    message(cohort, " ATAC exact intervals: ", key,
+      " (", spec$n_CON[[i]], " CON / ", spec$n_HFD[[i]], " HFD)")
+    pooled_effect(atac, meta, spec$indices[[i]], "ATAC",
+      features = selected_features, total_depth = depth) |>
+      dplyr::mutate(contrast = .env$key, .before = 1)
+  }))
+  need(!anyDuplicated(cohort_effect[c("contrast", "feature")]),
+    paste("Duplicate exact-interval effects in", cohort))
+  full <- tidyr::expand_grid(contrast = spec$contrast,
+    feature = anchor$feature) |>
+    dplyr::left_join(cohort_effect,
+      by = c("contrast", "feature"), relationship = "one-to-one") |>
+    dplyr::left_join(dplyr::select(spec, contrast, role, n_CON, n_HFD,
+      eligible), by = "contrast", relationship = "many-to-one") |>
+    dplyr::mutate(cohort = .env$cohort, .before = 1) |>
+    dplyr::left_join(all_presence[[cohort]],
+      by = c("cohort", "feature"), relationship = "many-to-one") |>
+    dplyr::left_join(dplyr::select(anchor, feature, chrom, start_1based,
+      end_1based, C0_supported, count_supported_40, nested_top10,
+      anchor_log2FC_HFD_vs_CON, C0_all_log2FC_HFD_vs_CON,
+      anchor_CON_counts, anchor_HFD_counts), by = "feature",
+      relationship = "many-to-one") |>
+    dplyr::mutate(status = dplyr::case_when(
+      !eligible ~ "gate_ineligible", !feature_present ~ "peak_absent_from_assay",
+      !evaluable ~ "peak_below_evaluability", TRUE ~ "evaluable"),
+      same_WT_top15_direction = dplyr::if_else(status == "evaluable",
+        sign(log2FC_HFD_vs_CON) == sign(anchor_log2FC_HFD_vs_CON), NA))
+  need(all(!is.na(full$status)) &&
+    sum(full$status == "peak_absent_from_assay") ==
+      sum(!present) * sum(spec$eligible),
+    paste("Missing/evaluable peak bookkeeping failed in", cohort))
+  all_effects[[cohort]] <- full
+
+  all_score_audit[[cohort]] <- meta |>
+    dplyr::filter(wnn_cluster %in% COHORT_STATES[[cohort]]$primary) |>
+    dplyr::group_by(wnn_cluster, diet, ISC_core_genes_detected) |>
+    dplyr::summarise(cohort = cohort, nuclei = dplyr::n(),
+      median_score = median(ISC_core6_UCell),
+      median_RNA_features = median(nFeature_RNA), .groups = "drop")
+  rm(obj, meta, rna, atac, rna_aligned, atac_aligned, scores,
+    depth, cohort_effect, full, spec)
+  invisible(gc())
+}
+write_table(dplyr::bind_rows(all_marker_audit), OUT,
+  "02_fixed_six_gene_assay_availability.csv")
+write_table(dplyr::bind_rows(all_marker_detection), OUT,
+  "02_six_gene_detection_by_approved_parent_diet.csv")
+write_table(dplyr::bind_rows(all_score_audit), OUT,
+  "02_crypt_ISC_score_by_detected_genes_diet.csv")
+write_table(dplyr::bind_rows(all_balance), OUT,
+  "02_crypt_gate_parent_diet_sex_depth_balance.csv")
+write_table(dplyr::bind_rows(all_presence), OUT,
+  "02_frozen_peak_presence_by_cohort.csv")
+effects <- dplyr::bind_rows(all_effects)
+need(!anyDuplicated(effects[c("cohort", "contrast", "feature")]) &&
+  all(vapply(all_effects, nrow, integer(1)) ==
+    622L * vapply(names(COHORT_STATES), function(cohort)
+      length(COHORT_STATES[[cohort]]$primary) * 3L + 4L, integer(1))),
+  "Not every frozen peak has a status row for each genotype contrast.")
+write_table(effects, OUT, "03_all_622_exact_interval_cohort_effects.csv.gz")
+write_table(dplyr::filter(effects, C0_supported), OUT,
+  "03_C0_supported_37_exact_interval_cohort_effects.csv.gz")
+```
+
+## 4. Summarize effect direction, evaluability, and composition
+
+The descriptive `clear_effect` threshold still means >=30 pooled fragments,
+>=1% detection in either diet, and absolute depth-normalized log2FC >=0.5.
+No P values are generated. All cohort outcomes report the original WT
+reference effect alongside the corresponding genotype effect. Same-direction
+counts are descriptive summaries of WT-selected peaks,
+not tests of a genotype interaction. Inspect each parent's CON/HFD balance
+before interpreting its combined union.
+
+```{r summaries-and-plots}
+summary_by_tier <- function(tier, subset) {
+  effects |>
+    dplyr::filter(.env$subset) |>
+    dplyr::group_by(cohort, contrast, role, n_CON, n_HFD, eligible) |>
+    dplyr::summarise(tier = tier, frozen_regions = dplyr::n(),
+      present_regions = sum(feature_present),
+      evaluable_regions = sum(status == "evaluable"),
+      clear_regions = sum(clear_effect, na.rm = TRUE),
+      evaluable_same_WT_direction = sum(same_WT_top15_direction,
+        na.rm = TRUE),
+      clear_same_WT_direction = sum(clear_effect &
+        same_WT_top15_direction, na.rm = TRUE),
+      clear_opposite_WT_direction = sum(clear_effect &
+        !same_WT_top15_direction, na.rm = TRUE),
+      .groups = "drop") |>
+    dplyr::mutate(dplyr::across(c(evaluable_regions, clear_regions,
+      evaluable_same_WT_direction, clear_same_WT_direction,
+      clear_opposite_WT_direction), ~dplyr::if_else(eligible, .x, NA_integer_)))
+}
+summary <- dplyr::bind_rows(
+  summary_by_tier("all_622", rep(TRUE, nrow(effects))),
+  summary_by_tier("C0_supported_37", effects$C0_supported),
+  summary_by_tier("count_supported_16", effects$C0_supported &
+    effects$count_supported_40),
+  summary_by_tier("nested_top10_6", effects$nested_top10))
+write_table(summary, OUT, "03_cohort_gate_peak_effect_summary.csv")
+source_composition <- dplyr::bind_rows(lapply(names(COHORT_STATES), function(cohort) {
+  a <- all_balance[[cohort]]
+  parents <- paste0("parent_", COHORT_STATES[[cohort]]$primary, "_")
+  dplyr::bind_rows(lapply(c("all", "top15", "WTcal"), function(g) {
+    selected <- a |>
+      dplyr::filter(contrast %in% paste0(parents, g)) |>
+      dplyr::mutate(gate = g,
+        parent = sub("^parent_([^_]+)_.*$", "\\1", contrast))
+    selected |>
+      dplyr::group_by(cohort, gate, diet) |>
+      dplyr::mutate(parent_percent_of_union = if (sum(n) > 0L)
+        100 * n / sum(n) else NA_real_) |>
+      dplyr::ungroup() |>
+      dplyr::select(cohort, gate, parent, diet, n,
+        parent_percent_of_union, median_ISC_UCell,
+        median_detected_six, median_ATAC_counts, Xist_detected_percent)
+  }))
+}))
+write_table(source_composition, OUT,
+  "03_parent_contributions_to_annotated_unions.csv")
+print(summary |>
+  dplyr::filter(tier %in% c("all_622", "C0_supported_37"),
+    contrast %in% c("annotated_union_all", "annotated_union_top15",
+      paste0("parent_", unlist(lapply(COHORT_STATES, `[[`, "primary")),
+        "_all"))))
+print(source_composition)
+
+p_scatter <- effects |>
+  dplyr::filter(contrast %in% c("annotated_union_all",
+    "annotated_union_top15"), status == "evaluable") |>
+  ggplot2::ggplot(ggplot2::aes(x = anchor_log2FC_HFD_vs_CON,
+    y = log2FC_HFD_vs_CON,
+    color = ifelse(C0_supported, "WT C0-supported 37", "Other WT top-15 peaks"))) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = .25) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = .25) +
+  ggplot2::geom_point(alpha = .55, size = 1) +
+  ggplot2::facet_grid(cohort ~ contrast) +
+  ggplot2::scale_color_manual(values = c("WT C0-supported 37" = "#B24B3A",
+    "Other WT top-15 peaks" = "#5C7080")) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "Exact WT candidate intervals in approved genotype crypt states",
+    subtitle = "Evaluable peaks only; pooled descriptive log2FC; check parent balance before union interpretation",
+    x = "WT C0/W0 top-15 log2FC (HFD vs CON)",
+    y = "Genotype crypt-state log2FC (HFD vs CON)", color = NULL)
+save_vector_plot(p_scatter, PLOTS,
+  "03_WT_vs_genotype_exact_interval_effects.pdf", 13, 8)
+
+ordered37 <- dplyr::filter(anchor, C0_supported) |>
+  dplyr::arrange(anchor_log2FC_HFD_vs_CON) |>
+  dplyr::pull(feature)
+p_heat <- effects |>
+  dplyr::filter(C0_supported,
+    contrast %in% c("annotated_union_all", "annotated_union_top15",
+      paste0("parent_", unlist(lapply(COHORT_STATES, `[[`, "primary")),
+        "_all"))) |>
+  dplyr::mutate(feature = factor(feature, levels = ordered37),
+    contrast = factor(contrast,
+      levels = c("annotated_union_all", "annotated_union_top15",
+        paste0("parent_", unlist(lapply(COHORT_STATES, `[[`, "primary")),
+          "_all"))),
+    effect_for_display = ifelse(status == "evaluable",
+      log2FC_HFD_vs_CON, NA_real_)) |>
+  ggplot2::ggplot(ggplot2::aes(x = feature, y = contrast,
+    fill = effect_for_display)) +
+  ggplot2::geom_tile(color = "white", linewidth = .1) +
+  ggplot2::facet_wrap(~cohort, ncol = 1, scales = "free_y") +
+  ggplot2::scale_fill_gradient2(low = "#3279A8", mid = "white",
+    high = "#C45F48", midpoint = 0, na.value = "grey85") +
+  ggplot2::theme_bw(base_size = 8) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90,
+    hjust = 1, vjust = .5, size = 6)) +
+  ggplot2::labs(title = "Frozen WT C0-supported regions in each genotype parent",
+    subtitle = "Grey: missing or below evaluability; colors show descriptive log2FC only",
+    x = "Exact GRCm39 peak", y = NULL, fill = "HFD vs CON\nlog2FC")
+save_vector_plot(p_heat, PLOTS,
+  "03_frozen_37_peak_genotype_context_heatmap.pdf", 17, 7)
+```
+
+## 5. Handoff
+
+Read `01_WT_exclusive_proxy_peak_summary.csv` first. Then review
+`02_crypt_gate_parent_diet_sex_depth_balance.csv` and
+`03_parent_contributions_to_annotated_unions.csv` before the effect table.
+Rows labeled `peak_absent_from_assay`, `peak_below_evaluability`, or
+`gate_ineligible` must remain missing in subsequent comparisons. The
+full 622-row WT source table and all genotype contrasts are exported to
+support a review pack and a later matched-background motif analysis.
+
+```{r finish}
+finish_run(OUT, "STEP_08I_COMPLETE.txt", c(
+  "The WT 622/37/16/6 candidate lists and exact GRCm39 intervals were kept fixed.",
+  "WT C0 Xist-only and Y-only effects are transcript-proxy sensitivity views.",
+  "PPAR 3/6 and IL17 9/10 were scored with six fixed ISC genes, maxRank=400.",
+  "Parent effects precede any union interpretation; progenitor context remains separate.",
+  "Peak absence and insufficient counts remain explicit missing values.",
+  "One pooled library per diet per genotype: no significant DARs or genotype interaction test.",
+  paste("Results:", OUT)))
+```

@@ -1,0 +1,251 @@
+---
+title: "Step 08Q | Functions represented by the WT ISC HFD peak program"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This is a separate biological question from Step 08N. It asks whether genes
+nearest to the frozen WT **HFD-opening** or **HFD-closing** peaks are more
+frequently assigned GO or KEGG terms than genes near the **2,028 evaluable
+WT C0/W0 top-15% ATAC peaks**. The background includes both WT candidate
+directions and the other evaluable WT peaks. It does not test PPAR or IL17
+dependence. Promoter analyses restrict **both** foreground and universe to
+peaks within ±2 kb of the nearest annotated GRCm39 vM33 TSS.
+
+Nearest genes are proximity assignments, not established targets. A gene
+with multiple evaluable peaks has more opportunities to enter a peak-selected
+foreground; simple gene-level hypergeometric tests do not correct that bias.
+These terms, if any, are exploratory functions associated with the WT peak
+screen, not replicated differential accessibility or TF binding.
+
+Run from the repository root after Steps 08L and 08N. Step 08L already
+performed the complementary WT-direction motif test against matched neutral
+evaluable WT peaks; this notebook copies its motif summary for review and
+does not rescan motifs.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+required_packages <- c("readr", "dplyr", "tibble", "GenomicRanges",
+  "IRanges", "ChIPseeker", "GenomicFeatures", "AnnotationDbi",
+  "org.Mm.eg.db", "clusterProfiler")
+missing <- required_packages[!vapply(required_packages,
+  requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing,
+  collapse = ", "))
+need <- function(ok, why) if (!isTRUE(ok)) stop(why, call. = FALSE)
+STEP08L <- file.path(OUTPUT_DIR,
+  "08l_wt_ISC_open_close_motifs")
+STEP08N <- file.path(OUTPUT_DIR,
+  "08n_wt_ISC_interval_loss_pathways")
+OUT <- file.path(OUTPUT_DIR,
+  "08q_wt_ISC_program_pathways")
+ORA <- file.path(OUT, "ora")
+dir.create(ORA, recursive = TRUE, showWarnings = FALSE)
+read_csv <- function(f) readr::read_csv(f, show_col_types = FALSE,
+  progress = FALSE)
+write_csv <- function(x, f) readr::write_csv(x, f)
+files <- c(universe = file.path(STEP08L,
+    "02_evaluable_WT_universe_sequence_covariates.csv.gz"),
+  frozen = file.path(STEP08N,
+    "01_all_622_annotated_loss_audit.csv.gz"),
+  motif_summary = file.path(STEP08L, "03_motif_result_summary.csv"),
+  gtf = GRCM39_GTF)
+need(all(file.exists(files)), paste("Missing:",
+  paste(files[!file.exists(files)], collapse = "; ")))
+write_csv(tibble::tibble(input = names(files),
+  path = normalizePath(files), md5 = unname(tools::md5sum(files))),
+  file.path(OUT, "00_input_manifest.csv"))
+```
+
+## Annotate the evaluable WT opportunity set
+
+The candidate 622 retain their Step 08N annotation exactly. We annotate
+only the other 1,406 intervals with the same ChIPseeker/TxDb/TSS window, then
+map Ensembl gene IDs to Entrez IDs with the same deterministic rule as 08N.
+
+```{r annotate-universe}
+u <- read_csv(files[["universe"]])
+frozen <- read_csv(files[["frozen"]])
+need(nrow(u) == 2028L && !anyDuplicated(u$feature) &&
+  nrow(frozen) == 622L && !anyDuplicated(frozen$feature) &&
+  all(frozen$feature %in% u$feature),
+  "The 08L WT opportunity set or 08N candidate identity changed.")
+need(all(c("chrom", "start_1based", "end_1based", "membership") %in%
+  names(u)) && all(c("WT_direction", "nearest_ensembl",
+    "nearest_entrez", "nearest_symbol", "annotation", "distanceToTSS",
+    "promoter_pm2kb") %in% names(frozen)),
+  "Annotation or coordinate columns are missing.")
+ix <- match(frozen$feature, u$feature)
+need(all(frozen$chrom == u$chrom[ix] &
+  frozen$start_1based == u$start_1based[ix] &
+  frozen$end_1based == u$end_1based[ix]) &&
+  all(u$membership[ix] == frozen$WT_direction),
+  "08L/08N exact coordinates or directions differ.")
+cols <- c("feature", "chrom", "start_1based", "end_1based",
+  "annotation", "distanceToTSS", "nearest_ensembl",
+  "nearest_entrez", "nearest_symbol", "promoter_pm2kb")
+fixed <- frozen[, cols]
+fixed$WT_direction <- frozen$WT_direction
+other <- u[!u$feature %in% fixed$feature, , drop = FALSE]
+need(nrow(other) == 1406L, "Noncandidate WT opportunity count changed.")
+make_txdb <- if (requireNamespace("txdbmaker", quietly = TRUE) &&
+  "makeTxDbFromGFF" %in% getNamespaceExports("txdbmaker"))
+  getExportedValue("txdbmaker", "makeTxDbFromGFF") else
+    getExportedValue("GenomicFeatures", "makeTxDbFromGFF")
+txdb <- make_txdb(files[["gtf"]], format = "gtf",
+  organism = "Mus musculus")
+gr <- GenomicRanges::GRanges(seqnames = other$chrom,
+  ranges = IRanges::IRanges(other$start_1based, other$end_1based))
+names(gr) <- other$feature
+need(all(as.character(GenomicRanges::seqnames(gr)) %in%
+  GenomeInfoDb::seqlevels(txdb)), "GTF and peak sequence names differ.")
+annotated <- as.data.frame(ChIPseeker::annotatePeak(gr,
+  TxDb = txdb, tssRegion = c(-2000, 2000),
+  level = "gene", annoDb = NULL, verbose = FALSE))
+annotated$feature <- paste0(as.character(annotated$seqnames), "-",
+  annotated$start, "-", annotated$end)
+need(nrow(annotated) == nrow(other) &&
+  !anyDuplicated(annotated$feature) &&
+  setequal(annotated$feature, other$feature),
+  "Noncandidate ChIPseeker annotations could not be aligned.")
+annotated <- annotated[match(other$feature, annotated$feature), ]
+other$annotation <- as.character(annotated$annotation)
+other$distanceToTSS <- as.numeric(annotated$distanceToTSS)
+other$nearest_ensembl <- sub("\\.[0-9]+$", "",
+  as.character(annotated$geneId))
+other$nearest_ensembl[is.na(annotated$geneId) |
+  !grepl("^ENSMUSG", other$nearest_ensembl)] <- NA_character_
+other$promoter_pm2kb <- !is.na(other$distanceToTSS) &
+  abs(other$distanceToTSS) <= 2000
+keys <- sort(unique(stats::na.omit(other$nearest_ensembl)))
+mapped <- AnnotationDbi::select(org.Mm.eg.db::org.Mm.eg.db,
+  keys = keys, keytype = "ENSEMBL",
+  columns = c("ENTREZID", "SYMBOL")) |>
+  dplyr::filter(!is.na(.data$ENTREZID)) |>
+  dplyr::arrange(.data$ENSEMBL, as.integer(.data$ENTREZID)) |>
+  dplyr::distinct(.data$ENSEMBL, .keep_all = TRUE)
+other <- dplyr::left_join(other, mapped |>
+  dplyr::transmute(nearest_ensembl = .data$ENSEMBL,
+    nearest_entrez = .data$ENTREZID,
+    nearest_symbol = .data$SYMBOL),
+  by = "nearest_ensembl", relationship = "many-to-one")
+other$WT_direction <- "other_evaluable_WT"
+fixed$nearest_entrez <- as.character(fixed$nearest_entrez)
+other$nearest_entrez <- as.character(other$nearest_entrez)
+all_peaks <- dplyr::bind_rows(fixed, other[, names(fixed),
+  drop = FALSE])
+need(nrow(all_peaks) == 2028L &&
+  setequal(all_peaks$feature, u$feature),
+  "The background does not contain every evaluable WT peak.")
+write_csv(all_peaks, file.path(OUT,
+  "01_all_2028_WT_evaluable_annotated_peaks.csv.gz"))
+write_csv(all_peaks |>
+  dplyr::count(.data$WT_direction, .data$promoter_pm2kb,
+    name = "intervals"),
+  file.path(OUT, "01_opportunity_set_composition.csv"))
+write_csv(all_peaks |>
+  dplyr::filter(!is.na(.data$nearest_entrez)) |>
+  dplyr::count(.data$nearest_entrez, name = "evaluable_peak_opportunities") |>
+  dplyr::arrange(dplyr::desc(.data$evaluable_peak_opportunities)),
+  file.path(OUT, "01_gene_peak_opportunity_audit.csv"))
+```
+
+## WT HFD-opening and HFD-closing GO/KEGG tests
+
+The WT foregrounds are compared with all evaluable WT peaks under the same
+gate. Each gene enters the hypergeometric test once regardless of its number
+of peaks; the opportunity audit above reports that potential bias. GO terms
+are split by BP/MF/CC. Benjamini-Hochberg adjustment is within each
+direction/scope/database result. The KEGG status is recorded if the online
+resource is unavailable on SOL. No result is interpreted as a genotype
+effect or a gene regulatory link.
+
+```{r wt-program-ora}
+status <- list()
+kegg_unavailable <- FALSE
+old_timeout <- getOption("timeout")
+options(timeout = min(20L, old_timeout))
+for (direction in c("HFD_open", "HFD_closed")) {
+  for (scope in c("all", "promoter_pm2kb")) {
+    universe <- all_peaks
+    if (scope == "promoter_pm2kb")
+      universe <- universe[universe$promoter_pm2kb, , drop = FALSE]
+    target <- universe[universe$WT_direction == direction, , drop = FALSE]
+    bg <- sort(unique(stats::na.omit(as.character(
+      universe$nearest_entrez))))
+    genes <- intersect(bg, sort(unique(stats::na.omit(as.character(
+      target$nearest_entrez)))))
+    write_csv(tibble::tibble(entrez_id = bg),
+      file.path(ORA, paste0(direction, "_", scope,
+        "_background_genes.csv")))
+    write_csv(tibble::tibble(entrez_id = genes),
+      file.path(ORA, paste0(direction, "_", scope,
+        "_target_genes.csv")))
+    for (db in c("GO_BP", "GO_MF", "GO_CC", "KEGG")) {
+      message("WT ", direction, " / ", scope, " / ", db,
+        ": ", length(genes), " of ", length(bg), " genes")
+      result <- NULL; issue <- NA_character_
+      if (db == "KEGG" && kegg_unavailable) {
+        issue <- "skipped_after_earlier_KEGG_error"
+      } else if (length(genes) >= 3L &&
+          length(setdiff(bg, genes)) >= 3L) {
+        result <- tryCatch({
+          if (db == "KEGG") clusterProfiler::enrichKEGG(
+            gene = genes, universe = bg, organism = "mmu",
+            keyType = "ncbi-geneid", minGSSize = 5L,
+            maxGSSize = 500L, pvalueCutoff = 1, qvalueCutoff = 1) else
+              clusterProfiler::enrichGO(gene = genes,
+                OrgDb = org.Mm.eg.db::org.Mm.eg.db,
+                keyType = "ENTREZID", ont = sub("GO_", "", db),
+                universe = bg, minGSSize = 5L, maxGSSize = 500L,
+                pvalueCutoff = 1, qvalueCutoff = 1,
+                readable = FALSE)
+        }, error = function(e) { issue <<- conditionMessage(e); NULL })
+        if (db == "KEGG" && !is.na(issue))
+          kegg_unavailable <- TRUE
+      } else issue <- "too_few_mapped_target_or_non_target_genes"
+      table <- if (is.null(result)) data.frame(
+        ID = character(), Description = character(),
+        GeneRatio = character(), BgRatio = character(),
+        pvalue = numeric(), p.adjust = numeric(),
+        qvalue = numeric(), geneID = character(),
+        Count = integer()) else as.data.frame(result)
+      write_csv(table, file.path(ORA, paste0(direction, "_", scope,
+        "_", db, ".csv")))
+      status[[length(status) + 1L]] <- tibble::tibble(
+        WT_direction = direction, scope = scope, database = db,
+        foreground_peaks = nrow(target), background_peaks = nrow(universe),
+        foreground_genes = length(genes), background_genes = length(bg),
+        pathways_returned = nrow(table),
+        min_BH = if (nrow(table) && any(is.finite(table$p.adjust)))
+          min(table$p.adjust, na.rm = TRUE) else NA_real_,
+        BH_below_005 = if (nrow(table))
+          sum(table$p.adjust < .05, na.rm = TRUE) else 0L,
+        status = if (!is.na(issue)) issue else if (!nrow(table))
+          "no_pathways_after_size_filter" else "complete")
+    }
+  }
+}
+options(timeout = old_timeout)
+write_csv(dplyr::bind_rows(status),
+  file.path(OUT, "02_WT_program_ORA_summary.csv"))
+motif <- read_csv(files[["motif_summary"]]) |>
+  dplyr::filter(.data$set %in% c("HFD_open_622", "HFD_closed_622"))
+need(nrow(motif) == 2L, "The two Step 08L WT motif results are missing.")
+write_csv(motif, file.path(OUT,
+  "03_existing_08L_WT_matched_neutral_motif_summary.csv"))
+print(dplyr::bind_rows(status)); print(motif)
+writeLines(c("08Q WT program ORA complete.",
+  "This tests WT direction candidate peak genes versus all 2028 evaluable WT gate peaks.",
+  "It does not test PPAR/IL17 loss or genotype-by-diet interaction.",
+  "Step 08L already tested WT direction peak motifs versus matched WT neutral peaks."),
+  file.path(OUT, "STEP_08Q_COMPLETE.txt"))
+```

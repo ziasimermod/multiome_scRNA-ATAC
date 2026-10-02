@@ -1,0 +1,351 @@
+---
+title: "Step 08H | WT ISC-enriched candidate regions and sex-marker audit"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This follows the completed Step 08G. C0 is the **broader ISC-enriched crypt
+state** defined by the independent focused clustering and 05F marker review.
+C0/W0 top 15% is a **prespecified marker-enriched sensitivity population**:
+the six-gene UCell score ranks C0 nuclei within W0 over both diets together.
+The score was set before evaluating these ATAC peaks. Neither the four
+gene sensitivity score nor Gourab's programs selects nuclei or peaks here.
+Neither group is a purified ISC population. C2 remains a separate crypt
+progenitor comparison; W6 and W8 are not silently pooled with C0.
+
+Step 08G has one pooled WT library per diet. All output is descriptive:
+"clear effect" is the prior count/detection and absolute log2FC threshold,
+not a statistically significant DAR. Retaining an effect in nested groups
+uses overlapping nuclei and does not provide independent validation.
+
+This notebook preserves **every one of the 622** Step 08G top-15 clear
+peaks with evidence fields. The 37 with a same-direction clear effect in C0
+overall form the focused review list. Six of those also have a same-direction
+clear effect at top 10%. A count-support flag (at least 40 pooled fragments
+in top 15%, with at least 10 in each diet) is a sensitivity view, not an
+optimized discovery cutoff. The 20% and 25% effects are reported as
+continuous values and separate threshold flags. No RNA or nearest-gene
+behavior decides which peak enters the list.
+
+`Xist` and Y-linked transcript detection are **imperfect sex proxies** in
+sparse snRNA. The notebook audits composition and conditionally recalculates
+candidate ATAC effects within Xist-detected and Xist-undetected nuclei when
+both diets have at least 30 nuclei. An Xist-undetected nucleus is not
+necessarily male. These analyses do not recover individual mouse identities
+or remove pooled-library sex confounding. Sex and depth findings should be
+reviewed before treating the focused peak list as ready for a genotype
+comparison.
+
+Run interactively from the repository root in the same R 4.4 environment as
+08G. Step 08G outputs are not modified. All coordinates use the Step 03
+GRCm39 common peak intervals; compare the **exact intervals and same
+directional effect definition** in PPAR and IL17 after independently
+adjudicating their ISC-like states. No genotype interaction test is possible
+from one pooled library per diet per cohort.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Open the repository root before running 08H.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(HELPER)) HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(HELPER)) stop("Missing WT crypt follow-up helper.")
+source(HELPER)
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+     "08H expects the WT v2_resequenced cohort.")
+STEP5E <- file.path(OUTPUT_DIR, "05_wnn", "focused_wt_crypt_stem_progenitor")
+STEP8G <- file.path(OUTPUT_DIR, "08g_C0_C2_and_C0W0_ISC")
+OBJECT <- file.path(STEP5E, "objects", "WT_crypt_core_0_6_8_focused.rds")
+CELLS <- file.path(STEP8G, "02_all_nuclei_fixed_labels_and_C0W0_gates.csv.gz")
+PEAKS <- file.path(STEP8G, "06_C0W0_top15_candidates_with_depth_check.csv.gz")
+OUT <- file.path(OUTPUT_DIR, "08h_wt_ISC_region_freeze_sex_audit")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+inputs <- c(OBJECT, CELLS, PEAKS, SAMPLE_SHEET_PATH,
+  file.path(STEP8G, "STEP_08G_COMPLETE.txt"))
+for (path in inputs) need(file.exists(path), paste("Missing input:", path))
+capture_manifest(inputs, OUT)
+```
+
+## 1. Validate cells, assays, and recorded diet balance
+
+```{r load-and-validate}
+focused <- load_focused(OBJECT)
+obj <- focused$object
+rna <- focused$matrices$RNA_counts
+atac <- focused$matrices$ATAC_counts
+meta <- focused$metadata
+recorded <- read_csv_checked(CELLS)
+require_columns(recorded, c("cell_barcode", "diet", "parent_wnn_cluster",
+  "focused_cluster", "ISC_core6_UCell", "ISC_core_genes_detected",
+  "C0W0_top15", "C0W0_top10", "C0W0_top20", "C0W0_top25"),
+  "08G nucleus table")
+need(!anyDuplicated(recorded$cell_barcode) &&
+     setequal(meta$cell_barcode, recorded$cell_barcode),
+     "Step 08G nuclei differ from the saved focused object.")
+recorded <- recorded[match(meta$cell_barcode, recorded$cell_barcode), ]
+need(identical(meta$cell_barcode, recorded$cell_barcode) &&
+     identical(meta$cell_barcode, colnames(rna)) &&
+     identical(meta$cell_barcode, colnames(atac)) &&
+     identical(meta$diet, recorded$diet) &&
+     identical(meta$focused_cluster, as.character(recorded$focused_cluster)) &&
+     identical(meta$parent_wnn_cluster,
+       as.character(recorded$parent_wnn_cluster)),
+     "Focused metadata, 08G gates and matrices are not aligned.")
+for (field in c("ISC_core6_UCell", "ISC_core_genes_detected",
+                "C0W0_top15", "C0W0_top10", "C0W0_top20", "C0W0_top25"))
+  meta[[field]] <- recorded[[field]]
+need(all(meta$C0W0_top10 <= meta$C0W0_top15) &&
+     all(meta$C0W0_top15 <= meta$C0W0_top20) &&
+     all(meta$C0W0_top20 <= meta$C0W0_top25) &&
+     all(meta$focused_cluster[meta$C0W0_top15] == "0") &&
+     all(meta$parent_wnn_cluster[meta$C0W0_top15] == "0"),
+     "Recorded score gates are not nested C0/W0 sets.")
+sample_sheet <- read_csv_checked(SAMPLE_SHEET_PATH)
+require_columns(sample_sheet, c("cohort_id", "sample_id", "diet",
+  "mice_pooled", "female_mice", "male_mice"), "v2 sample sheet")
+wt_samples <- dplyr::filter(sample_sheet, cohort_id == "wt") |>
+  dplyr::select(sample_id, diet, mice_pooled, female_mice, male_mice)
+need(nrow(wt_samples) == 2L &&
+     setequal(wt_samples$sample_id, unique(meta$sample_id)) &&
+     all(wt_samples$mice_pooled == wt_samples$female_mice +
+       wt_samples$male_mice), "WT pooled sample records changed.")
+write_table(wt_samples, OUT, "00_WT_pooled_mouse_sex_composition.csv")
+write_table(focused$alignment, OUT, "00_matrix_alignment.csv")
+```
+
+## 2. Audit sex-linked transcript detection, composition, and depth
+
+Do not classify Xist-negative nuclei as male. A Y-transcript-positive
+nucleus is suggestive, but non-detection is common in sparse snRNA.
+
+```{r sex-proxy-audit}
+need("Xist" %in% rownames(rna), "Xist absent from focused RNA assay.")
+y_genes <- intersect(c("Uty", "Ddx3y", "Eif2s3y", "Kdm5d"), rownames(rna))
+need(length(y_genes) > 0L, "None of the four prespecified Y genes is in RNA.")
+meta$Xist_counts <- as.numeric(rna["Xist", meta$cell_barcode])
+meta$Y_genes_detected <- as.integer(Matrix::colSums(
+  rna[y_genes, meta$cell_barcode, drop = FALSE] > 0))
+meta$Xist_detected <- meta$Xist_counts > 0
+meta$Y_any_detected <- meta$Y_genes_detected > 0
+meta$sex_proxy_status <- dplyr::case_when(
+  meta$Xist_detected & !meta$Y_any_detected ~ "Xist_only",
+  !meta$Xist_detected & meta$Y_any_detected ~ "Y_only",
+  meta$Xist_detected & meta$Y_any_detected ~ "both_detected",
+  TRUE ~ "neither_detected")
+groups <- list(C0_all = meta$focused_cluster == "0",
+  C2_all = meta$focused_cluster == "2",
+  C0_C2_proxy = meta$focused_cluster %in% c("0", "2"),
+  C0W0_all = meta$focused_cluster == "0" & meta$parent_wnn_cluster == "0",
+  C0W0_top15 = meta$C0W0_top15, C0W0_top10 = meta$C0W0_top10,
+  C0W0_top20 = meta$C0W0_top20, C0W0_top25 = meta$C0W0_top25)
+sex_audit <- dplyr::bind_rows(lapply(names(groups), function(key) {
+  meta[groups[[key]], , drop = FALSE] |>
+    dplyr::group_by(diet) |>
+    dplyr::summarise(group = key, nuclei = dplyr::n(),
+      Xist_positive = sum(Xist_detected),
+      Xist_positive_percent = 100 * mean(Xist_detected),
+      Y_positive = sum(Y_any_detected),
+      Y_positive_percent = 100 * mean(Y_any_detected),
+      both_detected = sum(sex_proxy_status == "both_detected"),
+      neither_detected = sum(sex_proxy_status == "neither_detected"),
+      median_RNA_features = median(nFeature_RNA),
+      median_RNA_counts = median(nCount_RNA),
+      median_ATAC_counts = median(nCount_ATAC),
+      median_ISC_score = median(ISC_core6_UCell), .groups = "drop")
+}))
+write_table(sex_audit, OUT, "01_sex_marker_and_depth_balance_by_group_diet.csv")
+sex_strata <- dplyr::bind_rows(lapply(names(groups), function(key) {
+  meta[groups[[key]], , drop = FALSE] |>
+    dplyr::count(diet, sex_proxy_status, name = "nuclei") |>
+    dplyr::mutate(group = key, .before = 1)
+}))
+write_table(sex_strata, OUT, "01_sex_marker_proxy_strata_by_group_diet.csv")
+write_table(meta |>
+  dplyr::select(cell_barcode, sample_id, diet, focused_cluster,
+    parent_wnn_cluster, ISC_core6_UCell, ISC_core_genes_detected,
+    Xist_counts, Xist_detected, Y_genes_detected, Y_any_detected,
+    sex_proxy_status, nFeature_RNA, nCount_RNA, nCount_ATAC,
+    dplyr::starts_with("C0W0_top")), OUT,
+  "01_nucleus_level_sex_proxy_and_gate_audit.csv.gz")
+p_sex <- ggplot2::ggplot(sex_audit,
+  ggplot2::aes(x = group, y = Xist_positive_percent, fill = diet)) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = .8)) +
+  ggplot2::scale_fill_manual(values = c(CON = "#E69F00", HFD = "#56B4E9")) +
+  ggplot2::coord_flip() + ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "Xist transcript detection across the fixed WT groups",
+    subtitle = "A detection audit, not per-mouse sex assignment or a corrected diet effect",
+    x = NULL, y = "Nuclei with Xist detected (%)")
+save_vector_plot(p_sex, PLOTS, "01_Xist_detection_by_group_diet.pdf", 11, 7)
+```
+
+## 3. Freeze every peak and retain transparent support flags
+
+The complete peak list remains available. `C0_supported` is the descriptive
+subset for inspection; `count_supported_40` and `nested_top10` are flags,
+not replacements for full count and continuous effect values. All BEDs use
+0-based starts and 1-based ends from the canonical peak GRanges.
+
+```{r freeze-candidates}
+candidate <- read_csv_checked(PEAKS)
+require_columns(candidate, c("feature", "anchor_clear_effect", "anchor_evaluable",
+  "anchor_CON_counts", "anchor_HFD_counts", "anchor_CON_percent",
+  "anchor_HFD_percent", "anchor_log2FC_HFD_vs_CON", "C0_same",
+  "C2_same", "top10_same", "C0_all_log2FC_HFD_vs_CON",
+  "C0W0_top20_evaluable", "C0W0_top20_clear_effect",
+  "C0W0_top20_log2FC_HFD_vs_CON", "C0W0_top25_evaluable",
+  "C0W0_top25_clear_effect", "C0W0_top25_log2FC_HFD_vs_CON"),
+  "08G top-15 ATAC candidate table")
+need(!anyDuplicated(candidate$feature) &&
+     all(candidate$anchor_evaluable & candidate$anchor_clear_effect) &&
+     identical(nrow(candidate), 622L),
+     "08G top-15 candidate set changed; inspect the new run before reusing this release.")
+peak_ranges <- GenomicRanges::granges(obj[["ATAC.crypt"]])
+need(identical(rownames(atac), rownames(obj[["ATAC.crypt"]])) &&
+     length(peak_ranges) == nrow(atac) &&
+     all(candidate$feature %in% rownames(atac)),
+     "Candidate peaks do not align to the same GRCm39 consensus ranges.")
+names(peak_ranges) <- rownames(atac)
+selected_ranges <- peak_ranges[match(candidate$feature, names(peak_ranges))]
+candidate$chrom <- as.character(GenomicRanges::seqnames(selected_ranges))
+candidate$start_1based <- as.integer(BiocGenerics::start(selected_ranges))
+candidate$end_1based <- as.integer(BiocGenerics::end(selected_ranges))
+candidate$start_0based_bed <- candidate$start_1based - 1L
+candidate$anchor_total_counts <- candidate$anchor_CON_counts +
+  candidate$anchor_HFD_counts
+candidate$count_supported_40 <- candidate$anchor_total_counts >= 40L &
+  pmin(candidate$anchor_CON_counts, candidate$anchor_HFD_counts) >= 10L
+candidate$C0_supported <- candidate$C0_same
+candidate$nested_top10 <- candidate$C0_supported & candidate$top10_same
+same_effect <- function(clear, effect, anchor) {
+  dplyr::coalesce(clear & sign(effect) == sign(anchor), FALSE)
+}
+candidate$top20_clear_same <- same_effect(
+  candidate$C0W0_top20_clear_effect,
+  candidate$C0W0_top20_log2FC_HFD_vs_CON,
+  candidate$anchor_log2FC_HFD_vs_CON)
+candidate$top25_clear_same <- same_effect(
+  candidate$C0W0_top25_clear_effect,
+  candidate$C0W0_top25_log2FC_HFD_vs_CON,
+  candidate$anchor_log2FC_HFD_vs_CON)
+write_table(candidate, OUT, "02_all_622_top15_ATAC_peaks_with_evidence_flags.csv.gz")
+focused_candidates <- candidate |>
+  dplyr::filter(C0_supported) |>
+  dplyr::arrange(dplyr::desc(nested_top10),
+    dplyr::desc(count_supported_40),
+    dplyr::desc(anchor_total_counts), feature)
+need(nrow(focused_candidates) == 37L &&
+     sum(focused_candidates$nested_top10) == 6L,
+     "Expected C0-supported and nested-region counts changed.")
+write_table(focused_candidates, OUT,
+  "02_C0_supported_37_peak_candidates_full_evidence.csv")
+write_table(dplyr::filter(focused_candidates, count_supported_40), OUT,
+  "02_higher_count_C0_supported_sensitivity.csv")
+write_table(dplyr::filter(focused_candidates, nested_top10), OUT,
+  "02_six_nested_C0_and_top10_HFD_open_peaks.csv")
+write_bed <- function(x, filename) {
+  readr::write_tsv(dplyr::transmute(x, chrom, start_0based_bed,
+    end_1based, feature), file.path(OUT, filename), col_names = FALSE)
+}
+write_bed(focused_candidates, "02_C0_supported_37_GRCm39.bed")
+write_bed(dplyr::filter(focused_candidates, count_supported_40),
+  "02_higher_count_C0_supported_GRCm39.bed")
+write_table(tibble(list_name = c("C0_supported", "count_supported_40",
+  "nested_top10", "top20_clear_same", "top25_clear_same"),
+  n_of_37 = c(nrow(focused_candidates),
+    sum(focused_candidates$count_supported_40),
+    sum(focused_candidates$nested_top10),
+    sum(focused_candidates$top20_clear_same),
+    sum(focused_candidates$top25_clear_same))), OUT,
+  "02_candidate_support_summary.csv")
+```
+
+## 4. Xist detection strata as a bounded sensitivity analysis
+
+Evaluate the 37 regions in the same C0 and top-15 group separately among
+Xist-detected versus Xist-undetected nuclei only when both diets have at
+least 30 nuclei. The results are a sensitivity diagnostic: Xist-undetected
+is a mixture of male and female nuclei, and these groups are neither
+independent libraries nor proper biological replicates.
+
+```{r Xist-stratum-peak-audit}
+depth <- Matrix::colSums(atac)
+sex_effects <- list()
+sex_stratum_eligibility <- list()
+for (key in c("C0_all", "C0W0_top15")) {
+  for (status in c("Xist_detected", "Xist_undetected")) {
+    ix <- which(groups[[key]] & meta$Xist_detected ==
+      identical(status, "Xist_detected"))
+    n_con <- sum(meta$diet[ix] == "CON")
+    n_hfd <- sum(meta$diet[ix] == "HFD")
+    eligible <- n_con >= 30L && n_hfd >= 30L
+    sex_stratum_eligibility[[length(sex_stratum_eligibility) + 1L]] <-
+      tibble(group = key, Xist_status = status, n_CON = n_con,
+        n_HFD = n_hfd, eligible = eligible)
+    if (eligible) {
+      sex_effects[[length(sex_effects) + 1L]] <- pooled_effect(
+        atac, meta, ix, "ATAC", features = focused_candidates$feature,
+        total_depth = depth) |>
+        dplyr::mutate(group = key, Xist_status = status, .before = 1)
+    }
+  }
+}
+write_table(dplyr::bind_rows(sex_stratum_eligibility), OUT,
+  "03_Xist_stratum_eligibility.csv")
+sex_effects <- dplyr::bind_rows(sex_effects)
+write_table(sex_effects, OUT,
+  "03_C0_supported_region_effects_by_Xist_detection.csv")
+if (nrow(sex_effects)) {
+  sex_summary <- sex_effects |>
+    dplyr::left_join(dplyr::select(focused_candidates, feature,
+      anchor_log2FC_HFD_vs_CON), by = "feature", relationship = "many-to-one") |>
+    dplyr::group_by(group, Xist_status) |>
+    dplyr::summarise(region_n = dplyr::n(),
+      evaluable_n = sum(evaluable),
+      evaluable_same_direction = sum(evaluable &
+        sign(log2FC_HFD_vs_CON) == sign(anchor_log2FC_HFD_vs_CON)),
+      clear_same_direction = sum(clear_effect &
+        sign(log2FC_HFD_vs_CON) == sign(anchor_log2FC_HFD_vs_CON)),
+      .groups = "drop")
+  write_table(sex_summary, OUT, "03_Xist_stratum_peak_summary.csv")
+}
+```
+
+## 5. Handoff rules for an exact-interval genotype comparison
+
+Use the same Step 03 GRCm39 common peak coordinates in WT, PPAR, and IL17.
+Do not map cluster numbers across cohorts. For each other cohort, first
+adjudicate an ISC-like state using its own marker, cycling, and secretory
+context; independently score the same ISC signature and audit CON/HFD
+membership. Then quantify **all 37 frozen WT intervals**, plus the 622
+top-15 peaks as a broader view, on that cohort's unmodified common-peak
+counts. Show each cohort's CON/HFD nucleus counts, peak counts, detection,
+pooled CPM, and HFD-versus-CON effect, with missing evaluability explicit.
+Compare directional effect vectors and exposure of the same exact intervals;
+do not test a genotype-by-diet interaction with these pooled libraries.
+Check the genotype-specific sex/proxy and depth balance before interpreting
+different directions. A peak absent from a filtered assay is *missing*, not
+a zero accessibility effect.
+
+```{r finish}
+finish_run(OUT, "STEP_08H_COMPLETE.txt", c(
+  "C0 overall remains the broader ISC-enriched population; C0/W0 top15 is the marker-enriched sensitivity view.",
+  "All 622 top15 clear peaks retained; 37 C0-supported and six nested-top10 flags exported without using nearby RNA.",
+  "Xist/Y transcript detection and depth audited; stratum effects are sensitivity only, not mouse-adjusted inference.",
+  "Exact canonical GRCm39 peak BEDs exported for later PPAR and IL17 comparison.",
+  "One pooled WT library per diet: no significant DARs or genotype-by-diet inference.",
+  paste("Results:", OUT)))
+```

@@ -15,29 +15,16 @@ Each Cell Ranger library contains colon epithelial cells pooled from multiple mi
 
 Cell-level and cluster-level differences can be explored descriptively, but nuclei are **not** independent biological replicates for diet-level inference. This workflow does not treat cell-level P values as replicated evidence for HFD-versus-CON effects.
 
-## Why the workflow is split into steps
+## Teaching workflow and reference provenance
 
-Each numbered notebook has one job, reads documented inputs or completed checkpoints, and writes a new checkpoint. A later step can therefore be repeated without rerunning every expensive calculation.
+Start with [Yesenia's handoff guide](docs/YESENIA_HANDOFF.md).
+The main independent workflow is analysis/00-07, followed by the whole-WNN-cluster
+07D companion. 05B and the Gourab/refinement/trajectory/08-series notebooks are
+optional analyses with their own prerequisites. Presentation figures are support
+outputs and do not define an analysis step 09.
 
-| Step | Notebook | Main purpose | Current status |
-|---:|---|---|---|
-| 0 | `analysis/00_environment_and_inputs.Rmd` | Validate R, packages, sample metadata, reference annotation, and Cell Ranger ARC inputs | Ready |
-| 1 | `analysis/01_import_and_calculate_qc.Rmd` | Import each library separately and calculate RNA/ATAC QC plus doublet scores | Ready |
-| 2 | `analysis/02_review_qc_and_filter.Rmd` | Review QC distributions, record thresholds, and make one joint keep/remove decision per paired barcode | Ready |
-| 3 | `analysis/03_build_common_atac_peak_set.Rmd` | Build a common GRCm39 ATAC peak space and requantify post-QC nuclei | Ready |
-| 4 | `analysis/04_merge_and_reduce_dimensions.Rmd` | Merge libraries, perform RNA log-normalization/PCA and ATAC TF-IDF/LSI, and inspect modality-specific structure | Ready |
-| 5 | `analysis/05_build_wnn_and_evaluate_clusters.Rmd` | Construct the WNN graph, compare clustering resolutions, and select a reviewed working resolution | Ready; added offshoot workflow for IL17 |
-| 6 | `analysis/06_annotate_mouse_colon_cell_states.Rmd` | Assign and document mouse-colon epithelial cell states using RNA and ATAC evidence | Ready |
-| 7 | `analysis/07_analyze_within_cohort_diet_response.Rmd` | Describe composition and within-state RNA/ATAC effects without treating nuclei as biological replicates | WT benchmark complete |
-| 7B | `analysis/07b_model_wt_epithelial_trajectories.Rmd` | Audit d21 lineage fidelity, require manual root approval, and fit exploratory WT RNA trajectories | WT trajectory modeling complete |
-| 7C | `analysis/07c_prioritize_wt_diet_response_candidates.Rmd` | Integrate RNA and ATAC effect sizes, balanced-sampling stability, multimodal concordance, and trajectory context into reviewable WT candidate lists | WT candidate prioritization complete |
-
-PPAR, WT, and IL17 are complete through Step 6. The WT cohort is complete
-through Step 7C and provides the first descriptive diet-response benchmark,
-approved epithelial trajectory models, and prioritized RNA/ATAC candidate
-lists. Steps 00-07 use shared code, but clustering and annotation decisions are
-stored separately for every dataset/cohort combination. Steps 7B and 7C are
-currently WT-specific. Cluster numbers are never transferred between cohorts.
+Code/configuration presence is verified by cleanup. Analysis execution status must
+be checked from the saved run records, not inferred from a filename or this README.
 
 ## The short answer to "Is Multiome QC separate or together?"
 

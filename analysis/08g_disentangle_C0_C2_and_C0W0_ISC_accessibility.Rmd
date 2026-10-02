@@ -1,0 +1,689 @@
+---
+title: "Step 08G | Separate crypt states and score-defined C0/W0 ISC nuclei"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This notebook follows the completed WT Step 08F review. The prior
+W0+W6+W8 union was compositionally uneven: W8 supplied 100 CON and 19 HFD nuclei at the 15% gate, while the W6 gate usually detected only one of the six ISC markers. It must not be interpreted as one high-confidence stem population. The same consensus ATAC peaks and Step 08E pooled-effect function are retained throughout this follow-up.
+
+**Prespecified groups:** C0 alone, C2 alone, C0+C2 (the broad Gourab proxy),
+all C0 nuclei from W0, and score-ranked C0/W0 nuclei at 15% and 10%.
+The C0/W0 5%, 20%, and 25% gates are sensitivity views. Ranking is within
+C0/W0 over both diets together. W6/C2 and W8/C3+C5 are *separate context
+comparators*, never pooled into the selected ISC arm. Fixed 05F labels are
+carried forward; no object or global annotation is modified.
+
+**Score diagnostic:** the original Step 08F six-gene UCell score (`Lgr5`,
+`Ascl2`, `Smoc2`, `Axin2`, `Lrig1`, `Rnf43`) remains the primary rank.
+The observed four-gene set (`Lgr5`, `Smoc2`, `Lrig1`, `Rnf43`) is scored at
+maxRank 400 and 600 **only as a sensitivity**. This lets us see whether
+undetected/rare members or rank cap change membership, without choosing a
+signature after looking at ATAC effects. `Olfm4` is not a distal-colon gate
+member and its absent detection in 08F is expected.
+
+**Statistical scope:** one pooled CON and one pooled HFD library. Results are
+descriptive diet-associated effects; nuclei are not mouse replicates. Do
+not call the candidate peaks significant DARs, report FDR, infer causation
+from a promoter overlap, or use the post hoc source-gene program to choose
+nuclei. Peak-set files are review inputs for a later, matched-background
+motif analysis, not motif enrichment results.
+
+Run interactively from the repository root on SOL in the WT R 4.4.2 session
+after Step 08F completed. This creates a new `08g_*` result directory and
+leaves Step 08E/08F outputs intact.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+                      fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Open the project root before running 08G.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) stop("Missing shared WT crypt helper.")
+source(FOLLOWUP_HELPER)
+if (!requireNamespace("UCell", quietly = TRUE))
+  stop("Install UCell in the active R 4.4 library before 08G.")
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges); library(patchwork)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+     "08G requires WT v2_resequenced.")
+set.seed(8139)
+MIN_PER_DIET <- 30L
+PRIMARY_GATES <- c(top15 = .15, top10 = .10)
+SENSITIVITY_GATES <- c(top05 = .05, top20 = .20, top25 = .25)
+GATES <- c(PRIMARY_GATES, SENSITIVITY_GATES)
+UCELL_MAX_RANK <- 400L
+UCELL_SENS_RANK <- 600L
+N_DRAWS <- 20L
+RUN_COVERAGE <- TRUE
+MAX_COVERAGE_LOCI <- 4L
+```
+
+## 1. Inputs, barcode alignment, and fixed labels
+
+```{r inputs}
+STEP5E <- file.path(OUTPUT_DIR, "05_wnn", "focused_wt_crypt_stem_progenitor")
+STEP5F <- file.path(OUTPUT_DIR, "05_wnn", FOLLOWUP_RELEASE, "05f_review")
+STEP8F <- file.path(OUTPUT_DIR, "08f_isc_ucell_wt_crypt")
+OBJECT <- file.path(STEP5E, "objects", "WT_crypt_core_0_6_8_focused.rds")
+ANNOTATED <- file.path(OUTPUT_DIR, "06_annotation", "multiome_annotated.rds")
+DECISION <- file.path(STEP5F, "refined_working_labels.csv")
+SCORES_08F <- file.path(STEP8F, "01_scores_and_preserved_annotations.csv.gz")
+SOURCE_GENES <- file.path(STEP8F, "08_Gourab_gene_assay_audit.csv")
+OUT <- file.path(OUTPUT_DIR, "08g_C0_C2_and_C0W0_ISC")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+inputs <- c(OBJECT, ANNOTATED, DECISION, SCORES_08F, SOURCE_GENES,
+  file.path(STEP5F, "STEP_05F_COMPLETE.txt"),
+  file.path(STEP8F, "STEP_08F_COMPLETE.txt"))
+for (p in inputs) need(file.exists(p), paste("Missing required input:", p))
+capture_manifest(inputs, OUT)
+map <- read_csv_checked(DECISION) |>
+  dplyr::mutate(focused_cluster = as.character(focused_cluster))
+require_columns(map, c("focused_cluster", "working_label", "analysis_unit",
+  "focused_annotation_confidence", "label_status",
+  "approved_for_global_annotation"), "Step 05F map")
+need(setequal(map$focused_cluster, as.character(0:5)) &&
+     !anyDuplicated(map$focused_cluster) &&
+     all(map$label_status == "provisional_working") &&
+     !any(map$approved_for_global_annotation), "Step 05F labels changed.")
+focused <- load_focused(OBJECT)
+obj <- focused$object
+rna <- focused$matrices$RNA_counts
+rna_data <- focused$matrices$RNA_data
+atac <- focused$matrices$ATAC_counts
+meta <- focused$metadata |>
+  dplyr::rename(parent_annotation_confidence = annotation_confidence) |>
+  dplyr::left_join(map, by = "focused_cluster", relationship = "many-to-one")
+need(identical(meta$cell_barcode, colnames(rna)) &&
+     identical(meta$cell_barcode, colnames(atac)) &&
+     identical(meta$cell_barcode, colnames(rna_data)) &&
+     !anyNA(meta$working_label), "Focused assays/labels are misaligned.")
+score_input <- read_csv_checked(SCORES_08F)
+require_columns(score_input, c("cell_barcode", "ISC_core6_UCell",
+  "ISC_core6_maxRank600", "ISC_core_genes_detected"), "08F score table")
+need(!anyDuplicated(score_input$cell_barcode) &&
+     setequal(score_input$cell_barcode, meta$cell_barcode),
+     "08F score table and focused assay have different barcodes.")
+score_input <- score_input[match(meta$cell_barcode, score_input$cell_barcode), ]
+need(identical(meta$cell_barcode, score_input$cell_barcode),
+     "Could not order the Step 08F scores.")
+meta$ISC_core6_UCell <- score_input$ISC_core6_UCell
+meta$ISC_core6_rank600 <- score_input$ISC_core6_maxRank600
+meta$ISC_core_genes_detected <- score_input$ISC_core_genes_detected
+need(all(is.finite(meta$ISC_core6_UCell)) &&
+     setequal(unique(meta$diet), c("CON", "HFD")), "Missing score or diet.")
+write_table(focused$alignment, OUT, "00_matrix_alignment.csv")
+```
+
+## 2. Explain score scale and audit detected genes
+
+The UCell score is a normalized rank statistic. With six positive genes and
+`maxRank=400`, a nucleus with just one gene ranked first and all other genes
+beyond the cap has an idealized score of about 0.168; two genes ranked first
+and second give about 0.335. Detection of one or two of six genes therefore
+leaves little room for a large value. The small list is not itself a defect;
+the low *observed* detection and rank cap determine the scale here. These
+idealized values are explanatory bounds, not thresholds for calling ISCs.
+
+```{r score-diagnostic}
+CORE6 <- c("Lgr5", "Ascl2", "Smoc2", "Axin2", "Lrig1", "Rnf43")
+DETECTED4 <- c("Lgr5", "Smoc2", "Lrig1", "Rnf43")
+need(all(CORE6 %in% rownames(rna)),
+     "A prespecified ISC marker is missing from the RNA assay.")
+score4 <- UCell::ScoreSignatures_UCell(rna,
+  features = list(ISC_detected4 = DETECTED4), maxRank = UCELL_MAX_RANK)
+score4_600 <- UCell::ScoreSignatures_UCell(rna,
+  features = list(ISC_detected4 = DETECTED4), maxRank = UCELL_SENS_RANK)
+need(setequal(rownames(score4), meta$cell_barcode) &&
+     setequal(rownames(score4_600), meta$cell_barcode) &&
+     "ISC_detected4_UCell" %in% colnames(score4) &&
+     "ISC_detected4_UCell" %in% colnames(score4_600),
+     "Unexpected four-gene UCell output shape/names.")
+meta$ISC_detected4_UCell <- score4[meta$cell_barcode, "ISC_detected4_UCell"]
+meta$ISC_detected4_rank600 <- score4_600[meta$cell_barcode, "ISC_detected4_UCell"]
+meta$ISC_detected4_genes_detected <- Matrix::colSums(
+  rna[DETECTED4, , drop = FALSE] > 0)
+meta$ISC_core_genes_detected_recount <- Matrix::colSums(
+  rna[CORE6, , drop = FALSE] > 0)
+need(identical(as.numeric(meta$ISC_core_genes_detected),
+               as.numeric(meta$ISC_core_genes_detected_recount)),
+     "08F six-gene detection counts differ from reloaded RNA counts.")
+ideal_score <- function(k, n, cap) {
+  rank_sum <- k * (k + 1) / 2 + (n - k) * cap
+  1 - (rank_sum - n * (n + 1) / 2) / (n * cap - n * (n + 1) / 2)
+}
+write_table(tibble(detected_genes = 0:6, signature_size = 6L,
+  maxRank = UCELL_MAX_RANK,
+  idealized_score_if_detected_genes_rank_first =
+    ideal_score(0:6, 6, UCELL_MAX_RANK)), OUT,
+  "01_UCell_score_scale_explanation.csv")
+marker_detection <- dplyr::bind_rows(lapply(CORE6, function(g) {
+  detected <- as.numeric(rna[g, meta$cell_barcode]) > 0
+  meta |>
+    dplyr::mutate(marker_detected = .env$detected) |>
+    dplyr::group_by(parent_wnn_cluster, focused_cluster, diet) |>
+    dplyr::summarise(gene = g, nuclei = dplyr::n(),
+      detected_n = sum(marker_detected), detected_percent = 100 * mean(marker_detected),
+      .groups = "drop")
+}))
+write_table(marker_detection, OUT, "01_core_marker_detection_by_state_diet.csv")
+score_audit <- meta |>
+  dplyr::group_by(parent_wnn_cluster, focused_cluster, diet,
+    ISC_core_genes_detected) |>
+  dplyr::summarise(nuclei = dplyr::n(),
+    median_core6 = median(ISC_core6_UCell),
+    median_detected4 = median(ISC_detected4_UCell),
+    median_RNA_features = median(nFeature_RNA), .groups = "drop")
+write_table(score_audit, OUT, "01_score_by_detected_genes_and_state.csv")
+p_score <- ggplot2::ggplot(meta, ggplot2::aes(
+  x = ISC_core_genes_detected, y = ISC_core6_UCell, color = diet)) +
+  ggplot2::geom_jitter(width = .15, height = 0, alpha = .22, size = .4) +
+  ggplot2::facet_grid(~parent_wnn_cluster) +
+  ggplot2::scale_color_manual(values = c(CON = "#E69F00", HFD = "#56B4E9")) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "Low UCell scores track sparse ISC marker detection",
+    x = "Six-gene signature members detected per nucleus",
+    y = "Step 08F six-gene UCell score")
+save_vector_plot(p_score, PLOTS, "01_score_vs_detected_ISC_genes.pdf", 12, 6)
+```
+
+## 3. Select only within C0/W0; preserve all 05F identities
+
+No diet or ATAC information enters the ranking. Gate percentages are computed
+over all C0/W0 nuclei together, not separately for CON and HFD. The four-gene
+and rank-600 scores never determine primary group membership.
+
+```{r C0W0-gates}
+base_ix <- which(meta$focused_cluster == "0" & meta$parent_wnn_cluster == "0")
+need(length(base_ix) > 100L && all(c("CON", "HFD") %in% meta$diet[base_ix]),
+     "The expected C0/W0 source group is absent.")
+ranked <- base_ix[order(-meta$ISC_core6_UCell[base_ix],
+                        meta$cell_barcode[base_ix])]
+meta$C0W0_rank <- NA_integer_
+meta$C0W0_rank[ranked] <- seq_along(ranked)
+ranked4 <- base_ix[order(-meta$ISC_detected4_UCell[base_ix],
+                         meta$cell_barcode[base_ix])]
+ranked600 <- base_ix[order(-meta$ISC_core6_rank600[base_ix],
+                           meta$cell_barcode[base_ix])]
+for (g in names(GATES)) {
+  target <- ceiling(GATES[[g]] * length(base_ix))
+  meta[[paste0("C0W0_", g)]] <- !is.na(meta$C0W0_rank) &
+    meta$C0W0_rank <= target & meta$ISC_core6_UCell > 0
+}
+need(all(!meta$C0W0_top05 | meta$C0W0_top10) &&
+     all(!meta$C0W0_top10 | meta$C0W0_top15) &&
+     all(!meta$C0W0_top15 | meta$C0W0_top20) &&
+     all(!meta$C0W0_top20 | meta$C0W0_top25),
+     "C0/W0 gates must be nested.")
+gate_audit <- dplyr::bind_rows(lapply(names(GATES), function(g) {
+  flag <- meta[[paste0("C0W0_", g)]]
+  sensitivity4 <- seq_along(meta$cell_barcode) %in%
+    ranked4[seq_len(ceiling(GATES[[g]] * length(base_ix)))]
+  sensitivity600 <- seq_along(meta$cell_barcode) %in%
+    ranked600[seq_len(ceiling(GATES[[g]] * length(base_ix)))]
+  tibble(gate = g, target_n = ceiling(GATES[[g]] * length(base_ix)),
+    selected_n = sum(flag), CON_n = sum(flag & meta$diet == "CON"),
+    HFD_n = sum(flag & meta$diet == "HFD"),
+    minimum_primary_score = if (any(flag)) min(meta$ISC_core6_UCell[flag]) else NA_real_,
+    median_detected_six = if (any(flag)) median(meta$ISC_core_genes_detected[flag]) else NA_real_,
+    overlap_detected4 = sum(flag & sensitivity4),
+    overlap_rank600 = sum(flag & sensitivity600),
+    jaccard_detected4 = sum(flag & sensitivity4) /
+      sum(flag | sensitivity4),
+    jaccard_rank600 = sum(flag & sensitivity600) /
+      sum(flag | sensitivity600))
+}))
+write_table(gate_audit, OUT, "02_C0W0_gate_size_and_score_sensitivity.csv")
+write_table(meta |>
+  dplyr::select(cell_barcode, sample_id, diet, parent_wnn_cluster,
+    focused_cluster, working_label, parent_annotation_confidence,
+    focused_annotation_confidence, Phase, nFeature_RNA, nCount_RNA,
+    nCount_ATAC, ISC_core6_UCell, ISC_core6_rank600,
+    ISC_detected4_UCell, ISC_detected4_rank600,
+    ISC_core_genes_detected, ISC_detected4_genes_detected, C0W0_rank,
+    dplyr::starts_with("C0W0_top")), OUT,
+  "02_all_nuclei_fixed_labels_and_C0W0_gates.csv.gz")
+gate_identity <- dplyr::bind_rows(lapply(names(GATES), function(g) {
+  meta[meta[[paste0("C0W0_", g)]], , drop = FALSE] |>
+    dplyr::group_by(diet) |>
+    dplyr::summarise(gate = g, nuclei = dplyr::n(),
+      median_six_score = median(ISC_core6_UCell),
+      median_detected4_score = median(ISC_detected4_UCell),
+      median_six_genes_detected = median(ISC_core_genes_detected),
+      median_ATAC_counts = median(nCount_ATAC),
+      median_RNA_features = median(nFeature_RNA), .groups = "drop")
+}))
+write_table(gate_identity, OUT, "02_C0W0_selected_identity_and_depth_by_diet.csv")
+```
+
+## 4. Fixed comparisons and pooled descriptive effects
+
+Each contrast needs at least 30 nuclei in *each* diet. The same Step 08E
+`pooled_effect()` and consensus peaks are used throughout. An ineligible
+comparison has missing effects, not zero changed peaks. The W6/C2 and
+W8/C3+C5 context groups remain independent of all C0 analyses.
+
+```{r contrasts-and-effects}
+make_contrast <- function(key, role_name, ix) {
+  tibble(contrast = key, role = role_name, indices = list(as.integer(ix)))
+}
+spec <- list(
+  make_contrast("C0_all", "ISC_enriched_state", which(meta$focused_cluster == "0")),
+  make_contrast("C2_all", "crypt_progenitor_state", which(meta$focused_cluster == "2")),
+  make_contrast("C0_C2_proxy", "broad_Gourab_proxy",
+    which(meta$focused_cluster %in% c("0", "2"))),
+  make_contrast("C0W0_all", "parent_restricted_C0", base_ix))
+for (g in names(GATES)) spec[[length(spec) + 1L]] <- make_contrast(
+  paste0("C0W0_", g), if (g %in% names(PRIMARY_GATES))
+    "primary_C0W0_score_gate" else "sensitivity_C0W0_score_gate",
+  which(meta[[paste0("C0W0_", g)]]))
+spec[[length(spec) + 1L]] <- make_contrast("W6_C2_context", "separate_W6_context",
+  which(meta$parent_wnn_cluster == "6" & meta$focused_cluster == "2"))
+spec[[length(spec) + 1L]] <- make_contrast("W8_C3_C5_context", "separate_W8_context",
+  which(meta$parent_wnn_cluster == "8" & meta$focused_cluster %in% c("3", "5")))
+contrast <- dplyr::bind_rows(spec)
+contrast$n_CON <- vapply(contrast$indices, function(ix)
+  as.integer(sum(meta$diet[ix] == "CON")), integer(1))
+contrast$n_HFD <- vapply(contrast$indices, function(ix)
+  as.integer(sum(meta$diet[ix] == "HFD")), integer(1))
+contrast$eligible <- contrast$n_CON >= MIN_PER_DIET & contrast$n_HFD >= MIN_PER_DIET
+need(!anyDuplicated(contrast$contrast) &&
+     all(contrast$eligible[contrast$contrast %in%
+       c("C0_all", "C2_all", "C0_C2_proxy", "C0W0_top15", "C0W0_top10")]),
+     "A primary contrast is duplicated or has too few nuclei per diet.")
+write_table(dplyr::select(contrast, -indices), OUT,
+  "03_contrast_definitions_and_diet_balance.csv")
+all_effects <- list()
+effect_summary <- list()
+for (modality in c("RNA", "ATAC")) {
+  counts <- if (modality == "RNA") rna else atac
+  depth <- Matrix::colSums(counts)
+  effects <- dplyr::bind_rows(lapply(which(contrast$eligible), function(i) {
+    contrast_key <- contrast$contrast[[i]]
+    role_name <- contrast$role[[i]]
+    message("08G ", modality, ": ", contrast_key, " (",
+      contrast$n_CON[i], " CON / ", contrast$n_HFD[i], " HFD)")
+    pooled_effect(counts, meta, contrast$indices[[i]], modality,
+      total_depth = depth) |>
+      dplyr::mutate(contrast = .env$contrast_key, role = .env$role_name,
+                    .before = 1)
+  }))
+  need(!anyDuplicated(effects[c("contrast", "feature")]),
+       paste("Duplicate", modality, "feature per contrast."))
+  effect_summary[[modality]] <- effects |>
+    dplyr::group_by(contrast, role, modality) |>
+    dplyr::summarise(consensus_features = dplyr::n(),
+      evaluable_features = sum(evaluable), clear_features = sum(clear_effect),
+      HFD_higher_clear = sum(clear_effect & log2FC_HFD_vs_CON > 0),
+      CON_higher_clear = sum(clear_effect & log2FC_HFD_vs_CON < 0),
+      .groups = "drop")
+  write_table(dplyr::filter(effects, evaluable), OUT,
+    paste0("04_", modality, "_evaluable_pooled_effects.csv.gz"))
+  all_effects[[modality]] <- effects
+  rm(effects); invisible(gc())
+}
+write_table(dplyr::bind_rows(effect_summary) |>
+  dplyr::left_join(dplyr::select(contrast, contrast, n_CON, n_HFD, eligible),
+    by = "contrast", relationship = "many-to-one"), OUT,
+  "04_descriptive_effect_counts.csv")
+```
+
+## 5. Compare C0, C2, and the score gates at the same consensus peaks
+
+The 15% C0/W0 peak set is a **descriptive anchor**. Each row retains the
+original contrast values, detection, and count support. The tiers summarize
+whether the same directional clear effect also appears in C0 overall and/or
+the 10% gate; they are not P values or evidence from independent samples.
+The C0 and C2 comparison is tabulated separately so that their distinct
+responses remain visible even if the C0+C2 proxy averages them together.
+
+```{r compare-peak-effects}
+atac_effects <- all_effects$ATAC
+rna_effects <- all_effects$RNA
+feature_effect <- function(key) {
+  atac_effects |>
+    dplyr::filter(contrast == .env$key) |>
+    dplyr::select(feature, evaluable, clear_effect,
+      log2FC_HFD_vs_CON, CON_percent, HFD_percent, CON_counts, HFD_counts)
+}
+comparators <- c("C0_all", "C2_all", "C0_C2_proxy", "C0W0_top10",
+  "C0W0_top05", "C0W0_top20", "C0W0_top25",
+  "W6_C2_context", "W8_C3_C5_context")
+candidate <- feature_effect("C0W0_top15") |>
+  dplyr::filter(clear_effect)
+names(candidate)[-1] <- paste0("anchor_", names(candidate)[-1])
+for (key in comparators) {
+  comparison <- feature_effect(key)
+  names(comparison)[-1] <- paste0(key, "_", names(comparison)[-1])
+  candidate <- dplyr::left_join(candidate, comparison, by = "feature",
+    relationship = "one-to-one")
+}
+agrees <- function(key) {
+  dplyr::coalesce(candidate[[paste0(key, "_clear_effect")]] &
+    sign(candidate[[paste0(key, "_log2FC_HFD_vs_CON")]]) ==
+      sign(candidate$anchor_log2FC_HFD_vs_CON), FALSE)
+}
+candidate$C0_same <- agrees("C0_all")
+candidate$C2_same <- agrees("C2_all")
+candidate$top10_same <- agrees("C0W0_top10")
+candidate$proxy_same <- agrees("C0_C2_proxy")
+candidate$tier <- dplyr::case_when(
+  candidate$C0_same & candidate$top10_same ~ "C0_and_top10",
+  candidate$C0_same ~ "C0_only",
+  candidate$top10_same ~ "top10_only",
+  TRUE ~ "anchor_only")
+candidate$direction <- ifelse(candidate$anchor_log2FC_HFD_vs_CON > 0,
+  "HFD_higher", "CON_higher")
+write_table(candidate, OUT, "05_C0W0_top15_peak_candidates_with_all_contrasts.csv.gz")
+candidate_summary <- candidate |>
+  dplyr::group_by(tier, direction) |>
+  dplyr::summarise(candidate_peaks = dplyr::n(),
+    also_C2_same = sum(C2_same),
+    also_proxy_same = sum(proxy_same),
+    .groups = "drop")
+write_table(candidate_summary, OUT, "05_candidate_peak_support_tiers.csv")
+c0_vs_c2 <- feature_effect("C0_all") |>
+  dplyr::rename_with(~ paste0("C0_", .x), -feature) |>
+  dplyr::left_join(feature_effect("C2_all") |>
+    dplyr::rename_with(~ paste0("C2_", .x), -feature),
+    by = "feature", relationship = "one-to-one") |>
+  dplyr::mutate(C0_C2_both_evaluable = C0_evaluable & C2_evaluable,
+    both_clear_same_direction = C0_clear_effect & C2_clear_effect &
+      sign(C0_log2FC_HFD_vs_CON) == sign(C2_log2FC_HFD_vs_CON),
+    both_clear_opposite_direction = C0_clear_effect & C2_clear_effect &
+      sign(C0_log2FC_HFD_vs_CON) != sign(C2_log2FC_HFD_vs_CON))
+write_table(dplyr::filter(c0_vs_c2, C0_clear_effect | C2_clear_effect),
+  OUT, "05_C0_C2_at_least_one_clear_peak.csv.gz")
+write_table(tibble(
+  consensus_peaks = nrow(c0_vs_c2),
+  C0_evaluable = sum(c0_vs_c2$C0_evaluable),
+  C2_evaluable = sum(c0_vs_c2$C2_evaluable),
+  both_evaluable = sum(c0_vs_c2$C0_C2_both_evaluable),
+  C0_clear = sum(c0_vs_c2$C0_clear_effect),
+  C2_clear = sum(c0_vs_c2$C2_clear_effect),
+  both_clear_same_direction = sum(c0_vs_c2$both_clear_same_direction),
+  both_clear_opposite_direction = sum(c0_vs_c2$both_clear_opposite_direction)
+), OUT, "05_C0_vs_C2_peak_overlap_summary.csv")
+peak_counts <- dplyr::bind_rows(effect_summary) |>
+  dplyr::filter(modality == "ATAC") |>
+  dplyr::left_join(dplyr::select(contrast, contrast, n_CON, n_HFD),
+    by = "contrast", relationship = "many-to-one")
+write_table(peak_counts, OUT, "05_ATAC_peak_counts_and_diet_balance.csv")
+p_counts <- ggplot2::ggplot(peak_counts, ggplot2::aes(
+  x = stats::reorder(contrast, evaluable_features), y = evaluable_features,
+  fill = clear_features / pmax(evaluable_features, 1))) +
+  ggplot2::geom_col() + ggplot2::coord_flip() +
+  ggplot2::scale_fill_viridis_c(labels = scales::percent,
+    name = "Clear/evaluable") +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "Evaluable consensus peaks by fixed population",
+    subtitle = "Color shows descriptive clear effects among evaluable peaks; each group needs diet balance",
+    x = NULL, y = "Evaluable ATAC peaks")
+save_vector_plot(p_counts, PLOTS, "05_evaluable_peak_counts.pdf", 12, 7)
+```
+
+## 6. Cell number and depth sensitivity at selected peak candidates
+
+Repeat the same sampling methods used in 08F for the top 200 evaluable
+features of each eligible primary contrast. These draws estimate stability
+against cell balance and fragment depth; they do not create mouse replicates.
+
+```{r depth-sensitivity}
+resample_keys <- intersect(c("C0_all", "C2_all", "C0_C2_proxy",
+  "C0W0_top15", "C0W0_top10", "C0W0_top05"),
+  contrast$contrast[contrast$eligible])
+resampling <- dplyr::bind_rows(lapply(resample_keys, function(key) {
+  i <- match(key, contrast$contrast)
+  full <- atac_effects |>
+    dplyr::filter(contrast == .env$key, evaluable) |>
+    dplyr::arrange(dplyr::desc(abs(log2FC_HFD_vs_CON)))
+  picked <- head(full$feature, 200L)
+  if (!length(picked)) return(tibble::tibble())
+  resampling_effects(atac, meta, contrast$indices[[i]], full, picked,
+    "ATAC", iterations = N_DRAWS) |>
+    dplyr::mutate(contrast = .env$key, .before = 1)
+}))
+write_table(resampling, OUT, "06_top200_ATAC_equal_cell_and_depth_sensitivity.csv.gz")
+candidate <- candidate |>
+  dplyr::left_join(resampling |>
+    dplyr::filter(contrast == "C0W0_top15", method == "depth_matched") |>
+    dplyr::select(feature, depth_matched_valid_draws = valid_iterations,
+      depth_matched_sign_agreement_percent = sign_agreement_percent,
+      depth_matched_median_log2FC = median_log2FC),
+    by = "feature", relationship = "one-to-one")
+write_table(candidate, OUT, "06_C0W0_top15_candidates_with_depth_check.csv.gz")
+```
+
+## 7. Promoter and expression context after peak selection
+
+The source program is joined **after** the peak list and groups are fixed.
+The promoter map uses annotated gene TSS and a symmetric 2-kb window. A
+nearby gene and a concordant RNA effect are hypotheses for follow-up, not
+validated peak-to-gene links. The example plots require observed RNA and
+prefer candidates retained in C0 and the 10% score gate.
+
+```{r promoter-rna-context}
+promoter <- promoter_peak_map(obj, window = 2000L)$map |>
+  dplyr::distinct(gene, peak, .keep_all = TRUE)
+rna_anchor <- rna_effects |>
+  dplyr::filter(contrast == "C0W0_top15") |>
+  dplyr::transmute(gene = feature, RNA_evaluable = evaluable,
+    RNA_clear = clear_effect, RNA_log2FC = log2FC_HFD_vs_CON,
+    RNA_CON_percent = CON_percent, RNA_HFD_percent = HFD_percent,
+    RNA_CON_counts = CON_counts, RNA_HFD_counts = HFD_counts)
+gene_context <- candidate |>
+  dplyr::inner_join(promoter, by = c("feature" = "peak"),
+    relationship = "many-to-many") |>
+  dplyr::left_join(rna_anchor, by = "gene", relationship = "many-to-one")
+source_genes <- read_csv_checked(SOURCE_GENES)
+require_columns(source_genes, c("gene", "program"), "08F Gourab audit")
+source_genes <- dplyr::distinct(source_genes, gene, .keep_all = TRUE)
+gene_context <- dplyr::left_join(gene_context, source_genes,
+  by = "gene", relationship = "many-to-one") |>
+  dplyr::mutate(RNA_ATAC_same_direction = dplyr::coalesce(
+    RNA_evaluable & sign(RNA_log2FC) == sign(anchor_log2FC_HFD_vs_CON), FALSE))
+write_table(gene_context, OUT, "07_peak_promoter_RNA_and_Gourab_overlay.csv.gz")
+examples <- gene_context |>
+  dplyr::filter(RNA_evaluable, gene %in% rownames(rna_data)) |>
+  dplyr::mutate(tier_priority = dplyr::case_when(
+    tier == "C0_and_top10" ~ 3L, tier == "C0_only" ~ 2L,
+    tier == "top10_only" ~ 1L, TRUE ~ 0L)) |>
+  dplyr::arrange(dplyr::desc(tier_priority),
+    dplyr::desc(RNA_ATAC_same_direction),
+    dplyr::desc(abs(anchor_log2FC_HFD_vs_CON))) |>
+  dplyr::distinct(feature, .keep_all = TRUE) |>
+  dplyr::slice_head(n = MAX_COVERAGE_LOCI)
+write_table(examples, OUT, "07_example_loci_selected_without_Gourab_overlay.csv")
+if (nrow(examples)) {
+  effect_plot <- dplyr::bind_rows(
+    dplyr::transmute(examples, gene, feature, modality = "ATAC",
+      effect = anchor_log2FC_HFD_vs_CON),
+    dplyr::transmute(examples, gene, feature, modality = "RNA",
+      effect = RNA_log2FC))
+  p_effect <- ggplot2::ggplot(effect_plot, ggplot2::aes(
+      x = interaction(gene, feature), y = effect, fill = modality)) +
+    ggplot2::geom_col(position = "dodge") +
+    ggplot2::geom_hline(yintercept = 0, linewidth = .25) +
+    ggplot2::coord_flip() + ggplot2::theme_bw(base_size = 11) +
+    ggplot2::labs(title = "Observed RNA and nearby promoter ATAC effects",
+      subtitle = "Descriptive pooled log2 CPM ratios; annotation implies proximity only",
+      x = NULL, y = "HFD versus CON pooled log2 fold change")
+  save_vector_plot(p_effect, PLOTS, "07_examples_RNA_and_ATAC_effects.pdf", 12, 6)
+  violin_keys <- c("C0_all", "C0W0_top15")
+  violin_data <- dplyr::bind_rows(lapply(unique(examples$gene), function(gene_name) {
+    dplyr::bind_rows(lapply(violin_keys, function(key) {
+      ix <- contrast$indices[[match(key, contrast$contrast)]]
+      tibble(gene = gene_name, group = key, diet = meta$diet[ix],
+        RNA_normalized = as.numeric(rna_data[gene_name, ix]))
+    }))
+  }))
+  write_table(violin_data, OUT, "07_example_gene_per_nucleus_normalized_RNA.csv.gz")
+  p_violin <- ggplot2::ggplot(violin_data,
+      ggplot2::aes(x = diet, y = RNA_normalized, fill = diet)) +
+    ggplot2::geom_violin(scale = "width", trim = TRUE, na.rm = TRUE) +
+    ggplot2::geom_boxplot(width = .12, outlier.shape = NA, alpha = .6) +
+    ggplot2::facet_grid(gene ~ group, scales = "free_y") +
+    ggplot2::scale_fill_manual(values = c(CON = "#E69F00", HFD = "#56B4E9")) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::labs(title = "Example genes in C0 overall and the C0/W0 score gate",
+      subtitle = "Individual nuclei show the distribution; pooled libraries determine descriptive effects",
+      x = NULL, y = "Seurat normalized RNA expression")
+  save_vector_plot(p_violin, PLOTS, "07_example_gene_RNA_violins.pdf", 11, 9)
+}
+```
+
+## 8. Coverage views at mapped genomic coordinates
+
+The global WNN view shows the nested score-defined C0/W0 cells in their
+original embedding while leaving all unused nuclei grey.
+
+Pass a genomic range to Signac instead of a gene name. This avoids the
+`Gene not found` warnings encountered when a region string was combined
+with `annotation="gene"` in 08F. If fragment references are missing or
+an individual locus fails, save the status and continue.
+
+```{r mapped-coverage}
+global <- readRDS(ANNOTATED)
+need("wnn.umap" %in% names(global@reductions),
+     "Step 06 global WNN UMAP is absent.")
+coords <- as.data.frame(SeuratObject::Embeddings(global, "wnn.umap"))
+names(coords)[1:2] <- c("x", "y")
+coords$cell_barcode <- rownames(coords)
+fg <- dplyr::left_join(coords, dplyr::select(meta, cell_barcode,
+  focused_cluster, parent_wnn_cluster, C0W0_top15, C0W0_top10),
+  by = "cell_barcode", relationship = "one-to-one")
+need(nrow(fg) == nrow(coords) &&
+     sum(!is.na(fg$focused_cluster)) == nrow(meta),
+     "Global WNN and focused barcode sets are misaligned.")
+fg$highlight <- dplyr::case_when(
+  fg$C0W0_top10 %in% TRUE ~ "C0/W0 top 10%",
+  fg$C0W0_top15 %in% TRUE ~ "C0/W0 10–15%",
+  fg$focused_cluster == "0" ~ "Other C0",
+  fg$focused_cluster == "2" ~ "C2",
+  TRUE ~ "Other nuclei")
+fg$highlight <- factor(fg$highlight, levels = c("Other nuclei", "C2",
+  "Other C0", "C0/W0 10–15%", "C0/W0 top 10%"))
+p_wnn <- ggplot2::ggplot(fg, ggplot2::aes(x, y)) +
+  ggplot2::geom_point(data = dplyr::filter(fg,
+    highlight == "Other nuclei"), color = "grey87", size = .10) +
+  ggplot2::geom_point(data = dplyr::filter(fg,
+    highlight != "Other nuclei"), ggplot2::aes(color = highlight),
+    size = .35, alpha = .85) +
+  ggplot2::scale_color_manual(values = c("C2" = "#D18C3A",
+    "Other C0" = "#59B2A0", "C0/W0 10–15%" = "#3278AB",
+    "C0/W0 top 10%" = "#143D74"), drop = TRUE) +
+  ggplot2::coord_equal() + ggplot2::theme_classic(base_size = 11) +
+  ggplot2::labs(title = "C0, C2, and score-defined C0/W0 on the global WNN UMAP",
+    subtitle = "Fixed focused subclusters; C0/W0 gates ranked by six-gene UCell across both diets",
+    x = "Global WNN UMAP 1", y = "Global WNN UMAP 2", color = NULL)
+save_vector_plot(p_wnn, PLOTS, "08_C0_C2_and_C0W0_on_global_WNN.pdf", 12, 7)
+coverage_status <- tidyr::expand_grid(
+  contrast = c("C0_all", "C0W0_top15"), feature = examples$feature) |>
+  dplyr::mutate(status = "not_attempted", detail = "")
+if (RUN_COVERAGE && nrow(coverage_status)) {
+  if (!length(Signac::Fragments(global[["ATAC"]]))) {
+    coverage_status$status <- "skipped_no_fragments"
+    coverage_status$detail <- "Step 06 ATAC fragment references are unavailable"
+  } else {
+    peaks <- GenomicRanges::granges(obj[["ATAC.crypt"]])
+    names(peaks) <- rownames(atac)
+    for (key in unique(coverage_status$contrast)) {
+      ix <- contrast$indices[[match(key, contrast$contrast)]]
+      coverage_obj <- subset(global, cells = meta$cell_barcode[ix])
+      SeuratObject::DefaultAssay(coverage_obj) <- "ATAC"
+      for (j in seq_len(nrow(examples))) {
+        peak_name <- examples$feature[[j]]
+        k <- which(coverage_status$contrast == key &
+          coverage_status$feature == peak_name)
+        gr <- peaks[match(peak_name, names(peaks))]
+        span <- GenomicRanges::GRanges(
+          seqnames = as.character(GenomicRanges::seqnames(gr)),
+          ranges = IRanges::IRanges(
+            start = max(1L, as.integer(BiocGenerics::start(gr)) - 5000L),
+            end = as.integer(BiocGenerics::end(gr)) + 5000L))
+        tryCatch({
+          p <- Signac::CoveragePlot(coverage_obj, region = span,
+            assay = "ATAC", annotation = "gene", peaks = TRUE,
+            region.highlight = gr, links = FALSE, tile = FALSE,
+            group.by = "diet", ymax = "q95") +
+            patchwork::plot_annotation(title = paste(key, peak_name),
+              subtitle = paste("Promoter-associated", examples$gene[[j]],
+                "; pooled depth-normalized CON/HFD coverage"))
+          ggplot2::ggsave(file.path(PLOTS, paste0("08_", key, "_example_", j,
+            ".pdf")), plot = p, device = grDevices::pdf,
+            useDingbats = FALSE, width = 13, height = 6)
+          coverage_status$status[k] <- "saved"
+        }, error = function(e) {
+          coverage_status$status[k] <<- "plot_failed"
+          coverage_status$detail[k] <<- conditionMessage(e)
+          warning("Coverage view failed for ", key, " / ", peak_name,
+            ": ", conditionMessage(e))
+        })
+      }
+      rm(coverage_obj); invisible(gc())
+    }
+  }
+}
+rm(global); invisible(gc())
+write_table(coverage_status, OUT, "08_example_coverage_status.csv")
+```
+
+## 9. Coordinate checked BED inputs for a later motif analysis
+
+Write only the robust descriptive tier (shared by C0 and C0/W0 10%) in
+separate HFD-higher and CON-higher sets. The entire evaluable C0/W0 15%
+universe is recorded for background design, but is **not** a matched
+background. Motif enrichment needs a length, GC, mappability, and detection
+matched background and explicit motif choices in a separate analysis.
+
+```{r motif-inputs-and-finish}
+peak_ranges <- GenomicRanges::granges(obj[["ATAC.crypt"]])
+need(identical(rownames(atac), rownames(obj[["ATAC.crypt"]])) &&
+     length(peak_ranges) == nrow(atac), "ATAC ranges/features changed.")
+names(peak_ranges) <- rownames(atac)
+bed_for <- function(features, filename) {
+  gr <- peak_ranges[match(features, names(peak_ranges))]
+  need(!anyNA(match(features, names(peak_ranges))),
+       paste("Peak coordinates missing for", filename))
+  bed <- tibble(chrom = as.character(GenomicRanges::seqnames(gr)),
+    start0 = as.integer(BiocGenerics::start(gr)) - 1L,
+    end = as.integer(BiocGenerics::end(gr)), feature = features)
+  readr::write_tsv(bed, file.path(OUT, filename), col_names = FALSE)
+  nrow(bed)
+}
+motif_inputs <- tibble(
+  set = c("C0_and_top10_HFD_higher", "C0_and_top10_CON_higher",
+    "C0W0_top15_evaluable_unmatched_universe"),
+  file = c("09_HFD_higher_candidate_regions.bed",
+    "09_CON_higher_candidate_regions.bed",
+    "09_evaluable_unmatched_universe.bed"))
+anchor_universe <- feature_effect("C0W0_top15") |>
+  dplyr::filter(evaluable)
+motif_inputs$n_regions <- c(
+  bed_for(candidate$feature[candidate$tier == "C0_and_top10" &
+    candidate$direction == "HFD_higher"], motif_inputs$file[[1]]),
+  bed_for(candidate$feature[candidate$tier == "C0_and_top10" &
+    candidate$direction == "CON_higher"], motif_inputs$file[[2]]),
+  bed_for(anchor_universe$feature, motif_inputs$file[[3]]))
+write_table(motif_inputs, OUT, "09_motif_input_manifest_not_enrichment.csv")
+finish_run(OUT, "STEP_08G_COMPLETE.txt", c(
+  "C0, C2, C0+C2, C0/W0 all, C0/W0 score gates and separate W6/W8 contexts audited.",
+  "Primary C0/W0 gates: 15% and 10%; 5%, 20%, 25% are sensitivity gates.",
+  "One pooled library per diet: effects and resampling are descriptive, not replicate-level DAR tests.",
+  "BED sets are candidate and unmatched-universe inputs; motif enrichment was not performed.",
+  paste("Results:", OUT)))
+```

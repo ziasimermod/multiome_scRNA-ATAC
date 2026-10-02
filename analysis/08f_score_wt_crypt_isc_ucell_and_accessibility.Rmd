@@ -1,0 +1,783 @@
+---
+title: "Step 08F | ISC UCell gates and WT crypt accessibility"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This notebook continues the completed WT Step 08E analysis without changing
+Step 05E/05F labels or the Step 06 object. Its **two prespecified arms** are:
+
+1. Focused **C0+C2**, a crypt-core proxy for the G6/G9 part of Gourab's broad
+   source label. It is not a reconstruction of every source "Stem" cell.
+2. Within each parent **W0, W6, W8**, the top 15%, 10%, and 5% by one fixed
+   six-gene ISC UCell signature. Ranking is across CON and HFD *together within
+   each parent*, never separately by diet. The three thresholds are nested.
+
+We calculate each parent separately and a union of the three parent gates for
+each threshold. The union is an **exploratory sensitivity** until its parent
+states, diet balance, and effect directions have been reviewed. W8 is
+intentionally retained: it expresses ISC-associated markers but its reciprocal
+source match favors the source TA clusters, and its library composition is
+strongly imbalanced. Fixed C0–C5 labels are carried through every output.
+
+The ISC core is `Lgr5, Ascl2, Smoc2, Axin2, Lrig1, Rnf43`. These are the
+noncycling, source-independent ISC markers in the Step 05E targeted panel. We
+keep `Olfm4` as a seventh-gene sensitivity because its colonic detectability
+needs inspection. We audit cell-cycle and secretory programs separately rather
+than excluding cycling ISCs or defining cells using Gourab's diet-responsive
+genes. All signatures, ranks, and thresholds are fixed before ATAC effects.
+
+**Interpretation:** one pooled CON library and one pooled HFD library. Nuclei
+are not mouse replicates. The output contains *descriptive diet-associated
+accessibility candidates* and no mouse-level differential-accessibility P
+value, FDR, or claim of regulatory causation. A threshold with fewer than 30
+nuclei from either diet is recorded but its RNA/ATAC effect calculation is
+skipped. In particular, W8 top 5% may be too small in CON. A promoter overlap
+is a locus annotation, not evidence that a peak regulates that gene.
+
+Run from the project root on SOL after Step 08E finishes. Use the WT
+`v2_resequenced` cohort, R 4.4.2, and the same 8 CPU / 96 GiB interactive
+session recommended for 08E. `UCell` must be installed in that R 4.4 library;
+the notebook stops with a readable preflight message if it is missing.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
+                      fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else
+      stop("Open the project root before running 08F.", call. = FALSE)
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) stop("Missing 05F/08E shared helper on this checkout.")
+source(FOLLOWUP_HELPER)
+if (!requireNamespace("UCell", quietly = TRUE))
+  stop("Install UCell for the active R 4.4 Bioconductor library before 08F.")
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges)
+  library(patchwork)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+     "08F requires WT v2_resequenced.")
+set.seed(8128)
+MIN_PER_DIET <- 30L
+GATE_FRACTIONS <- c(top15 = .15, top10 = .10, top05 = .05)
+UCELL_MAX_RANK <- 400L   # Focused median nFeature_RNA is ~365; compare 600 below.
+UCELL_SENS_RANK <- 600L
+N_DRAWS <- 20L
+RUN_COVERAGE <- TRUE
+MAX_COVERAGE_LOCI <- 4L
+```
+
+## 1. Input contract and preserved annotations
+
+```{r inputs}
+STEP5E <- file.path(OUTPUT_DIR, "05_wnn", "focused_wt_crypt_stem_progenitor")
+ROOT_FOLLOWUP <- file.path(OUTPUT_DIR, "05_wnn", FOLLOWUP_RELEASE)
+STEP5F <- file.path(ROOT_FOLLOWUP, "05f_review")
+STEP8E <- file.path(OUTPUT_DIR, "08e_refined_wt_crypt_diet")
+OBJECT <- file.path(STEP5E, "objects", "WT_crypt_core_0_6_8_focused.rds")
+ANNOTATED <- file.path(OUTPUT_DIR, "06_annotation", "multiome_annotated.rds")
+DECISION <- file.path(STEP5F, "refined_working_labels.csv")
+REFERENCE <- file.path(DATASET_CONFIG_DIR, "reference_programs",
+                       "persistent_hfd_genes.csv")
+OUT <- file.path(OUTPUT_DIR, "08f_isc_ucell_wt_crypt")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+inputs <- c(OBJECT, ANNOTATED, DECISION, REFERENCE,
+  file.path(STEP5F, "STEP_05F_COMPLETE.txt"),
+  file.path(STEP8E, "STEP_08E_COMPLETE.txt"),
+  file.path(STEP8E, "RNA_all_refined_pooled_effects.csv.gz"),
+  file.path(STEP8E, "ATAC_all_refined_pooled_effects.csv.gz"))
+for (path in inputs) need(file.exists(path), paste("Missing required input:", path))
+capture_manifest(inputs, OUT)
+map <- read_csv_checked(DECISION) |>
+  mutate(focused_cluster = as.character(focused_cluster))
+require_columns(map, c("focused_cluster", "analysis_unit", "working_label",
+  "analysis_role", "focused_annotation_confidence", "label_status",
+  "approved_for_global_annotation"), "05F working map")
+need(setequal(map$focused_cluster, as.character(0:5)) &&
+  !anyDuplicated(map$focused_cluster), "Expected one 05F C0-C5 row each.")
+need(all(map$label_status == "provisional_working") &&
+  !any(map$approved_for_global_annotation), "05F provisional labels changed.")
+focused <- load_focused(OBJECT)
+obj <- focused$object
+meta <- focused$metadata |>
+  dplyr::rename(parent_annotation_confidence = annotation_confidence) |>
+  dplyr::left_join(map, by = "focused_cluster", relationship = "many-to-one")
+need(!anyNA(meta$working_label) && !anyNA(meta$diet),
+     "Focused barcode/working-label alignment failed.")
+rna <- focused$matrices$RNA_counts
+atac <- focused$matrices$ATAC_counts
+need(identical(meta$cell_barcode, colnames(rna)) &&
+     identical(meta$cell_barcode, colnames(atac)),
+     "Focused RNA/ATAC matrices are not aligned with metadata.")
+need(setequal(unique(meta$parent_wnn_cluster), c("0", "6", "8")),
+     "Expected Step 05E parent W0/W6/W8 only.")
+write_table(focused$alignment, OUT, "00_matrix_alignment.csv")
+```
+
+## 2. Gene audit and rank-based ISC score
+
+`UCell` ranks RNA genes within each nucleus. Use raw, joined `RNA.crypt`
+counts, not ATAC gene activities or smoothed values. A common `maxRank` is
+held across all three parents. The seventh-gene score and a second rank cap
+are sensitivity checks; neither changes the primary gate.
+
+```{r score-ucell}
+ISC_CORE <- c("Lgr5", "Ascl2", "Smoc2", "Axin2", "Lrig1", "Rnf43")
+ISC_EXTENDED <- c(ISC_CORE, "Olfm4") #use this as a negative control
+CYCLE_AUDIT <- c("Mki67", "Top2a", "Cenpf", "Ube2c", "Cdk1", "Ccnb1")
+SECRETORY_AUDIT <- c("Atoh1", "Muc2", "Reg4", "Spink4", "Kit")
+signatures <- list(ISC_core6 = ISC_CORE, ISC_plus_Olfm4 = ISC_EXTENDED,
+  Cell_cycle = CYCLE_AUDIT, Secretory_DSC = SECRETORY_AUDIT)
+signature_audit <- dplyr::bind_rows(lapply(names(signatures), function(s) {
+  tibble(signature = s, gene = signatures[[s]],
+         in_RNA_assay = signatures[[s]] %in% rownames(rna))
+}))
+write_table(signature_audit, OUT, "01_signature_assay_availability.csv")
+need(sum(ISC_CORE %in% rownames(rna)) >= 4L,
+  "Fewer than four of the six prespecified ISC genes are assayed; review signature before running 08F.")
+available_signatures <- lapply(signatures, intersect, rownames(rna))
+need(all(lengths(available_signatures) >= 3L),
+     "A signature has fewer than three assayed genes; review signature availability.")
+score <- UCell::ScoreSignatures_UCell(rna, features = available_signatures,
+  maxRank = UCELL_MAX_RANK)
+score_sens <- UCell::ScoreSignatures_UCell(rna,
+  features = list(ISC_core6 = available_signatures$ISC_core6),
+  maxRank = UCELL_SENS_RANK)
+need(setequal(rownames(score), meta$cell_barcode) &&
+     setequal(rownames(score_sens), meta$cell_barcode),
+     "UCell result barcode set differs from focused object.")
+score <- score[meta$cell_barcode, , drop = FALSE]
+score_sens <- score_sens[meta$cell_barcode, , drop = FALSE]
+need(all(paste0(names(signatures), "_UCell") %in% colnames(score)) &&
+     "ISC_core6_UCell" %in% colnames(score_sens),
+     "Unexpected UCell output column names.")
+for (s in names(signatures))
+  meta[[paste0(s, "_UCell")]] <- score[, paste0(s, "_UCell")]
+meta$ISC_core6_maxRank600 <- score_sens[, "ISC_core6_UCell"]
+need(!anyNA(meta$ISC_core6_UCell) && all(is.finite(meta$ISC_core6_UCell)),
+     "Missing or nonfinite core ISC UCell scores.")
+expressed_genes <- available_signatures$ISC_core6
+meta$ISC_core_genes_detected <- Matrix::colSums(
+  rna[expressed_genes, , drop = FALSE] > 0)
+marker_detection <- dplyr::bind_rows(lapply(ISC_EXTENDED, function(g) {
+  if (!g %in% rownames(rna)) return(tibble(gene = g, parent = NA_character_,
+    diet = NA_character_, n = 0L, percent_detected = NA_real_))
+  meta |>
+    dplyr::mutate(detected = as.numeric(rna[g, meta$cell_barcode]) > 0) |>
+    dplyr::group_by(parent = parent_wnn_cluster, diet) |>
+    dplyr::summarise(gene = g, n = dplyr::n(),
+      percent_detected = 100 * mean(detected), .groups = "drop")
+}))
+write_table(marker_detection, OUT, "01_marker_detection_by_parent_diet.csv")
+write_table(meta |> dplyr::select(cell_barcode, sample_id, diet,
+  parent_wnn_cluster, focused_cluster, working_label,
+  parent_annotation_confidence, focused_annotation_confidence,
+  Phase, nFeature_RNA, nCount_RNA, nCount_ATAC, ISC_core_genes_detected,
+  dplyr::ends_with("_UCell"), ISC_core6_maxRank600), OUT,
+  "01_scores_and_preserved_annotations.csv.gz")
+```
+
+## 3. Three nested, diet-blind gates within each parent
+
+The requested percentages are **within W0, W6, and W8 separately**. Ranking
+uses the combined CON+HFD parent, with barcode as a reproducible tie break;
+no diet or ATAC information enters the gate. A zero score cannot be called a
+high-ISC nucleus. We record actual fractions, boundary ties, and mouse-pool
+composition so the labels can be interpreted at the end.
+
+```{r define-gates}
+meta <- meta |>
+  dplyr::group_by(parent_wnn_cluster) |>
+  dplyr::arrange(dplyr::desc(ISC_core6_UCell), cell_barcode,
+                 .by_group = TRUE) |>
+  dplyr::mutate(rank_in_parent = dplyr::row_number(),
+    parent_n = dplyr::n(),
+    top15 = rank_in_parent <= ceiling(.15 * parent_n) & ISC_core6_UCell > 0,
+    top10 = rank_in_parent <= ceiling(.10 * parent_n) & ISC_core6_UCell > 0,
+    top05 = rank_in_parent <= ceiling(.05 * parent_n) & ISC_core6_UCell > 0) |>
+  dplyr::ungroup()
+need(all(!meta$top05 | meta$top10) && all(!meta$top10 | meta$top15),
+     "UCell gates are not nested.")
+need(setequal(meta$cell_barcode, colnames(rna)), "Gate lost a barcode.")
+# Restore the matrix/metadata order before every pooled-effect call.
+meta <- meta[match(colnames(rna), meta$cell_barcode), , drop = FALSE]
+need(identical(meta$cell_barcode, colnames(rna)), "Cannot restore matrix order.")
+gate_cells <- dplyr::bind_rows(lapply(names(GATE_FRACTIONS), function(g) {
+  meta |>
+    dplyr::transmute(cell_barcode, sample_id, diet, parent_wnn_cluster,
+      focused_cluster, analysis_unit, working_label,
+      parent_annotation_confidence, focused_annotation_confidence,
+      Phase, ISC_core6_UCell, ISC_plus_Olfm4_UCell,
+      ISC_core6_maxRank600, Cell_cycle_UCell, Secretory_DSC_UCell,
+      ISC_core_genes_detected, nFeature_RNA, nCount_RNA, nCount_ATAC,
+      rank_in_parent, parent_n, gate = g, selected = .data[[g]])
+}))
+write_table(gate_cells, OUT, "02_all_gate_memberships_with_05f_labels.csv.gz")
+gate_audit <- gate_cells |>
+  dplyr::group_by(gate, parent_wnn_cluster, diet) |>
+  dplyr::summarise(n_parent = dplyr::n(), n_selected = sum(selected),
+    selected_percent = 100 * mean(selected),
+    median_ISC_score_selected = if (sum(selected)) median(ISC_core6_UCell[selected]) else NA_real_,
+    median_marker_genes_selected = if (sum(selected)) median(ISC_core_genes_detected[selected]) else NA_real_,
+    median_RNA_features_selected = if (sum(selected)) median(nFeature_RNA[selected]) else NA_real_,
+    median_ATAC_counts_selected = if (sum(selected)) median(nCount_ATAC[selected]) else NA_real_,
+    .groups = "drop")
+write_table(gate_audit, OUT, "02_gate_counts_and_depth_by_parent_diet.csv")
+gate_boundary <- dplyr::bind_rows(lapply(names(GATE_FRACTIONS), function(g) {
+  meta |>
+    dplyr::group_by(parent_wnn_cluster) |>
+    dplyr::summarise(gate = g, target_n = ceiling(GATE_FRACTIONS[[g]] * dplyr::n()),
+      selected_n = sum(.data[[g]]),
+      minimum_selected_score = if (sum(.data[[g]])) min(ISC_core6_UCell[.data[[g]]]) else NA_real_,
+      boundary_tied_n = if (sum(.data[[g]]))
+        sum(ISC_core6_UCell == min(ISC_core6_UCell[.data[[g]]])) else NA_integer_,
+      .groups = "drop")
+}))
+write_table(gate_boundary, OUT, "02_gate_boundary_and_ties.csv")
+
+# Compare primary ranks with a 600-rank sensitivity without changing selection.
+rank600 <- meta |>
+  dplyr::group_by(parent_wnn_cluster) |>
+  dplyr::arrange(dplyr::desc(ISC_core6_maxRank600), cell_barcode,
+                 .by_group = TRUE) |>
+  dplyr::mutate(rank600 = dplyr::row_number()) |>
+  dplyr::ungroup()
+rank_audit <- dplyr::bind_rows(lapply(names(GATE_FRACTIONS), function(g) {
+  rank600 |>
+    dplyr::group_by(parent_wnn_cluster) |>
+    dplyr::summarise(gate = g,
+      n_primary = sum(.data[[g]]),
+      n_600 = sum(rank600 <= ceiling(GATE_FRACTIONS[[g]] * dplyr::n()) &
+                    ISC_core6_maxRank600 > 0),
+      overlap = sum(.data[[g]] & rank600 <= ceiling(GATE_FRACTIONS[[g]] * dplyr::n()) &
+                      ISC_core6_maxRank600 > 0),
+      .groups = "drop") |>
+    dplyr::mutate(jaccard = ifelse(n_primary + n_600 - overlap > 0,
+      overlap / (n_primary + n_600 - overlap), NA_real_))
+}))
+write_table(rank_audit, OUT, "02_maxRank400_vs_600_gate_overlap.csv")
+
+spec <- list()
+add_contrast <- function(key, role, gate, parent, ix) {
+  tibble(contrast = key, role = role, gate = gate, parent = parent,
+         indices = list(as.integer(ix)))
+}
+spec[[1]] <- add_contrast("proxy_C0_C2", "crypt_core_proxy", "fixed", "C0+C2",
+                          which(meta$focused_cluster %in% c("0", "2")))
+for (g in names(GATE_FRACTIONS)) {
+  for (p in c("0", "6", "8")) {
+    spec[[length(spec) + 1L]] <- add_contrast(paste0("W", p, "_", g),
+      "parent_gate", g, paste0("W", p),
+      which(meta$parent_wnn_cluster == p & meta[[g]]))
+  }
+  spec[[length(spec) + 1L]] <- add_contrast(paste0("ISC_union_", g),
+    "union_sensitivity", g, "W0+W6+W8", which(meta[[g]]))
+}
+contrast <- dplyr::bind_rows(spec) |>
+  dplyr::mutate(n_CON = vapply(indices, function(ix) sum(meta$diet[ix] == "CON"), integer(1)),
+                n_HFD = vapply(indices, function(ix) sum(meta$diet[ix] == "HFD"), integer(1)),
+                eligible = n_CON >= MIN_PER_DIET & n_HFD >= MIN_PER_DIET,
+                status = ifelse(eligible, "descriptive_effect_eligible",
+                                "insufficient_nuclei_in_one_diet"))
+need(!anyDuplicated(contrast$contrast) && contrast$eligible[1],
+     "Duplicate contrast or ineligible C0+C2 proxy.")
+write_table(dplyr::select(contrast, -indices), OUT,
+            "02_contrast_definitions_and_eligibility.csv")
+```
+
+## 4. Show UCell membership and source subclusters
+
+```{r membership-figures}
+global <- readRDS(ANNOTATED)
+need("wnn.umap" %in% names(global@reductions), "Step 06 lacks global WNN UMAP.")
+coords <- as.data.frame(SeuratObject::Embeddings(global, "wnn.umap"))
+names(coords)[1:2] <- c("x", "y")
+coords$cell_barcode <- rownames(coords)
+coords$selected_focus <- coords$cell_barcode %in% meta$cell_barcode
+fg <- dplyr::left_join(coords, dplyr::select(meta, cell_barcode,
+  parent_wnn_cluster, focused_cluster, working_label, diet, ISC_core6_UCell,
+  top15, top10, top05), by = "cell_barcode")
+need(nrow(fg) == nrow(coords) &&
+     !anyNA(fg$ISC_core6_UCell[fg$selected_focus]), "UMAP cell alignment failed.")
+base_points <- fg |>
+  ggplot2::ggplot(ggplot2::aes(x, y)) +
+  ggplot2::geom_point(color = "grey85", size = .10, alpha = .5) +
+  ggplot2::coord_equal() + ggplot2::theme_classic(base_size = 12) +
+  ggplot2::labs(x = "Global WNN UMAP 1", y = "Global WNN UMAP 2")
+p_score <- base_points +
+  ggplot2::geom_point(data = dplyr::filter(fg, selected_focus),
+    ggplot2::aes(color = ISC_core6_UCell), size = .25) +
+  ggplot2::scale_color_viridis_c(option = "magma") +
+  ggplot2::labs(title = "Six-gene ISC score on the global WT WNN UMAP",
+    subtitle = "Same score definition in W0, W6 and W8; all other cells grey",
+    color = "UCell")
+save_vector_plot(p_score, PLOTS, "01_ISC_UCell_on_global_WNN.pdf", 12, 7)
+selected_plot <- dplyr::bind_rows(lapply(names(GATE_FRACTIONS), function(g) {
+  fg |>
+    dplyr::filter(selected_focus, .data[[g]]) |>
+    dplyr::mutate(gate = g)
+}))
+background_plot <- dplyr::bind_rows(lapply(names(GATE_FRACTIONS),
+  function(g) dplyr::mutate(dplyr::select(coords, x, y), gate = g)))
+p_gates <- ggplot2::ggplot() +
+  ggplot2::geom_point(data = background_plot, ggplot2::aes(x, y),
+    color = "grey87", size = .08, alpha = .35) +
+  ggplot2::geom_point(data = selected_plot,
+    ggplot2::aes(x, y, color = paste0("W", parent_wnn_cluster)),
+    size = .35, alpha = .85) +
+  ggplot2::facet_wrap(~gate, nrow = 1) +
+  ggplot2::scale_color_manual(values = c(W0 = "#007F86", W6 = "#B34A6A",
+                                         W8 = "#3454A5"), name = "Parent") +
+  ggplot2::coord_equal() + ggplot2::theme_classic(base_size = 11) +
+  ggplot2::labs(title = "Nested ISC score gates on the original WNN embedding",
+    subtitle = "15%, 10%, and 5% are ranked within each WNN parent, pooled across diets",
+    x = "WNN UMAP 1", y = "WNN UMAP 2")
+save_vector_plot(p_gates, PLOTS, "02_nested_gate_locations.pdf", 16, 6)
+p_scores <- ggplot2::ggplot(meta,
+  ggplot2::aes(x = diet, y = ISC_core6_UCell, fill = diet)) +
+  ggplot2::geom_violin(scale = "width", trim = TRUE, color = "grey25") +
+  ggplot2::geom_boxplot(width = .14, outlier.shape = NA, fill = "white") +
+  ggplot2::facet_wrap(~parent_wnn_cluster, nrow = 1) +
+  ggplot2::scale_fill_manual(values = c(CON = "#E69F00", HFD = "#56B4E9"),
+                             guide = "none") +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::labs(title = "ISC scores and diet balance in each parent",
+    subtitle = "Score distributions are descriptive and can depend on RNA detection",
+    x = NULL, y = "ISC core UCell score")
+save_vector_plot(p_scores, PLOTS, "03_parent_score_distributions.pdf", 11, 6)
+subcluster_counts <- gate_cells |>
+  dplyr::filter(selected) |>
+  dplyr::count(gate, parent_wnn_cluster, focused_cluster,
+               working_label, diet, name = "nuclei")
+write_table(subcluster_counts, OUT, "03_selected_05f_subclusters_by_parent_diet.csv")
+p_subcluster <- ggplot2::ggplot(subcluster_counts,
+  ggplot2::aes(x = paste0("W", parent_wnn_cluster, " | ", diet), y = nuclei,
+    fill = paste0("C", focused_cluster, " ", working_label))) +
+  ggplot2::geom_col() + ggplot2::facet_wrap(~gate, nrow = 1, scales = "free_y") +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 legend.text = ggplot2::element_text(size = 8)) +
+  ggplot2::labs(title = "Which fixed C0-C5 states enter each ISC score gate?",
+    subtitle = "No new subclustering or relabeling; one bar per parent and diet",
+    x = NULL, y = "Selected nuclei", fill = "05F working annotation")
+save_vector_plot(p_subcluster, PLOTS, "04_preserved_subcluster_composition.pdf", 16, 8)
+```
+
+## 5. Descriptive RNA and ATAC effects on the same fixed consensus peaks
+
+No significance tests use nuclei as replicates. Run the original Step 08E
+`pooled_effect()` with the same CPM pseudocount and evaluable/clear filters.
+The newly calculated proxy and UCell results use **exactly the same** focused
+RNA genes and ATAC consensus peak rows. The eligible contrasts alone receive
+fold changes. Sample-depth and selected-cell counts remain in each record.
+
+```{r pooled-effects}
+all_effects <- list()
+for (modality in c("RNA", "ATAC")) {
+  counts <- if (modality == "RNA") rna else atac
+  depth <- Matrix::colSums(counts)
+  out <- dplyr::bind_rows(lapply(which(contrast$eligible), function(i) {
+    contrast_key <- contrast$contrast[[i]]
+    gate_key <- contrast$gate[[i]]
+    role_key <- contrast$role[[i]]
+    parent_key <- contrast$parent[[i]]
+    message("08F ", modality, " ", contrast_key, ": ",
+            contrast$n_CON[i], " CON / ", contrast$n_HFD[i], " HFD")
+    pooled_effect(counts, meta, contrast$indices[[i]], modality,
+                  total_depth = depth) |>
+      dplyr::mutate(contrast = .env$contrast_key, gate = .env$gate_key,
+        role = .env$role_key, parent = .env$parent_key, .before = 1)
+  }))
+  need(nrow(out) > 0L && !anyDuplicated(out[c("contrast", "feature")]),
+       paste("Bad", modality, "effect table or duplicate feature keys."))
+  write_table(out, OUT, paste0("05_", modality, "_all_eligible_pooled_effects.csv.gz"))
+  all_effects[[modality]] <- out
+  rm(out); invisible(gc())
+}
+```
+
+## 6. Parent consistency, proxy overlap, and depth stability
+
+"Shared" below means the same consensus peak has a descriptive *clear*
+effect in the same direction in **at least two eligible parents**. It does
+not mean a replicated diet effect; if W8 was ineligible, it is explicitly
+absent from that comparison. The C0+C2 and UCell union nuclei may overlap, so
+their peak agreement is a context comparison, not independent validation.
+
+```{r compare-peaks}
+atac_effects <- all_effects$ATAC
+parent_peaks <- atac_effects |>
+  dplyr::filter(role == "parent_gate") |>
+  dplyr::group_by(gate, feature) |>
+  dplyr::summarise(n_parent_effects = dplyr::n(),
+    n_parent_evaluable = sum(evaluable, na.rm = TRUE),
+    n_HFD_open = sum(clear_effect & log2FC_HFD_vs_CON > 0, na.rm = TRUE),
+    n_CON_open = sum(clear_effect & log2FC_HFD_vs_CON < 0, na.rm = TRUE),
+    HFD_open_parents = paste(parent[clear_effect &
+      log2FC_HFD_vs_CON > 0], collapse = ";"),
+    CON_open_parents = paste(parent[clear_effect &
+      log2FC_HFD_vs_CON < 0], collapse = ";"), .groups = "drop") |>
+  dplyr::mutate(parent_pattern = dplyr::case_when(
+    n_HFD_open > 0 & n_CON_open > 0 ~ "opposing_parent_directions",
+    n_HFD_open >= 2 ~ "shared_HFD_open",
+    n_CON_open >= 2 ~ "shared_CON_open",
+    n_HFD_open + n_CON_open == 1 ~ "one_parent_clear",
+    TRUE ~ "no_clear_parent_effect"))
+write_table(parent_peaks, OUT, "06_parent_peak_direction_comparison.csv.gz")
+parent_review <- contrast |>
+  dplyr::filter(gate %in% names(GATE_FRACTIONS), role == "parent_gate") |>
+  dplyr::select(gate, parent, n_CON, n_HFD, eligible, status)
+write_table(parent_review, OUT, "06_which_parent_effects_are_available.csv")
+
+proxy_peak <- atac_effects |>
+  dplyr::filter(contrast == "proxy_C0_C2") |>
+  dplyr::select(feature, proxy_evaluable = evaluable,
+    proxy_clear = clear_effect, proxy_log2FC = log2FC_HFD_vs_CON,
+    proxy_CON_percent = CON_percent, proxy_HFD_percent = HFD_percent)
+union_peaks <- atac_effects |>
+  dplyr::filter(role == "union_sensitivity") |>
+  dplyr::select(gate, feature, union_evaluable = evaluable,
+    union_clear = clear_effect, union_log2FC = log2FC_HFD_vs_CON,
+    union_CON_percent = CON_percent, union_HFD_percent = HFD_percent) |>
+  dplyr::left_join(proxy_peak, by = "feature", relationship = "many-to-one") |>
+  dplyr::left_join(parent_peaks, by = c("gate", "feature"),
+                   relationship = "one-to-one") |>
+  dplyr::mutate(proxy_union_class = dplyr::case_when(
+    !union_evaluable | !proxy_evaluable ~ "one_or_both_sparse",
+    union_clear & proxy_clear &
+      sign(union_log2FC) == sign(proxy_log2FC) ~ "both_clear_same_direction",
+    union_clear & proxy_clear &
+      sign(union_log2FC) != sign(proxy_log2FC) ~ "both_clear_opposite_direction",
+    union_clear & !proxy_clear ~ "union_only_clear",
+    !union_clear & proxy_clear ~ "proxy_only_clear",
+    TRUE ~ "neither_clear"))
+write_table(union_peaks, OUT, "06_proxy_vs_UCell_union_all_peaks.csv.gz")
+comparison_counts <- union_peaks |>
+  dplyr::count(gate, parent_pattern, proxy_union_class, name = "peaks")
+write_table(comparison_counts, OUT, "06_peak_comparison_counts.csv")
+
+p_peak_scatter <- ggplot2::ggplot(dplyr::filter(union_peaks,
+  union_evaluable, proxy_evaluable),
+  ggplot2::aes(proxy_log2FC, union_log2FC, color = proxy_union_class)) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = .2) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = .2) +
+  ggplot2::geom_point(size = .28, alpha = .25) +
+  ggplot2::facet_wrap(~gate, nrow = 1) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "Proxy versus UCell-selected accessibility effects",
+    subtitle = "Same consensus peaks, partly overlapping nuclei; no independent replication",
+    x = "C0+C2 HFD/CON pooled ATAC log2FC",
+    y = "Selected W0+W6+W8 pooled ATAC log2FC",
+    color = "Description")
+save_vector_plot(p_peak_scatter, PLOTS, "05_proxy_vs_union_peak_effects.pdf", 14, 6)
+
+# Inspect group identity and depth before interpreting a union.
+identity_review <- gate_cells |>
+  dplyr::filter(selected) |>
+  dplyr::group_by(gate, parent_wnn_cluster, diet) |>
+  dplyr::summarise(n = dplyr::n(),
+    median_ISC = median(ISC_core6_UCell),
+    median_ISC_plus_Olfm4 = median(ISC_plus_Olfm4_UCell),
+    median_cycle = median(Cell_cycle_UCell),
+    median_secretory = median(Secretory_DSC_UCell),
+    median_ISC_genes_detected = median(ISC_core_genes_detected),
+    median_RNA_features = median(nFeature_RNA),
+    median_ATAC_counts = median(nCount_ATAC), .groups = "drop")
+write_table(identity_review, OUT, "06_parent_identity_and_depth_review.csv")
+```
+
+Use the same Step 08E equal-cell and RNA/ATAC-depth-matched draws for a fixed,
+bounded set of peaks, selected once per contrast from the full effect. These
+draws test dependence on cell/depth composition, **not** biological variance.
+
+```{r resampling}
+resample_keys <- c("proxy_C0_C2", "ISC_union_top15", "ISC_union_top10",
+  "ISC_union_top05", "W0_top15", "W6_top15", "W8_top15")
+resample_keys <- intersect(resample_keys, contrast$contrast[contrast$eligible])
+stability <- dplyr::bind_rows(lapply(resample_keys, function(key) {
+  i <- match(key, contrast$contrast)
+  t <- atac_effects |>
+    dplyr::filter(contrast == key, evaluable) |>
+    dplyr::arrange(dplyr::desc(abs(log2FC_HFD_vs_CON)))
+  picked <- head(t$feature, 200L)
+  if (!length(picked)) return(tibble())
+  message("Depth and cell resampling: ", key, " (", length(picked), " peaks)")
+  resampling_effects(atac, meta, contrast$indices[[i]], t, picked,
+                     "ATAC", iterations = N_DRAWS) |>
+    dplyr::mutate(contrast = key, .before = 1)
+}))
+write_table(stability, OUT, "07_ATAC_equal_cell_and_depth_sensitivity.csv.gz")
+depth_stability <- stability |>
+  dplyr::filter(method == "depth_matched") |>
+  dplyr::select(contrast, feature, valid_iterations,
+    depth_median_log2FC = median_log2FC,
+    depth_sign_agreement_percent = sign_agreement_percent,
+    sampled_n_per_diet_min)
+```
+
+## 7. Prioritize loci and overlay Gourab's Figure 2 genes afterward
+
+The 37 HyperMet and 91 HypoImmune names supplied by Dom are used **only now**.
+They do not enter clustering, the UCell score, thresholding, or peak-effect
+selection. A source gene is displayed beside a peak only for an overlap with
+its ±2 kb annotated promoter, with RNA shown as a separate observation. This
+does not infer an enhancer target. `Atpif1` is mapped to `Atp5if1` in the
+current assay; absent genes remain in the gene audit.
+
+```{r posthoc-source-overlay}
+GOURAB_PROGRAMS <- list(
+ HyperMet = strsplit(paste(
+  "Mgst1 Gstm1 Idh1 Gss Gsta4 Gclm Sod1 Sult1a1 Hmgcs2 Acsm3 Csad",
+  "Acss2 Shmt1 Impdh2 Akr7a5 Adk Aprt Hao2 Hadh Mecr Scd2 Mif Fads2",
+  "Acads Sox9 Aldob Atpif1 Uqcrc1 Slc4a4 Hspd1 Eef1a1 Nox1 Cyba",
+  "Tkt Gpx2 Gsto1 Adh1"), " ")[[1]],
+ HypoImmune = strsplit(paste(
+  "Nupr1 Crip1 Atp2a3 Cdkn1a Cd74 Herpud1 Dnajc10 Ern2 Itpr1 Xbp1",
+  "P4hb Selenok Selenos Creb3l1 Serinc3 Sh3glb1 H2-K1 H2-D1 B2m",
+  "H2-T23 Psmb8 Calr Ceacam1 Klf4 Mia3 Cd24a Rap1gap Pla2g2f",
+  "Spint2 Trp53inp1 Gabarap Gabarapl2 Camk2n1 S100a13 Oit1 Syt7",
+  "Serp1 Rab3d Rab15 Agr2 Hspa5 Manf Dnajc3 Creb3l4 Pdia3 Pdia6",
+  "Sdf2l1 Sec61b Ramp1 Galnt7 C1galt1 Gfpt1 Gcnt3 St3gal6 Tmem59",
+  "St6galnac6 Galnt10 C1galt1c1 Fut2 Galnt3 Rpn1 Krtcap2 Pmm2",
+  "Prdx6 Qsox1 Sh3bgrl3 Txndc5 Pdia5 Dap Foxa3 Clca1 Tspan13",
+  "Atp2c2 P2rx4 Stim2 Asph Fxyd3 Lrrc26 Kit Plpp1 Pdxdc1 Rrbp1",
+  "Tram1 Sec62 Ssr1 Bag1 Lman1 Actb Fos Il13ra1 Ifngr1"), " ")[[1]]
+)
+need(length(GOURAB_PROGRAMS$HyperMet) == 37L &&
+     length(GOURAB_PROGRAMS$HypoImmune) == 91L,
+     "Figure 2 program list length changed.")
+source_genes <- dplyr::bind_rows(lapply(names(GOURAB_PROGRAMS), function(p) {
+  tibble(program = p, original_symbol = GOURAB_PROGRAMS[[p]],
+    gene = ifelse(GOURAB_PROGRAMS[[p]] == "Atpif1", "Atp5if1",
+                  GOURAB_PROGRAMS[[p]]),
+    expected_HFD_sign = ifelse(p == "HyperMet", 1L, -1L))
+})) |>
+  dplyr::mutate(in_RNA_assay = gene %in% rownames(rna))
+write_table(source_genes, OUT, "08_Gourab_gene_assay_audit.csv")
+source_RNA <- all_effects$RNA |>
+  dplyr::filter(feature %in% source_genes$gene) |>
+  dplyr::left_join(source_genes, by = c("feature" = "gene"),
+                   relationship = "many-to-one") |>
+  dplyr::mutate(source_direction_match = evaluable &
+    sign(log2FC_HFD_vs_CON) == expected_HFD_sign,
+    source_clear_same_direction = clear_effect & source_direction_match)
+write_table(source_RNA, OUT, "08_posthoc_Gourab_RNA_effects_by_population.csv")
+
+promoter_map <- promoter_peak_map(obj, window = 2000L)$map |>
+  dplyr::filter(peak %in% rownames(atac)) |>
+  dplyr::select(gene, peak, chromosome, peak_start, peak_end,
+    strand, tss, strand_oriented_center_distance) |>
+  dplyr::distinct()
+source_promoters <- promoter_map |>
+  dplyr::inner_join(source_genes, by = "gene", relationship = "many-to-one")
+write_table(source_promoters, OUT,
+            "08_source_gene_promoter_peak_annotations.csv.gz")
+
+# Pick locus examples using ATAC alone. The rank is set by union/proxy ATAC
+# effects and parent consistency, before checking any source-gene overlay.
+peak_priority <- union_peaks |>
+  dplyr::left_join(depth_stability |>
+    dplyr::filter(grepl("^ISC_union_", contrast)) |>
+    dplyr::mutate(gate = sub("^ISC_union_", "", contrast)) |>
+    dplyr::select(gate, feature, union_depth_sign = depth_sign_agreement_percent,
+                  union_valid_draws = valid_iterations),
+    by = c("gate", "feature"), relationship = "one-to-one") |>
+  dplyr::mutate(direction = ifelse(union_log2FC > 0, "HFD_open", "CON_open"),
+    eligible_candidate = union_evaluable & union_clear,
+    stable_if_resampled = !is.na(union_depth_sign) &
+      union_valid_draws >= 15L & union_depth_sign >= 80,
+    proxy_agrees = proxy_union_class == "both_clear_same_direction",
+    parent_recurrence = pmax(dplyr::coalesce(n_HFD_open, 0L),
+                             dplyr::coalesce(n_CON_open, 0L)),
+    rank_score = 100 * as.integer(proxy_agrees) +
+      10 * parent_recurrence + 5 * as.integer(stable_if_resampled) +
+      abs(union_log2FC))
+write_table(peak_priority, OUT, "08_ATAC_first_candidate_peak_priority.csv.gz")
+annotated_priority <- peak_priority |>
+  dplyr::filter(eligible_candidate) |>
+  dplyr::left_join(promoter_map |> dplyr::group_by(peak) |>
+    dplyr::summarise(promoter_genes = paste(sort(unique(gene)), collapse = ";"),
+                     .groups = "drop"), by = c("feature" = "peak"),
+    relationship = "many-to-one") |>
+  dplyr::left_join(source_promoters |> dplyr::group_by(peak) |>
+    dplyr::summarise(Gourab_promoter_genes =
+      paste(sort(unique(original_symbol)), collapse = ";"), .groups = "drop"),
+    by = c("feature" = "peak"), relationship = "many-to-one")
+write_table(annotated_priority, OUT,
+            "08_ATAC_candidates_with_posthoc_promoter_context.csv.gz")
+```
+
+## 8. Candidate BED sets and locus coverage
+
+Export the descriptive candidate sets in the mouse GRCm39 reference. BED
+starts are zero-based and ends are exclusive. These
+files are for *review and later motif analysis*, not approved motif target
+sets. If coverage fragments are inaccessible, keep the peak tables and record the failed plot attempts rather than suppressing the other outputs.
+
+```{r candidate-bed-and-coverage}
+peak_gr <- GenomicRanges::granges(obj[["ATAC.crypt"]])
+names(peak_gr) <- rownames(atac)
+need(identical(names(peak_gr), rownames(atac)),
+     "ATAC range/feature identity mismatch before BED export.")
+for (g in names(GATE_FRACTIONS)) {
+  for (dir in c("HFD_open", "CON_open")) {
+    x <- annotated_priority |>
+      dplyr::filter(gate == .env$g, direction == .env$dir,
+        stable_if_resampled | parent_recurrence >= 2L) |>
+      dplyr::arrange(dplyr::desc(rank_score)) |>
+      dplyr::distinct(feature, .keep_all = TRUE)
+    gr <- peak_gr[match(x$feature, names(peak_gr))]
+    bed <- tibble(chrom = as.character(GenomicRanges::seqnames(gr)),
+      start0 = as.integer(BiocGenerics::start(gr)) - 1L,
+      end = as.integer(BiocGenerics::end(gr)), peak = x$feature)
+    readr::write_tsv(bed, file.path(OUT, paste0("09_", g, "_", dir,
+                     "_review_only_GRCm39.bed")), col_names = FALSE)
+  }
+}
+
+# Prioritize at most four distinct ATAC loci from the 15% union. Source-gene
+# annotations are joined only after this selection and cannot drive it.
+coverage_loci <- peak_priority |>
+  dplyr::filter(gate == "top15", eligible_candidate) |>
+  dplyr::arrange(dplyr::desc(proxy_agrees),
+                  dplyr::desc(parent_recurrence),
+                  dplyr::desc(stable_if_resampled),
+                  dplyr::desc(abs(union_log2FC))) |>
+  dplyr::distinct(feature, .keep_all = TRUE) |>
+  dplyr::slice_head(n = MAX_COVERAGE_LOCI) |>
+  dplyr::select(feature, direction, union_log2FC,
+                proxy_log2FC, parent_recurrence,
+                union_depth_sign, proxy_agrees)
+write_table(coverage_loci, OUT, "09_prespecified_ATAC_locus_examples.csv")
+# Match these ATAC-first loci to RNA only after the loci have been selected.
+# An overlapping promoter annotates location, not a peak-to-gene link.
+example_keys <- c("proxy_C0_C2", "ISC_union_top15")
+example_peaks <- atac_effects |>
+  dplyr::filter(contrast %in% example_keys,
+                feature %in% coverage_loci$feature) |>
+  dplyr::transmute(contrast, feature, layer = "ATAC peak",
+    label = "peak", log2FC_HFD_vs_CON, evaluable, clear_effect,
+    CON_percent, HFD_percent)
+example_rna <- promoter_map |>
+  dplyr::filter(peak %in% coverage_loci$feature,
+                gene %in% rownames(rna)) |>
+  dplyr::distinct(feature = peak, gene) |>
+  dplyr::inner_join(all_effects$RNA |>
+    dplyr::filter(contrast %in% example_keys) |>
+    dplyr::select(contrast, gene = feature, log2FC_HFD_vs_CON, evaluable,
+                  clear_effect, CON_percent, HFD_percent),
+    by = "gene", relationship = "many-to-many") |>
+  dplyr::transmute(contrast, feature, layer = "Promoter-overlap RNA",
+    label = gene, log2FC_HFD_vs_CON, evaluable, clear_effect,
+    CON_percent, HFD_percent)
+example_context <- dplyr::bind_rows(example_peaks, example_rna) |>
+  dplyr::mutate(feature = factor(feature, levels = rev(coverage_loci$feature)))
+write_table(example_context, OUT, "09_ATAC_first_examples_with_RNA_context.csv")
+if (nrow(example_context)) {
+  p_examples <- ggplot2::ggplot(example_context,
+    ggplot2::aes(log2FC_HFD_vs_CON, feature, color = clear_effect,
+                 shape = evaluable)) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = .25) +
+    ggplot2::geom_point(size = 2.5,
+      position = ggplot2::position_dodge(width = .5)) +
+    ggplot2::geom_text(data = dplyr::filter(example_context,
+      layer == "Promoter-overlap RNA"), ggplot2::aes(label = label),
+      color = "grey20", size = 2.5, vjust = -.8, check_overlap = TRUE) +
+    ggplot2::facet_grid(layer ~ contrast, scales = "free_x") +
+    ggplot2::scale_color_manual(values = c(`FALSE` = "grey60",
+                                    `TRUE` = "#007F86")) +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::labs(title = "ATAC-first locus examples and overlapping promoter RNA",
+      subtitle = "Same peaks in both arms; RNA rows only when an annotated ±2 kb promoter overlaps; pooled descriptive effects",
+      x = "Pooled HFD/CON log2FC", y = "Consensus peak",
+      color = "Clear effect", shape = "Evaluable")
+  save_vector_plot(p_examples, PLOTS, "08_locus_ATAC_and_RNA_context.pdf", 13, 7)
+}
+coverage_keys <- c("proxy_C0_C2", "ISC_union_top15")
+coverage_status <- tidyr::expand_grid(contrast = coverage_keys,
+                                     feature = coverage_loci$feature) |>
+  dplyr::mutate(status = "not_attempted", detail = "")
+if (RUN_COVERAGE && nrow(coverage_loci)) {
+  if (!length(Signac::Fragments(global[["ATAC"]]))) {
+    coverage_status$status <- "skipped"
+    coverage_status$detail <- "Step 06 ATAC fragment references are unavailable"
+  } else {
+    coverage_groups <- list(
+      proxy_C0_C2 = contrast$indices[[match("proxy_C0_C2", contrast$contrast)]],
+      ISC_union_top15 = contrast$indices[[match("ISC_union_top15", contrast$contrast)]])
+    for (key in names(coverage_groups)) {
+      ix <- coverage_groups[[key]]
+      if (!contrast$eligible[match(key, contrast$contrast)]) {
+        coverage_status$status[coverage_status$contrast == key] <- "ineligible"
+        next
+      }
+      coverage_obj <- subset(global, cells = meta$cell_barcode[ix])
+      SeuratObject::DefaultAssay(coverage_obj) <- "ATAC"
+      for (j in seq_len(nrow(coverage_loci))) {
+        peak <- coverage_loci$feature[j]
+        k <- which(coverage_status$contrast == key &
+                   coverage_status$feature == peak)
+        gr <- peak_gr[match(peak, names(peak_gr))]
+        region <- paste0(as.character(GenomicRanges::seqnames(gr)), ":",
+          max(1L, as.integer(BiocGenerics::start(gr)) - 5000L), "-",
+          as.integer(BiocGenerics::end(gr)) + 5000L)
+        tryCatch({
+          p <- Signac::CoveragePlot(coverage_obj, region = region,
+  assay = "ATAC", annotation = "gene", peaks = TRUE,
+  links = FALSE, tile = FALSE, group.by = "diet",
+  ymax = "q95", sep = c(":", "-")) +
+  patchwork::plot_annotation(title = paste(key, peak),
+    subtitle = "CON and HFD pooled depth-normalized coverage; same GRCm39 locus")
+          ggplot2::ggsave(file.path(PLOTS, paste0("09_", key, "_locus_", j,
+            ".pdf")), plot = p, device = grDevices::pdf,
+            useDingbats = FALSE, width = 13, height = 7)
+          coverage_status$status[k] <- "saved"
+        }, error = function(e) {
+          coverage_status$status[k] <<- "plot_failed"
+          coverage_status$detail[k] <<- conditionMessage(e)
+          warning("Coverage plot failed for ", key, " / ", peak, ": ",
+                  conditionMessage(e))
+        })
+      }
+      rm(coverage_obj); invisible(gc())
+    }
+  }
+}
+write_table(coverage_status, OUT, "09_coverage_plot_status.csv")
+```
+
+## 9. Review and completion
+
+Inspect `02_contrast_definitions_and_eligibility.csv` first. Look at
+`06_parent_identity_and_depth_review.csv` and the fixed C0–C5 assignments
+before using the pooled UCell union. Next compare the direction of shared and
+parent-specific peaks, the bounded depth draws, and the ATAC-first loci. Keep
+the source-gene overlap as post hoc context. The BED sets are not yet motif
+results; future enrichment will need a matched background for GC, width,
+baseline accessibility, and genomic context, plus a minimum peak-set size.
+
+```{r finish}
+finish_run(OUT, "STEP_08F_COMPLETE.txt", c(
+  "Input: completed WT Step 08E and unchanged Step 05E/05F and 06 objects",
+  paste("Signature:", paste(ISC_CORE, collapse = ",")),
+  paste("UCell maxRank:", UCELL_MAX_RANK,
+        "; sensitivity maxRank:", UCELL_SENS_RANK),
+  paste("Eligibility min nuclei per diet:", MIN_PER_DIET),
+  paste("Eligible contrasts:", paste(contrast$contrast[contrast$eligible],
+                                    collapse = ";")),
+  "05F labels altered: FALSE; biological diet replication/FDR: FALSE",
+  "Peak sets and locus choices descriptive; motif enrichment: NOT PERFORMED"))
+```

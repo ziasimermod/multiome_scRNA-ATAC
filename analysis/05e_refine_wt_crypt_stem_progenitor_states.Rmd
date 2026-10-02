@@ -1,0 +1,2460 @@
+---
+title: "Step 5E - Focused WT crypt stem and progenitor refinement"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# Purpose
+
+Step 5D showed that the existing WT crypt annotations are too coarse for a
+defensible stem-versus-progenitor interpretation. In particular, global WNN
+cluster 0 contains a strong cycling program, cluster 6 resembles a
+`Dmbt1`/`Cftr`-rich crypt progenitor state, and cluster 8 does not behave as a
+clean canonical ISC population in the symmetric source comparison.
+
+This notebook performs a **review-only** focused analysis. It does not replace
+the approved Step 6 labels. It:
+
+1. refits RNA PCA, ATAC LSI, and WNN neighborhoods within clusters 0, 6, and 8;
+2. builds an RNA-only clustering sensitivity on those same nuclei;
+3. repeats the WNN fit after adding clusters 1 and 18 as absorptive and
+   secretory boundary sensitivities;
+4. scores cell cycle, curated crypt programs, and marker programs derived from
+   Gourab's original d21 integrated clusters;
+5. audits cluster stability, parent composition, diet representation, QC, and
+   modality weights across a resolution grid;
+6. performs formal marker review at the primary resolution 0.3 and sensitivity
+   resolutions 0.4 and 0.6;
+7. pairs targeted RNA evidence with exact promoter accessibility within 2 kb
+   of the annotated TSS; and
+8. exports marker and crosswalk tables for a manual refinement decision.
+
+The focused clusters are discovered independently of all marker-program
+scores. Those scores are used only after clustering to interpret the result.
+No diet-effect inference is performed because each diet is represented by one
+pooled library.
+
+A practical SOL allocation is **8 CPU cores, 96 GiB memory, 8 hours, R 4.4.2,
+no GPU**.
+
+# 1. Setup
+
+```r
+Sys.setenv(
+  MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt"
+)
+```
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 12,
+  fig.height = 8
+)
+
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else {
+  stop("Open multiome_scRNA-ATAC.Rproj before running this notebook.")
+}
+
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+
+check_r_version()
+package_preflight()
+initialize_output_dirs()
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Signac)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+if (!requireNamespace("presto", quietly = TRUE)) {
+  stop(
+    "Package 'presto' is required for the focused marker audit. Run ",
+    "setup/install_packages.R in a clean R session first.",
+    call. = FALSE
+  )
+}
+
+if (
+  !identical(DATASET_VERSION, "v2_resequenced") ||
+    !identical(COHORT_ID, "wt")
+) {
+  stop(
+    "Step 5E requires MULTIOME_DATASET_VERSION=v2_resequenced and ",
+    "MULTIOME_COHORT_ID=wt.",
+    call. = FALSE
+  )
+}
+
+ggplot2::theme_set(theme_multiome())
+future::plan(future::sequential)
+set.seed(12345)
+```
+
+# 2. Inputs, outputs, and audit parameters
+
+```{r define-inputs-and-outputs}
+ANALYSIS_VERSION <- "05e_focused_wt_crypt_v5"
+
+STEP6_OBJECT_PATH <- file.path(
+  OUTPUT_DIR,
+  "06_annotation",
+  "multiome_annotated.rds"
+)
+
+STEP5D_DIR <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "gourab_d21_rna_reference_mapping",
+  "05d_symmetric_pseudobulk_validation"
+)
+
+SOURCE_MARKER_PATH <- file.path(
+  STEP5D_DIR,
+  "tables",
+  "source_integrated_cluster_all_positive_markers.csv"
+)
+
+STEP5E_DIR <- file.path(
+  OUTPUT_DIR,
+  "05_wnn",
+  "focused_wt_crypt_stem_progenitor"
+)
+
+STEP5E_TABLE_DIR <- file.path(STEP5E_DIR, "tables")
+STEP5E_PLOT_DIR <- file.path(STEP5E_DIR, "plots")
+STEP5E_OBJECT_DIR <- file.path(STEP5E_DIR, "objects")
+
+for (output_directory in c(
+  STEP5E_DIR,
+  STEP5E_TABLE_DIR,
+  STEP5E_PLOT_DIR,
+  STEP5E_OBJECT_DIR
+)) {
+  dir.create(output_directory, recursive = TRUE, showWarnings = FALSE)
+}
+
+for (input_path in c(STEP6_OBJECT_PATH, SOURCE_MARKER_PATH)) {
+  assert_file(input_path)
+}
+
+CORE_PARENT_CLUSTERS <- c("0", "6", "8")
+BOUNDARY_PARENT_CLUSTERS <- c("0", "1", "6", "8", "18")
+
+FOCUSED_RESOLUTIONS <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8)
+PRIMARY_REVIEW_RESOLUTION <- 0.3
+MARKER_REVIEW_RESOLUTIONS <- c(0.3, 0.4, 0.6)
+
+RNA_NFEATURES <- 3000L
+RNA_NPCS <- 30L
+RNA_DIMS <- 1:20
+ATAC_NLSI <- 30L
+ATAC_DIMS <- 2:20
+WNN_K <- 20L
+
+MIN_PROGRAM_GENES <- 3L
+SOURCE_SIGNATURE_GENES_PER_CLUSTER <- 50L
+MARKER_MIN_PCT <- 0.10
+MARKER_LOGFC_THRESHOLD <- 0.25
+MARKER_ADJUSTED_P_THRESHOLD <- 0.05
+
+TARGETED_EVIDENCE_PROGRAMS <- list(
+  canonical_ISC = c(
+    "Lgr5", "Ascl2", "Smoc2", "Axin2", "Olfm4", "Lrig1", "Rnf43"
+  ),
+  cell_cycle = c(
+    "Mki67", "Top2a", "Cenpf", "Ube2c", "Cdk1", "Ccnb1"
+  ),
+  crypt_progenitor = c(
+    "Dmbt1", "Cftr", "Htr4", "Kcnq1", "Slc12a2", "Hmgcs2", "Hsd3b3"
+  ),
+  secretory_DSC = c(
+    "Atoh1", "Dll1", "Spdef", "Muc2", "Reg4", "Spink4",
+    "Slc12a8", "Kcnma1", "Sytl2"
+  )
+)
+
+TARGETED_EVIDENCE_GENES <- unique(unlist(TARGETED_EVIDENCE_PROGRAMS))
+PROMOTER_WINDOW_BP <- 2000L
+
+TECHNICAL_GENE_PATTERN <- paste0(
+  "^(mt-|Rpl|Rps|Gm[0-9]+|Mir[0-9]+|Snor|Hist[0-9])",
+  "|Rik$"
+)
+
+CURATED_PROGRAMS <- list(
+  curated_canonical_ISC = c(
+    "Lgr5", "Ascl2", "Smoc2", "Axin2", "Olfm4", "Lrig1",
+    "Prom1", "Sox9", "Hopx", "Tert"
+  ),
+  curated_cell_cycle = c(
+    "Mki67", "Top2a", "Cenpf", "Ube2c", "Cdk1", "Ccnb1",
+    "Ccnb2", "Tpx2", "Nusap1", "Kif11", "Birc5", "Prc1"
+  ),
+  curated_crypt_progenitor = c(
+    "Dmbt1", "Cftr", "Htr4", "Kcnq1", "Slc12a2", "Sema5a",
+    "Hmga2", "Clca3a2", "Kitl", "Hmgcs2"
+  ),
+  curated_early_absorptive = c(
+    "Slc26a3", "Slc9a2", "Lama3", "Car4", "Aqp8", "Krt20",
+    "Mxd1", "Tgm3", "Muc3", "Cyp2c55"
+  ),
+  curated_secretory_commitment = c(
+    "Atoh1", "Dll1", "Spdef", "Muc2", "Agr2", "Gfi1",
+    "Neurog3", "Fcgbp", "Clca1", "Zg16"
+  ),
+  curated_Reg4_DSC = c(
+    "Reg4", "Spink4", "Kit", "Klk1", "Car8", "Hepacam2",
+    "Slc12a8", "Sytl2", "Plcb4", "Agr2"
+  )
+)
+
+SOURCE_PROGRAM_CLUSTER_MAP <- list(
+  source_G6_canonical_ISC = "6",
+  source_G7_mixed_crypt_secretory = "7",
+  source_G8_absorptive_like_legacy_stem = "8",
+  source_G9_crypt_progenitor = "9",
+  source_G5_G11_cycling_TA = c("5", "11"),
+  source_G3_G12_cycling_secretory = c("3", "12")
+)
+
+resolution_tag <- function(resolution) {
+  format(resolution, nsmall = 1, trim = TRUE)
+}
+
+resolution_column <- function(prefix, resolution) {
+  paste0(prefix, "_res_", resolution_tag(resolution))
+}
+
+CORE_WNN_PREFIX <- "crypt_core_wnn"
+CORE_RNA_PREFIX <- "crypt_core_rna"
+BOUNDARY_WNN_PREFIX <- "crypt_boundary_wnn"
+```
+
+# 3. Helper functions
+
+```{r define-helper-functions}
+get_aligned_layer <- function(object, assay, layer, cells = colnames(object)) {
+  matrix_data <- SeuratObject::LayerData(
+    object[[assay]],
+    layer = layer
+  )
+
+  if (!setequal(colnames(matrix_data), colnames(object))) {
+    stop(
+      "Assay ", assay, " layer ", layer,
+      " does not contain the same cells as the Seurat object.",
+      call. = FALSE
+    )
+  }
+
+  missing_cells <- setdiff(cells, colnames(matrix_data))
+
+  if (length(missing_cells) > 0L) {
+    stop(
+      "Requested cells are absent from assay ", assay, ": ",
+      paste(head(missing_cells, 10L), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  matrix_data[, cells, drop = FALSE]
+}
+
+derive_source_programs <- function(marker_table) {
+  required_columns <- c(
+    "cluster", "gene", "effect_size", "pct.1", "pct.2", "p_val_adj"
+  )
+
+  missing_columns <- setdiff(required_columns, colnames(marker_table))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      "The Step 5D source marker table is missing column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  marker_table <- marker_table |>
+    dplyr::mutate(
+      cluster = as.character(cluster),
+      gene = as.character(gene),
+      pct_delta = pct.1 - pct.2
+    ) |>
+    dplyr::filter(
+      is.finite(effect_size),
+      effect_size > 0,
+      is.finite(p_val_adj),
+      p_val_adj < 0.05,
+      !grepl(TECHNICAL_GENE_PATTERN, gene)
+    )
+
+  programs <- lapply(
+    SOURCE_PROGRAM_CLUSTER_MAP,
+    function(source_clusters) {
+      marker_table |>
+        dplyr::filter(cluster %in% source_clusters) |>
+        dplyr::group_by(cluster) |>
+        dplyr::arrange(
+          p_val_adj,
+          dplyr::desc(pct_delta),
+          dplyr::desc(effect_size),
+          .by_group = TRUE
+        ) |>
+        dplyr::slice_head(n = SOURCE_SIGNATURE_GENES_PER_CLUSTER) |>
+        dplyr::ungroup() |>
+        dplyr::distinct(gene) |>
+        dplyr::pull(gene)
+    }
+  )
+
+  too_small <- names(programs)[lengths(programs) < MIN_PROGRAM_GENES]
+
+  if (length(too_small) > 0L) {
+    stop(
+      "Too few genes were recovered for source program(s): ",
+      paste(too_small, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  programs
+}
+
+add_program_scores <- function(object, assay, programs) {
+  normalized_data <- SeuratObject::LayerData(
+    object[[assay]],
+    layer = "data"
+  )
+
+  available_programs <- lapply(
+    programs,
+    function(genes) intersect(unique(genes), rownames(normalized_data))
+  )
+
+  program_gene_summary <- tibble::tibble(
+    program = names(programs),
+    genes_requested = lengths(programs),
+    genes_available = lengths(available_programs),
+    available_genes = vapply(
+      available_programs,
+      paste,
+      character(1),
+      collapse = ";"
+    )
+  )
+
+  invalid_programs <- program_gene_summary$program[
+    program_gene_summary$genes_available < MIN_PROGRAM_GENES
+  ]
+
+  if (length(invalid_programs) > 0L) {
+    stop(
+      "Fewer than ", MIN_PROGRAM_GENES,
+      " genes were available for program(s): ",
+      paste(invalid_programs, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  for (program_name in names(available_programs)) {
+    program_features <- available_programs[[program_name]]
+    temporary_prefix <- paste0("temporary_", program_name, "_")
+    metadata_before <- colnames(object[[]])
+
+    object <- Seurat::AddModuleScore(
+      object,
+      features = list(program_features),
+      assay = assay,
+      name = temporary_prefix,
+      seed = 12345,
+      search = FALSE
+    )
+
+    added_columns <- setdiff(colnames(object[[]]), metadata_before)
+
+    if (length(added_columns) != 1L) {
+      stop(
+        "Could not identify the AddModuleScore output for ",
+        program_name,
+        call. = FALSE
+      )
+    }
+
+    score_column <- paste0(program_name, "_score")
+    detection_column <- paste0(program_name, "_genes_detected")
+
+    object[[score_column]] <- object[[]][[added_columns]]
+    object[[added_columns]] <- NULL
+    object[[detection_column]] <- Matrix::colSums(
+      normalized_data[program_features, , drop = FALSE] > 0
+    )
+  }
+
+  list(
+    object = object,
+    gene_summary = program_gene_summary,
+    programs = available_programs
+  )
+}
+
+build_focused_reductions <- function(
+  parent_object,
+  parent_clusters,
+  reduction_prefix,
+  build_rna_graph = FALSE
+) {
+  parent_values <- as.character(parent_object$wnn_cluster)
+  focused_cells <- colnames(parent_object)[
+    parent_values %in% parent_clusters
+  ]
+
+  if (length(focused_cells) == 0L) {
+    stop(
+      "No nuclei matched parent clusters: ",
+      paste(parent_clusters, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  focused <- subset(parent_object, cells = focused_cells)
+  focused$parent_wnn_cluster <- as.character(focused$wnn_cluster)
+
+  rna_counts <- get_aligned_layer(
+    parent_object,
+    assay = "RNA",
+    layer = "counts",
+    cells = focused_cells
+  )
+
+  focused[["RNA.crypt"]] <- SeuratObject::CreateAssayObject(
+    counts = rna_counts
+  )
+  SeuratObject::Key(focused[["RNA.crypt"]]) <- "CRYPT_"
+
+  # The Seurat object is already restricted to focused_cells. Copying the
+  # complete ChromatinAssay first preserves its ranges, fragments, and genome
+  # annotations. Features are then filtered with subset(), avoiding the
+  # layer-indexing failure produced by assay[logical_vector, ].
+  focused[["ATAC.crypt"]] <- focused[["ATAC"]]
+  SeuratObject::Key(focused[["ATAC.crypt"]]) <- "ATACCRYPT_"
+
+  atac_counts <- SeuratObject::LayerData(
+    focused[["ATAC.crypt"]],
+    layer = "counts"
+  )
+
+  if (!identical(colnames(atac_counts), focused_cells)) {
+    if (!setequal(colnames(atac_counts), focused_cells)) {
+      stop("Focused ATAC counts do not contain the expected nuclei.")
+    }
+    atac_counts <- atac_counts[, focused_cells, drop = FALSE]
+  }
+
+  nonzero_atac_features <- rownames(atac_counts)[
+    Matrix::rowSums(atac_counts) > 0
+  ]
+
+  if (length(nonzero_atac_features) == 0L) {
+    stop("No nonzero ATAC features remain in the focused object.")
+  }
+
+  focused[["ATAC.crypt"]] <- subset(
+    x = focused[["ATAC.crypt"]],
+    features = nonzero_atac_features,
+    cells = focused_cells
+  )
+
+  feature_filter_summary <- tibble::tibble(
+    analysis_scope = reduction_prefix,
+    nuclei = length(focused_cells),
+    parent_clusters = paste(parent_clusters, collapse = ";"),
+    ATAC_features_before = nrow(atac_counts),
+    zero_count_features_removed = nrow(atac_counts) -
+      length(nonzero_atac_features),
+    ATAC_features_retained = length(nonzero_atac_features)
+  )
+
+  rm(rna_counts, atac_counts)
+  invisible(gc())
+
+  rna_pca_name <- paste0(reduction_prefix, ".pca")
+  rna_umap_name <- paste0(reduction_prefix, ".rna.umap")
+  atac_lsi_name <- paste0(reduction_prefix, ".lsi")
+  atac_umap_name <- paste0(reduction_prefix, ".atac.umap")
+  wnn_umap_name <- paste0(reduction_prefix, ".wnn.umap")
+  wknn_name <- paste0(reduction_prefix, ".wknn")
+  wsnn_name <- paste0(reduction_prefix, ".wsnn")
+  weighted_nn_name <- paste0(reduction_prefix, ".weighted.nn")
+  rna_nn_name <- paste0(reduction_prefix, ".rna.nn")
+  rna_snn_name <- paste0(reduction_prefix, ".rna.snn")
+
+  Seurat::DefaultAssay(focused) <- "RNA.crypt"
+
+  focused <- Seurat::NormalizeData(
+    focused,
+    assay = "RNA.crypt",
+    verbose = FALSE
+  )
+  focused <- Seurat::FindVariableFeatures(
+    focused,
+    assay = "RNA.crypt",
+    selection.method = "vst",
+    nfeatures = RNA_NFEATURES,
+    verbose = FALSE
+  )
+  focused <- Seurat::ScaleData(
+    focused,
+    assay = "RNA.crypt",
+    features = Seurat::VariableFeatures(focused[["RNA.crypt"]]),
+    verbose = FALSE
+  )
+  focused <- Seurat::RunPCA(
+    focused,
+    assay = "RNA.crypt",
+    features = Seurat::VariableFeatures(focused[["RNA.crypt"]]),
+    npcs = RNA_NPCS,
+    reduction.name = rna_pca_name,
+    reduction.key = paste0(toupper(gsub("[^A-Za-z0-9]", "", reduction_prefix)), "PCA_"),
+    verbose = FALSE
+  )
+  focused <- Seurat::RunUMAP(
+    focused,
+    reduction = rna_pca_name,
+    dims = RNA_DIMS,
+    reduction.name = rna_umap_name,
+    reduction.key = paste0(toupper(gsub("[^A-Za-z0-9]", "", reduction_prefix)), "RNAUMAP_"),
+    seed.use = 12345,
+    verbose = FALSE
+  )
+
+  Seurat::DefaultAssay(focused) <- "ATAC.crypt"
+  focused <- Signac::RunTFIDF(
+    focused,
+    assay = "ATAC.crypt",
+    verbose = FALSE
+  )
+  focused <- Signac::FindTopFeatures(
+    focused,
+    assay = "ATAC.crypt",
+    min.cutoff = "q5",
+    verbose = FALSE
+  )
+  focused <- Signac::RunSVD(
+    focused,
+    assay = "ATAC.crypt",
+    n = ATAC_NLSI,
+    reduction.name = atac_lsi_name,
+    reduction.key = paste0(toupper(gsub("[^A-Za-z0-9]", "", reduction_prefix)), "LSI_"),
+    verbose = FALSE
+  )
+  focused <- Seurat::RunUMAP(
+    focused,
+    reduction = atac_lsi_name,
+    dims = ATAC_DIMS,
+    reduction.name = atac_umap_name,
+    reduction.key = paste0(toupper(gsub("[^A-Za-z0-9]", "", reduction_prefix)), "ATACUMAP_"),
+    seed.use = 12345,
+    verbose = FALSE
+  )
+
+  focused <- Seurat::FindMultiModalNeighbors(
+    focused,
+    reduction.list = list(rna_pca_name, atac_lsi_name),
+    dims.list = list(RNA_DIMS, ATAC_DIMS),
+    k.nn = WNN_K,
+    knn.graph.name = wknn_name,
+    snn.graph.name = wsnn_name,
+    weighted.nn.name = weighted_nn_name,
+    modality.weight.name = c(
+      paste0(reduction_prefix, ".RNA.weight"),
+      paste0(reduction_prefix, ".ATAC.weight")
+    ),
+    verbose = FALSE
+  )
+  focused <- Seurat::RunUMAP(
+    focused,
+    nn.name = weighted_nn_name,
+    reduction.name = wnn_umap_name,
+    reduction.key = paste0(toupper(gsub("[^A-Za-z0-9]", "", reduction_prefix)), "WNNUMAP_"),
+    seed.use = 12345,
+    verbose = FALSE
+  )
+
+  if (build_rna_graph) {
+    focused <- Seurat::FindNeighbors(
+      focused,
+      reduction = rna_pca_name,
+      dims = RNA_DIMS,
+      graph.name = c(rna_nn_name, rna_snn_name),
+      verbose = FALSE
+    )
+  }
+
+  expected_reductions <- c(
+    rna_pca_name,
+    rna_umap_name,
+    atac_lsi_name,
+    atac_umap_name,
+    wnn_umap_name
+  )
+
+  valid_reductions <- vapply(
+    expected_reductions,
+    function(reduction_name) {
+      all(is.finite(Seurat::Embeddings(focused, reduction_name)))
+    },
+    logical(1)
+  )
+
+  if (!all(valid_reductions)) {
+    stop(
+      "Non-finite values were found in focused reduction(s): ",
+      paste(names(valid_reductions)[!valid_reductions], collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  list(
+    object = focused,
+    feature_filter_summary = feature_filter_summary,
+    rna_pca = rna_pca_name,
+    rna_umap = rna_umap_name,
+    atac_lsi = atac_lsi_name,
+    atac_umap = atac_umap_name,
+    wnn_umap = wnn_umap_name,
+    wsnn = wsnn_name,
+    rna_snn = rna_snn_name
+  )
+}
+
+add_resolution_grid <- function(
+  object,
+  graph_name,
+  column_prefix,
+  resolutions = FOCUSED_RESOLUTIONS
+) {
+  resolution_columns <- character(length(resolutions))
+
+  for (resolution_index in seq_along(resolutions)) {
+    resolution <- resolutions[[resolution_index]]
+    output_column <- resolution_column(column_prefix, resolution)
+
+    object <- Seurat::FindClusters(
+      object,
+      graph.name = graph_name,
+      algorithm = 3,
+      resolution = resolution,
+      random.seed = 12345,
+      verbose = FALSE
+    )
+
+    object[[output_column]] <- as.character(Seurat::Idents(object))
+    resolution_columns[[resolution_index]] <- output_column
+  }
+
+  list(object = object, columns = resolution_columns)
+}
+
+summarise_resolution_grid <- function(
+  object,
+  resolution_columns,
+  analysis_scope,
+  rna_weight_column,
+  atac_weight_column,
+  score_columns
+) {
+  metadata <- object[[]] |>
+    tibble::rownames_to_column("cell_barcode")
+
+  available_qc <- intersect(
+    c(
+      "nCount_RNA", "nFeature_RNA", "nCount_ATAC", "nFeature_ATAC",
+      "percent.mt", "TSS.enrichment", "nucleosome_signal", "frip_cr",
+      "scDblFinder.score", rna_weight_column, atac_weight_column,
+      "S.Score", "G2M.Score"
+    ),
+    colnames(metadata)
+  )
+
+  cluster_summary <- purrr::map2_dfr(
+    FOCUSED_RESOLUTIONS,
+    resolution_columns,
+    function(resolution, cluster_column) {
+      metadata |>
+        dplyr::mutate(focused_subcluster = .data[[cluster_column]]) |>
+        dplyr::group_by(focused_subcluster) |>
+        dplyr::summarise(
+          nuclei = dplyr::n(),
+          CON_nuclei = sum(as.character(diet) == "CON"),
+          HFD_nuclei = sum(as.character(diet) == "HFD"),
+          CON_percent = 100 * mean(as.character(diet) == "CON"),
+          HFD_percent = 100 * mean(as.character(diet) == "HFD"),
+          S_phase_percent = 100 * mean(as.character(Phase) == "S"),
+          G2M_phase_percent = 100 * mean(as.character(Phase) == "G2M"),
+          dplyr::across(
+            dplyr::all_of(c(available_qc, score_columns)),
+            ~ stats::median(.x, na.rm = TRUE),
+            .names = "{.col}_median"
+          ),
+          .groups = "drop"
+        ) |>
+        dplyr::mutate(
+          analysis_scope = analysis_scope,
+          resolution = resolution,
+          cluster_column = cluster_column,
+          .before = 1
+        )
+    }
+  )
+
+  parent_composition <- purrr::map2_dfr(
+    FOCUSED_RESOLUTIONS,
+    resolution_columns,
+    function(resolution, cluster_column) {
+      metadata |>
+        dplyr::transmute(
+          focused_subcluster = .data[[cluster_column]],
+          parent_wnn_cluster = as.character(parent_wnn_cluster)
+        ) |>
+        dplyr::count(
+          focused_subcluster,
+          parent_wnn_cluster,
+          name = "nuclei"
+        ) |>
+        dplyr::group_by(focused_subcluster) |>
+        dplyr::mutate(
+          percent_of_focused_subcluster = 100 * nuclei / sum(nuclei)
+        ) |>
+        dplyr::ungroup() |>
+        dplyr::mutate(
+          analysis_scope = analysis_scope,
+          resolution = resolution,
+          cluster_column = cluster_column,
+          .before = 1
+        )
+    }
+  )
+
+  list(
+    cluster_summary = cluster_summary,
+    parent_composition = parent_composition
+  )
+}
+
+make_adjacent_resolution_crosswalk <- function(
+  object,
+  resolution_columns,
+  analysis_scope
+) {
+  metadata <- object[[]]
+
+  purrr::map_dfr(
+    seq_len(length(resolution_columns) - 1L),
+    function(index) {
+      from_column <- resolution_columns[[index]]
+      to_column <- resolution_columns[[index + 1L]]
+
+      tibble::tibble(
+        from_cluster = as.character(metadata[[from_column]]),
+        to_cluster = as.character(metadata[[to_column]])
+      ) |>
+        dplyr::count(from_cluster, to_cluster, name = "nuclei") |>
+        dplyr::group_by(from_cluster) |>
+        dplyr::mutate(
+          percent_of_from_cluster = 100 * nuclei / sum(nuclei)
+        ) |>
+        dplyr::ungroup() |>
+        dplyr::mutate(
+          analysis_scope = analysis_scope,
+          from_resolution = FOCUSED_RESOLUTIONS[[index]],
+          to_resolution = FOCUSED_RESOLUTIONS[[index + 1L]],
+          from_column = from_column,
+          to_column = to_column,
+          .before = 1
+        )
+    }
+  )
+}
+
+make_same_resolution_crosswalk <- function(
+  left_object,
+  left_columns,
+  right_object,
+  right_columns,
+  comparison
+) {
+  shared_cells <- intersect(colnames(left_object), colnames(right_object))
+
+  if (length(shared_cells) == 0L) {
+    stop("No shared nuclei were available for ", comparison, ".")
+  }
+
+  left_metadata <- left_object[[]][shared_cells, , drop = FALSE]
+  right_metadata <- right_object[[]][shared_cells, , drop = FALSE]
+
+  purrr::pmap_dfr(
+    list(FOCUSED_RESOLUTIONS, left_columns, right_columns),
+    function(resolution, left_column, right_column) {
+      tibble::tibble(
+        left_cluster = as.character(left_metadata[[left_column]]),
+        right_cluster = as.character(right_metadata[[right_column]])
+      ) |>
+        dplyr::count(left_cluster, right_cluster, name = "nuclei") |>
+        dplyr::group_by(left_cluster) |>
+        dplyr::mutate(
+          percent_of_left_cluster = 100 * nuclei / sum(nuclei)
+        ) |>
+        dplyr::ungroup() |>
+        dplyr::mutate(
+          comparison = comparison,
+          resolution = resolution,
+          left_column = left_column,
+          right_column = right_column,
+          .before = 1
+        )
+    }
+  )
+}
+
+run_marker_audit <- function(object, cluster_column, analysis_scope) {
+  Seurat::DefaultAssay(object) <- "RNA.crypt"
+  Seurat::Idents(object) <- cluster_column
+
+  markers <- Seurat::FindAllMarkers(
+    object,
+    assay = "RNA.crypt",
+    only.pos = TRUE,
+    test.use = "wilcox",
+    min.pct = MARKER_MIN_PCT,
+    logfc.threshold = MARKER_LOGFC_THRESHOLD,
+    return.thresh = 0.05,
+    verbose = FALSE
+  )
+
+  if (nrow(markers) == 0L) {
+    warning("No markers passed thresholds for ", cluster_column)
+    return(tibble::tibble())
+  }
+
+  fold_change_column <- intersect(
+    c("avg_log2FC", "avg_logFC"),
+    colnames(markers)
+  )
+
+  if (length(fold_change_column) != 1L) {
+    stop("Could not identify the marker fold-change column.")
+  }
+
+  markers |>
+    dplyr::mutate(
+      analysis_scope = analysis_scope,
+      cluster_column = cluster_column,
+      cluster = as.character(cluster),
+      gene = as.character(gene),
+      effect_size = .data[[fold_change_column]],
+      pct_delta = pct.1 - pct.2,
+      .before = 1
+    ) |>
+    dplyr::filter(
+      is.finite(effect_size),
+      effect_size > 0,
+      is.finite(p_val_adj),
+      p_val_adj < MARKER_ADJUSTED_P_THRESHOLD
+    )
+}
+
+top_marker_table <- function(markers, n = 30L) {
+  if (nrow(markers) == 0L) {
+    return(markers)
+  }
+
+  markers |>
+    dplyr::filter(!grepl(TECHNICAL_GENE_PATTERN, gene)) |>
+    dplyr::group_by(analysis_scope, cluster_column, cluster) |>
+    dplyr::arrange(
+      p_val_adj,
+      dplyr::desc(pct_delta),
+      dplyr::desc(effect_size),
+      .by_group = TRUE
+    ) |>
+    dplyr::slice_head(n = n) |>
+    dplyr::ungroup()
+}
+
+safe_z_score <- function(values) {
+  finite_values <- is.finite(values)
+
+  if (!any(finite_values)) {
+    return(rep(NA_real_, length(values)))
+  }
+
+  value_sd <- stats::sd(values[finite_values])
+
+  if (!is.finite(value_sd) || value_sd <= 0) {
+    output <- rep(0, length(values))
+    output[!finite_values] <- NA_real_
+    return(output)
+  }
+
+  output <- (values - mean(values[finite_values])) / value_sd
+  output[!finite_values] <- NA_real_
+  output
+}
+
+make_targeted_rna_promoter_audit <- function(
+  object,
+  cluster_column,
+  targeted_programs,
+  promoter_window_bp = 2000L,
+  rna_assay = "RNA.crypt",
+  atac_assay = "ATAC.crypt"
+) {
+  message(
+    "Running targeted RNA/promoter audit helper v5 ",
+    "(direct-vector TSS mapping)."
+  )
+
+  cells <- colnames(object)
+  target_genes <- unique(unlist(targeted_programs))
+
+  rna_counts <- get_aligned_layer(
+    object,
+    assay = rna_assay,
+    layer = "counts",
+    cells = cells
+  )
+  rna_data <- get_aligned_layer(
+    object,
+    assay = rna_assay,
+    layer = "data",
+    cells = cells
+  )
+  atac_counts <- get_aligned_layer(
+    object,
+    assay = atac_assay,
+    layer = "counts",
+    cells = cells
+  )
+
+  annotation_ranges <- Signac::Annotation(object[[atac_assay]])
+
+  if (is.null(annotation_ranges) || length(annotation_ranges) == 0L) {
+    stop("The focused ATAC assay does not contain gene annotations.")
+  }
+
+  annotation_table <- as.data.frame(annotation_ranges)
+
+  if (!"gene_name" %in% colnames(annotation_table)) {
+    stop("The focused ATAC annotation lacks a gene_name column.")
+  }
+
+  gene_annotation <- annotation_table |>
+    dplyr::filter(gene_name %in% target_genes)
+
+  if (
+    "type" %in% colnames(gene_annotation) &&
+      any(gene_annotation$type == "gene", na.rm = TRUE)
+  ) {
+    gene_annotation <- gene_annotation |>
+      dplyr::filter(type == "gene")
+  }
+
+  gene_annotation <- gene_annotation |>
+    dplyr::mutate(
+      strand = as.character(strand),
+      tss = dplyr::if_else(strand == "-", end, start),
+      promoter_start = pmax(1L, tss - promoter_window_bp),
+      promoter_end = tss + promoter_window_bp
+    ) |>
+    dplyr::distinct(
+      seqnames,
+      tss,
+      promoter_start,
+      promoter_end,
+      strand,
+      gene_name
+    )
+
+  if (nrow(gene_annotation) == 0L) {
+    stop("No targeted genes were found in the focused ATAC annotation.")
+  }
+
+  promoter_ranges <- GenomicRanges::GRanges(
+    seqnames = gene_annotation$seqnames,
+    ranges = IRanges::IRanges(
+      start = gene_annotation$promoter_start,
+      end = gene_annotation$promoter_end
+    ),
+    strand = gene_annotation$strand
+  )
+
+  peak_ranges <- GenomicRanges::granges(object[[atac_assay]])
+  promoter_overlaps <- GenomicRanges::findOverlaps(
+    peak_ranges,
+    promoter_ranges,
+    ignore.strand = TRUE
+  )
+
+  overlap_peak_indices <- S4Vectors::queryHits(promoter_overlaps)
+  overlap_promoter_indices <- S4Vectors::subjectHits(promoter_overlaps)
+
+  if (!all(c("gene_name", "tss") %in% colnames(gene_annotation))) {
+    stop(
+      "The promoter annotation table lacks gene_name or tss after ",
+      "promoter construction.",
+      call. = FALSE
+    )
+  }
+
+  overlap_genes <- as.character(
+    gene_annotation[["gene_name"]][overlap_promoter_indices]
+  )
+  overlap_tss <- as.numeric(
+    gene_annotation[["tss"]][overlap_promoter_indices]
+  )
+  overlap_peak_starts <- BiocGenerics::start(peak_ranges)[
+    overlap_peak_indices
+  ]
+  overlap_peak_ends <- BiocGenerics::end(peak_ranges)[
+    overlap_peak_indices
+  ]
+  overlap_peak_centers <- floor(
+    (overlap_peak_starts + overlap_peak_ends) / 2
+  )
+
+  expected_overlap_length <- length(overlap_peak_indices)
+  overlap_vector_lengths <- c(
+    genes = length(overlap_genes),
+    tss = length(overlap_tss),
+    peak_starts = length(overlap_peak_starts),
+    peak_ends = length(overlap_peak_ends),
+    peak_centers = length(overlap_peak_centers)
+  )
+
+  if (any(overlap_vector_lengths != expected_overlap_length)) {
+    stop(
+      "Promoter-overlap vectors are not aligned: ",
+      paste(
+        names(overlap_vector_lengths),
+        overlap_vector_lengths,
+        sep = "=",
+        collapse = ", "
+      ),
+      call. = FALSE
+    )
+  }
+
+  promoter_peak_map <- tibble::tibble(
+    peak_index = overlap_peak_indices,
+    promoter_index = overlap_promoter_indices,
+    gene = overlap_genes,
+    peak = rownames(atac_counts)[overlap_peak_indices],
+    chromosome = as.character(
+      GenomeInfoDb::seqnames(peak_ranges)[overlap_peak_indices]
+    ),
+    peak_start = overlap_peak_starts,
+    peak_end = overlap_peak_ends,
+    peak_center = overlap_peak_centers,
+    tss_coordinate = overlap_tss,
+    distance_to_tss = overlap_peak_centers - overlap_tss
+  ) |>
+    dplyr::distinct(gene, peak_index, .keep_all = TRUE)
+
+  program_map <- purrr::imap_dfr(
+    targeted_programs,
+    ~ tibble::tibble(program = .y, gene = .x)
+  ) |>
+    dplyr::distinct(gene, .keep_all = TRUE)
+
+  cell_metadata <- object[[]] |>
+    tibble::rownames_to_column("cell_barcode") |>
+    dplyr::transmute(
+      cell_barcode,
+      focused_subcluster = as.character(.data[[cluster_column]]),
+      diet = as.character(diet)
+    )
+
+  total_atac_counts <- Matrix::colSums(atac_counts)
+
+  cell_level <- purrr::map_dfr(
+    target_genes,
+    function(gene) {
+      rna_is_available <- gene %in% rownames(rna_counts)
+
+      if (rna_is_available) {
+        rna_gene_counts <- as.numeric(rna_counts[gene, ])
+        rna_gene_data <- as.numeric(rna_data[gene, ])
+      } else {
+        rna_gene_counts <- rep(0, length(cells))
+        rna_gene_data <- rep(NA_real_, length(cells))
+      }
+
+      peak_indices <- promoter_peak_map$peak_index[
+        promoter_peak_map$gene == gene
+      ]
+
+      if (length(peak_indices) > 0L) {
+        promoter_counts <- Matrix::colSums(
+          atac_counts[unique(peak_indices), , drop = FALSE]
+        )
+      } else {
+        promoter_counts <- rep(0, length(cells))
+      }
+
+      tibble::tibble(
+        cell_barcode = cells,
+        gene = gene,
+        RNA_available = rna_is_available,
+        RNA_detected = rna_gene_counts > 0,
+        RNA_log_normalized = rna_gene_data,
+        promoter_peak_count = length(unique(peak_indices)),
+        promoter_detected = promoter_counts > 0,
+        promoter_log_normalized = log1p(
+          10000 * promoter_counts / pmax(total_atac_counts, 1)
+        )
+      )
+    }
+  ) |>
+    dplyr::left_join(program_map, by = "gene") |>
+    dplyr::left_join(cell_metadata, by = "cell_barcode")
+
+  group_columns <- c(
+    "focused_subcluster",
+    "diet",
+    "program",
+    "gene"
+  )
+
+  cluster_diet_summary <- cell_level |>
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_columns))) |>
+    dplyr::summarise(
+      nuclei = dplyr::n(),
+      RNA_available = all(RNA_available),
+      RNA_percent_detected = 100 * mean(RNA_detected),
+      RNA_mean_log_normalized = mean(
+        RNA_log_normalized,
+        na.rm = TRUE
+      ),
+      promoter_peak_count = max(promoter_peak_count),
+      promoter_percent_detected = 100 * mean(promoter_detected),
+      promoter_mean_log_normalized = mean(promoter_log_normalized),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      RNA_mean_log_normalized = dplyr::if_else(
+        is.nan(RNA_mean_log_normalized),
+        NA_real_,
+        RNA_mean_log_normalized
+      )
+    )
+
+  cluster_summary <- cell_level |>
+    dplyr::group_by(focused_subcluster, program, gene) |>
+    dplyr::summarise(
+      nuclei = dplyr::n(),
+      RNA_available = all(RNA_available),
+      RNA_percent_detected = 100 * mean(RNA_detected),
+      RNA_mean_log_normalized = mean(
+        RNA_log_normalized,
+        na.rm = TRUE
+      ),
+      promoter_peak_count = max(promoter_peak_count),
+      promoter_percent_detected = 100 * mean(promoter_detected),
+      promoter_mean_log_normalized = mean(promoter_log_normalized),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      RNA_mean_log_normalized = dplyr::if_else(
+        is.nan(RNA_mean_log_normalized),
+        NA_real_,
+        RNA_mean_log_normalized
+      )
+    )
+
+  list(
+    cluster_summary = cluster_summary,
+    cluster_diet_summary = cluster_diet_summary,
+    promoter_peak_map = promoter_peak_map
+  )
+}
+
+make_targeted_evidence_dotplot <- function(
+  summary_table,
+  value_column,
+  detection_column,
+  title,
+  color_label
+) {
+  plot_data <- summary_table |>
+    dplyr::group_by(gene) |>
+    dplyr::mutate(within_gene_z = safe_z_score(.data[[value_column]])) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      gene = factor(gene, levels = TARGETED_EVIDENCE_GENES),
+      program = factor(
+        program,
+        levels = names(TARGETED_EVIDENCE_PROGRAMS)
+      ),
+      cluster_diet = paste0("C", focused_subcluster, "_", diet)
+    )
+
+  cluster_levels <- plot_data |>
+    dplyr::distinct(focused_subcluster, diet, cluster_diet) |>
+    dplyr::mutate(
+      cluster_number = suppressWarnings(as.numeric(focused_subcluster)),
+      diet_order = match(diet, c("CON", "HFD"))
+    ) |>
+    dplyr::arrange(cluster_number, focused_subcluster, diet_order) |>
+    dplyr::pull(cluster_diet)
+
+  plot_data$cluster_diet <- factor(
+    plot_data$cluster_diet,
+    levels = rev(unique(cluster_levels))
+  )
+
+  ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = gene,
+      y = cluster_diet,
+      size = .data[[detection_column]],
+      fill = within_gene_z
+    )
+  ) +
+    ggplot2::geom_point(shape = 21, color = "grey25", stroke = 0.25) +
+    ggplot2::facet_grid(
+      cols = ggplot2::vars(program),
+      scales = "free_x",
+      space = "free_x"
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(0, 7),
+      limits = c(0, 100),
+      name = "Percent detected"
+    ) +
+    ggplot2::scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      na.value = "grey90",
+      name = color_label
+    ) +
+    ggplot2::labs(
+      title = title,
+      subtitle = paste0(
+        "Resolution ", resolution_tag(PRIMARY_REVIEW_RESOLUTION),
+        "; color is standardized within each gene"
+      ),
+      x = NULL,
+      y = "Focused cluster and diet"
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold")
+    )
+}
+
+save_pdf <- function(filename, plot, width = 12, height = 8) {
+  output_path <- file.path(STEP5E_PLOT_DIR, filename)
+  grDevices::pdf(output_path, width = width, height = height, useDingbats = FALSE)
+  print(plot)
+  grDevices::dev.off()
+  invisible(output_path)
+}
+```
+
+# 4. Load and validate the reviewed WT object
+
+```{r load-and-validate-wt-object}
+multiome <- readRDS(STEP6_OBJECT_PATH)
+metadata <- multiome[[]]
+
+required_metadata <- c(
+  "sample_id",
+  "diet",
+  "wnn_cluster",
+  "broad_compartment",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence",
+  "nCount_RNA",
+  "nCount_ATAC"
+)
+
+missing_metadata <- setdiff(required_metadata, colnames(metadata))
+
+if (length(missing_metadata) > 0L) {
+  stop(
+    "The Step 6 object is missing metadata column(s): ",
+    paste(missing_metadata, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!all(c("RNA", "ATAC") %in% names(multiome))) {
+  stop("The Step 6 object must contain RNA and ATAC assays.")
+}
+
+if (!"counts" %in% SeuratObject::Layers(multiome[["RNA"]])) {
+  stop("The Step 6 RNA assay lacks a joined counts layer.")
+}
+
+if (!"counts" %in% SeuratObject::Layers(multiome[["ATAC"]])) {
+  stop("The Step 6 ATAC assay lacks a joined counts layer.")
+}
+
+metadata$wnn_cluster <- as.character(metadata$wnn_cluster)
+metadata$diet <- as.character(metadata$diet)
+
+if (!all(BOUNDARY_PARENT_CLUSTERS %in% unique(metadata$wnn_cluster))) {
+  stop(
+    "One or more requested focused parent clusters are absent: ",
+    paste(
+      setdiff(BOUNDARY_PARENT_CLUSTERS, unique(metadata$wnn_cluster)),
+      collapse = ", "
+    )
+  )
+}
+
+if (!setequal(unique(metadata$diet), c("CON", "HFD"))) {
+  stop("Expected exactly CON and HFD in the WT object.")
+}
+
+parent_annotation_audit <- metadata |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::filter(wnn_cluster %in% BOUNDARY_PARENT_CLUSTERS) |>
+  dplyr::mutate(
+    wnn_cluster = as.character(wnn_cluster),
+    sample_id = as.character(sample_id),
+    diet = as.character(diet),
+    broad_compartment = as.character(broad_compartment),
+    cell_state = as.character(cell_state),
+    cell_state_full = as.character(cell_state_full),
+    annotation_confidence = as.character(annotation_confidence)
+  ) |>
+  dplyr::count(
+    wnn_cluster,
+    sample_id,
+    diet,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    name = "nuclei"
+  )
+
+readr::write_csv(
+  parent_annotation_audit,
+  file.path(STEP5E_TABLE_DIR, "parent_cluster_annotation_audit.csv")
+)
+
+parent_annotation_audit
+```
+
+# 5. Derive independent source and curated program panels
+
+```{r derive-source-programs}
+source_marker_table <- readr::read_csv(
+  SOURCE_MARKER_PATH,
+  show_col_types = FALSE
+)
+
+SOURCE_PROGRAMS <- derive_source_programs(source_marker_table)
+ALL_PROGRAMS <- c(CURATED_PROGRAMS, SOURCE_PROGRAMS)
+
+program_definition_table <- purrr::imap_dfr(
+  ALL_PROGRAMS,
+  function(genes, program) {
+    tibble::tibble(
+      program = program,
+      source = ifelse(
+        grepl("^source_", program),
+        "Gourab d21 integrated-cluster marker program",
+        "curated biological program"
+      ),
+      gene = genes
+    )
+  }
+)
+
+readr::write_csv(
+  program_definition_table,
+  file.path(STEP5E_TABLE_DIR, "crypt_program_definitions.csv")
+)
+
+program_definition_table |>
+  dplyr::count(program, source, name = "genes")
+```
+
+# 6. Build the core focused RNA, ATAC, and WNN representations
+
+```{r build-core-focused-reductions}
+core_fit <- build_focused_reductions(
+  parent_object = multiome,
+  parent_clusters = CORE_PARENT_CLUSTERS,
+  reduction_prefix = "crypt.core",
+  build_rna_graph = TRUE
+)
+
+core <- core_fit$object
+
+core_grid <- add_resolution_grid(
+  object = core,
+  graph_name = core_fit$wsnn,
+  column_prefix = CORE_WNN_PREFIX
+)
+core <- core_grid$object
+core_wnn_columns <- core_grid$columns
+
+core_rna_grid <- add_resolution_grid(
+  object = core,
+  graph_name = core_fit$rna_snn,
+  column_prefix = CORE_RNA_PREFIX
+)
+core <- core_rna_grid$object
+core_rna_columns <- core_rna_grid$columns
+
+core_fit$object <- NULL
+invisible(gc())
+```
+
+# 7. Add cell-cycle and biological support after clustering
+
+```{r score-core-programs}
+Seurat::DefaultAssay(core) <- "RNA.crypt"
+
+s_genes <- Seurat::CaseMatch(
+  search = Seurat::cc.genes.updated.2019$s.genes,
+  match = rownames(core[["RNA.crypt"]])
+)
+g2m_genes <- Seurat::CaseMatch(
+  search = Seurat::cc.genes.updated.2019$g2m.genes,
+  match = rownames(core[["RNA.crypt"]])
+)
+
+s_genes <- unique(stats::na.omit(s_genes))
+g2m_genes <- unique(stats::na.omit(g2m_genes))
+
+if (length(s_genes) < 20L || length(g2m_genes) < 20L) {
+  stop("Too few cell-cycle genes were available for CellCycleScoring.")
+}
+
+core <- Seurat::CellCycleScoring(
+  core,
+  s.features = s_genes,
+  g2m.features = g2m_genes,
+  set.ident = FALSE
+)
+
+core_program_result <- add_program_scores(
+  object = core,
+  assay = "RNA.crypt",
+  programs = ALL_PROGRAMS
+)
+
+core <- core_program_result$object
+program_score_columns <- paste0(names(ALL_PROGRAMS), "_score")
+program_detection_columns <- paste0(
+  names(ALL_PROGRAMS),
+  "_genes_detected"
+)
+
+readr::write_csv(
+  core_program_result$gene_summary,
+  file.path(STEP5E_TABLE_DIR, "crypt_program_gene_availability.csv")
+)
+```
+
+# 8. Build the expanded-boundary WNN sensitivity
+
+```{r build-boundary-sensitivity}
+boundary_fit <- build_focused_reductions(
+  parent_object = multiome,
+  parent_clusters = BOUNDARY_PARENT_CLUSTERS,
+  reduction_prefix = "crypt.boundary",
+  build_rna_graph = FALSE
+)
+
+boundary <- boundary_fit$object
+
+boundary_grid <- add_resolution_grid(
+  object = boundary,
+  graph_name = boundary_fit$wsnn,
+  column_prefix = BOUNDARY_WNN_PREFIX
+)
+boundary <- boundary_grid$object
+boundary_wnn_columns <- boundary_grid$columns
+
+Seurat::DefaultAssay(boundary) <- "RNA.crypt"
+boundary <- Seurat::CellCycleScoring(
+  boundary,
+  s.features = intersect(s_genes, rownames(boundary[["RNA.crypt"]])),
+  g2m.features = intersect(g2m_genes, rownames(boundary[["RNA.crypt"]])),
+  set.ident = FALSE
+)
+
+boundary_program_result <- add_program_scores(
+  object = boundary,
+  assay = "RNA.crypt",
+  programs = ALL_PROGRAMS
+)
+
+boundary <- boundary_program_result$object
+boundary_fit$object <- NULL
+invisible(gc())
+```
+
+# 9. Summarize resolutions, parent origins, and sensitivity agreement
+
+```{r summarize-resolution-grid}
+core_wnn_summary <- summarise_resolution_grid(
+  object = core,
+  resolution_columns = core_wnn_columns,
+  analysis_scope = "core_WNN_0_6_8",
+  rna_weight_column = "crypt.core.RNA.weight",
+  atac_weight_column = "crypt.core.ATAC.weight",
+  score_columns = c(program_score_columns, program_detection_columns)
+)
+
+core_rna_summary <- summarise_resolution_grid(
+  object = core,
+  resolution_columns = core_rna_columns,
+  analysis_scope = "core_RNA_only_0_6_8",
+  rna_weight_column = "crypt.core.RNA.weight",
+  atac_weight_column = "crypt.core.ATAC.weight",
+  score_columns = c(program_score_columns, program_detection_columns)
+)
+
+boundary_wnn_summary <- summarise_resolution_grid(
+  object = boundary,
+  resolution_columns = boundary_wnn_columns,
+  analysis_scope = "boundary_WNN_0_1_6_8_18",
+  rna_weight_column = "crypt.boundary.RNA.weight",
+  atac_weight_column = "crypt.boundary.ATAC.weight",
+  score_columns = c(program_score_columns, program_detection_columns)
+)
+
+resolution_cluster_summary <- dplyr::bind_rows(
+  core_wnn_summary$cluster_summary,
+  core_rna_summary$cluster_summary,
+  boundary_wnn_summary$cluster_summary
+)
+
+resolution_parent_composition <- dplyr::bind_rows(
+  core_wnn_summary$parent_composition,
+  core_rna_summary$parent_composition,
+  boundary_wnn_summary$parent_composition
+)
+
+adjacent_resolution_crosswalk <- dplyr::bind_rows(
+  make_adjacent_resolution_crosswalk(
+    core,
+    core_wnn_columns,
+    "core_WNN_0_6_8"
+  ),
+  make_adjacent_resolution_crosswalk(
+    core,
+    core_rna_columns,
+    "core_RNA_only_0_6_8"
+  ),
+  make_adjacent_resolution_crosswalk(
+    boundary,
+    boundary_wnn_columns,
+    "boundary_WNN_0_1_6_8_18"
+  )
+)
+
+core_wnn_vs_rna_crosswalk <- make_same_resolution_crosswalk(
+  left_object = core,
+  left_columns = core_wnn_columns,
+  right_object = core,
+  right_columns = core_rna_columns,
+  comparison = "core_WNN_vs_RNA"
+)
+
+core_vs_boundary_crosswalk <- make_same_resolution_crosswalk(
+  left_object = core,
+  left_columns = core_wnn_columns,
+  right_object = boundary,
+  right_columns = boundary_wnn_columns,
+  comparison = "core_WNN_vs_boundary_WNN"
+)
+
+readr::write_csv(
+  resolution_cluster_summary,
+  file.path(STEP5E_TABLE_DIR, "focused_resolution_cluster_summary.csv")
+)
+readr::write_csv(
+  resolution_parent_composition,
+  file.path(STEP5E_TABLE_DIR, "focused_resolution_parent_composition.csv")
+)
+readr::write_csv(
+  adjacent_resolution_crosswalk,
+  file.path(STEP5E_TABLE_DIR, "adjacent_resolution_crosswalk.csv")
+)
+readr::write_csv(
+  core_wnn_vs_rna_crosswalk,
+  file.path(STEP5E_TABLE_DIR, "core_WNN_vs_RNA_crosswalk.csv")
+)
+readr::write_csv(
+  core_vs_boundary_crosswalk,
+  file.path(STEP5E_TABLE_DIR, "core_vs_boundary_WNN_crosswalk.csv")
+)
+readr::write_csv(
+  resolution_cluster_summary |>
+    dplyr::filter(
+      analysis_scope == "core_WNN_0_6_8",
+      resolution == PRIMARY_REVIEW_RESOLUTION
+    ),
+  file.path(STEP5E_TABLE_DIR, "primary_r0.3_cluster_summary.csv")
+)
+readr::write_csv(
+  resolution_parent_composition |>
+    dplyr::filter(
+      analysis_scope == "core_WNN_0_6_8",
+      resolution == PRIMARY_REVIEW_RESOLUTION
+    ),
+  file.path(STEP5E_TABLE_DIR, "primary_r0.3_parent_composition.csv")
+)
+
+resolution_cluster_summary |>
+  dplyr::select(
+    analysis_scope,
+    resolution,
+    focused_subcluster,
+    nuclei,
+    CON_nuclei,
+    HFD_nuclei,
+    S_phase_percent,
+    G2M_phase_percent,
+    dplyr::contains("canonical_ISC_score_median"),
+    dplyr::contains("crypt_progenitor_score_median")
+  )
+```
+
+# 10. Focused RNA marker audit at the primary and sensitivity resolutions
+
+Resolution 0.3 is the primary review candidate because it preserves the major
+stable branches without the unsupported splits that appear at higher
+resolutions. Resolutions 0.4 and 0.6 remain marker-level sensitivities. Marker
+exports are explicitly restricted to positive genes with adjusted P values
+below 0.05. No annotation override is applied in this notebook.
+
+```{r focused-marker-audit}
+marker_tables <- purrr::map_dfr(
+  MARKER_REVIEW_RESOLUTIONS,
+  function(resolution) {
+    cluster_column <- resolution_column(CORE_WNN_PREFIX, resolution)
+    run_marker_audit(
+      object = core,
+      cluster_column = cluster_column,
+      analysis_scope = paste0("core_WNN_resolution_", resolution_tag(resolution))
+    )
+  }
+)
+
+top_marker_tables <- top_marker_table(marker_tables, n = 30L)
+
+marker_count_summary <- purrr::map_dfr(
+  MARKER_REVIEW_RESOLUTIONS,
+  function(resolution) {
+    cluster_column <- resolution_column(CORE_WNN_PREFIX, resolution)
+
+    tibble::tibble(
+      resolution = resolution,
+      cluster_column = cluster_column,
+      cluster = sort(unique(as.character(core[[]][[cluster_column]])))
+    )
+  }
+) |>
+  dplyr::left_join(
+    marker_tables |>
+      dplyr::count(cluster_column, cluster, name = "significant_positive_markers"),
+    by = c("cluster_column", "cluster")
+  ) |>
+  dplyr::mutate(
+    significant_positive_markers = tidyr::replace_na(
+      significant_positive_markers,
+      0L
+    )
+  )
+
+readr::write_csv(
+  marker_tables,
+  file.path(STEP5E_TABLE_DIR, "core_WNN_positive_markers_review_resolutions.csv.gz")
+)
+readr::write_csv(
+  top_marker_tables,
+  file.path(STEP5E_TABLE_DIR, "core_WNN_top_markers_review_resolutions.csv")
+)
+readr::write_csv(
+  marker_count_summary,
+  file.path(STEP5E_TABLE_DIR, "core_WNN_marker_count_review_resolutions.csv")
+)
+
+top_marker_tables |>
+  dplyr::select(
+    cluster_column,
+    cluster,
+    gene,
+    effect_size,
+    pct.1,
+    pct.2,
+    p_val_adj
+  )
+```
+
+# 11. Export cell-level audit assignments
+
+```{r export-cell-level-assignments}
+core_assignment_columns <- c(
+  "sample_id",
+  "diet",
+  "parent_wnn_cluster",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence",
+  "nCount_RNA",
+  "nFeature_RNA",
+  "nCount_ATAC",
+  "nFeature_ATAC",
+  "percent.mt",
+  "TSS.enrichment",
+  "nucleosome_signal",
+  "frip_cr",
+  "scDblFinder.score",
+  "crypt.core.RNA.weight",
+  "crypt.core.ATAC.weight",
+  "Phase",
+  "S.Score",
+  "G2M.Score",
+  core_wnn_columns,
+  core_rna_columns,
+  program_score_columns,
+  program_detection_columns
+)
+
+core_assignments <- core[[]] |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::select(
+    cell_barcode,
+    dplyr::any_of(core_assignment_columns)
+  )
+
+boundary_assignment_columns <- c(
+  "sample_id",
+  "diet",
+  "parent_wnn_cluster",
+  "cell_state",
+  "cell_state_full",
+  "annotation_confidence",
+  "nCount_RNA",
+  "nCount_ATAC",
+  "crypt.boundary.RNA.weight",
+  "crypt.boundary.ATAC.weight",
+  "Phase",
+  "S.Score",
+  "G2M.Score",
+  boundary_wnn_columns,
+  program_score_columns,
+  program_detection_columns
+)
+
+boundary_assignments <- boundary[[]] |>
+  tibble::rownames_to_column("cell_barcode") |>
+  dplyr::select(
+    cell_barcode,
+    dplyr::any_of(boundary_assignment_columns)
+  )
+
+readr::write_csv(
+  core_assignments,
+  file.path(STEP5E_TABLE_DIR, "core_cell_assignments.csv.gz")
+)
+readr::write_csv(
+  boundary_assignments,
+  file.path(STEP5E_TABLE_DIR, "boundary_cell_assignments.csv.gz")
+)
+```
+
+# 12. Parent, modality, and diet overview plots
+
+```{r plot-focused-overview}
+p_core_parent <- Seurat::DimPlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  group.by = "parent_wnn_cluster",
+  label = TRUE,
+  repel = TRUE,
+  raster = FALSE
+) +
+  ggplot2::labs(
+    title = "Core focused WNN: original parent clusters",
+    subtitle = "WT global clusters 0, 6, and 8"
+  ) +
+  ggplot2::theme_void(base_size = 14)
+
+p_core_diet <- Seurat::DimPlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  group.by = "diet",
+  split.by = "diet",
+  raster = FALSE
+) +
+  ggplot2::labs(
+    title = "Core focused WNN by diet",
+    subtitle = "Diet is descriptive because library and diet are confounded"
+  ) +
+  ggplot2::theme_void(base_size = 14)
+
+p_core_modality <- Seurat::FeaturePlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  features = c(
+    "crypt.core.RNA.weight",
+    "crypt.core.ATAC.weight"
+  ),
+  min.cutoff = "q02",
+  max.cutoff = "q98",
+  raster = FALSE,
+  ncol = 2
+) +
+  patchwork::plot_annotation(
+    title = "Focused WNN modality weights"
+  )
+
+save_pdf(
+  "01_core_WNN_parent_clusters.pdf",
+  p_core_parent,
+  width = 10,
+  height = 8
+)
+save_pdf(
+  "02_core_WNN_by_diet.pdf",
+  p_core_diet,
+  width = 14,
+  height = 7
+)
+save_pdf(
+  "03_core_WNN_modality_weights.pdf",
+  p_core_modality,
+  width = 14,
+  height = 7
+)
+```
+
+# 13. Resolution grids and RNA-only sensitivity
+
+```{r plot-resolution-grids}
+for (resolution_index in seq_along(FOCUSED_RESOLUTIONS)) {
+  resolution <- FOCUSED_RESOLUTIONS[[resolution_index]]
+  wnn_column <- core_wnn_columns[[resolution_index]]
+  rna_column <- core_rna_columns[[resolution_index]]
+  boundary_column <- boundary_wnn_columns[[resolution_index]]
+
+  p_core_wnn <- Seurat::DimPlot(
+    core,
+    reduction = core_fit$wnn_umap,
+    group.by = wnn_column,
+    label = TRUE,
+    repel = TRUE,
+    raster = FALSE
+  ) +
+    ggplot2::labs(
+      title = paste0("Core WNN resolution ", resolution_tag(resolution))
+    ) +
+    ggplot2::theme_void(base_size = 14)
+
+  p_core_rna <- Seurat::DimPlot(
+    core,
+    reduction = core_fit$rna_umap,
+    group.by = rna_column,
+    label = TRUE,
+    repel = TRUE,
+    raster = FALSE
+  ) +
+    ggplot2::labs(
+      title = paste0("Core RNA-only resolution ", resolution_tag(resolution))
+    ) +
+    ggplot2::theme_void(base_size = 14)
+
+  p_comparison <- p_core_wnn + p_core_rna +
+    patchwork::plot_annotation(
+      title = paste0(
+        "Core graph sensitivity at resolution ",
+        resolution_tag(resolution)
+      ),
+      subtitle = "The two panels contain exactly the same nuclei"
+    )
+
+  save_pdf(
+    paste0(
+      "04_core_WNN_vs_RNA_resolution_",
+      resolution_tag(resolution),
+      ".pdf"
+    ),
+    p_comparison,
+    width = 15,
+    height = 7
+  )
+
+  p_boundary <- Seurat::DimPlot(
+    boundary,
+    reduction = boundary_fit$wnn_umap,
+    group.by = boundary_column,
+    label = TRUE,
+    repel = TRUE,
+    raster = FALSE
+  ) +
+    ggplot2::labs(
+      title = paste0(
+        "Expanded-boundary WNN resolution ",
+        resolution_tag(resolution)
+      ),
+      subtitle = "Global clusters 0, 1, 6, 8, and 18"
+    ) +
+    ggplot2::theme_void(base_size = 14)
+
+  save_pdf(
+    paste0(
+      "05_boundary_WNN_resolution_",
+      resolution_tag(resolution),
+      ".pdf"
+    ),
+    p_boundary,
+    width = 10,
+    height = 8
+  )
+}
+```
+
+# 14. Program-score and cell-cycle support
+
+```{r plot-program-support}
+program_plot_features <- c(
+  "curated_canonical_ISC_score",
+  "curated_cell_cycle_score",
+  "curated_crypt_progenitor_score",
+  "curated_early_absorptive_score",
+  "curated_secretory_commitment_score",
+  "curated_Reg4_DSC_score"
+)
+
+p_curated_programs <- Seurat::FeaturePlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  features = program_plot_features,
+  min.cutoff = "q02",
+  max.cutoff = "q98",
+  raster = FALSE,
+  ncol = 3,
+  keep.scale = "feature"
+) +
+  patchwork::plot_annotation(
+    title = "Independent curated programs on the core focused WNN"
+  )
+
+source_plot_features <- paste0(
+  names(SOURCE_PROGRAMS),
+  "_score"
+)
+
+p_source_programs <- Seurat::FeaturePlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  features = source_plot_features,
+  min.cutoff = "q02",
+  max.cutoff = "q98",
+  raster = FALSE,
+  ncol = 3,
+  keep.scale = "feature"
+) +
+  patchwork::plot_annotation(
+    title = "Gourab d21 integrated-cluster programs on WT crypt nuclei"
+  )
+
+p_cell_cycle <- Seurat::DimPlot(
+  core,
+  reduction = core_fit$wnn_umap,
+  group.by = "Phase",
+  raster = FALSE
+) +
+  ggplot2::labs(title = "Cell-cycle phase on the core focused WNN") +
+  ggplot2::theme_void(base_size = 14)
+
+save_pdf(
+  "06_core_curated_program_support.pdf",
+  p_curated_programs,
+  width = 16,
+  height = 11
+)
+save_pdf(
+  "07_core_source_program_support.pdf",
+  p_source_programs,
+  width = 16,
+  height = 11
+)
+save_pdf(
+  "08_core_cell_cycle_phase.pdf",
+  p_cell_cycle,
+  width = 10,
+  height = 8
+)
+```
+
+# 15. Marker dot plots for manual review
+
+```{r plot-marker-audits}
+marker_audit_genes <- unique(c(
+  "Lgr5", "Ascl2", "Smoc2", "Axin2", "Olfm4", "Lrig1", "Rnf43",
+  "Mki67", "Top2a", "Cenpf", "Ube2c", "Cdk1", "Ccnb1",
+  "Dmbt1", "Cftr", "Htr4", "Kcnq1", "Slc12a2", "Hmga2",
+  "Hmgcs2", "Hsd3b3",
+  "Slc26a3", "Slc9a2", "Car4", "Aqp8", "Krt20", "Mxd1",
+  "Atoh1", "Dll1", "Spdef", "Muc2", "Reg4", "Spink4",
+  "Slc12a8", "Kcnma1", "Sytl2"
+))
+
+marker_audit_genes <- intersect(
+  marker_audit_genes,
+  rownames(core[["RNA.crypt"]])
+)
+
+for (resolution in MARKER_REVIEW_RESOLUTIONS) {
+  cluster_column <- resolution_column(CORE_WNN_PREFIX, resolution)
+  plot_group_column <- paste0(cluster_column, "_diet")
+
+  core[[plot_group_column]] <- paste0(
+    "C",
+    core[[]][[cluster_column]],
+    "_",
+    as.character(core$diet)
+  )
+
+  p_markers <- Seurat::DotPlot(
+    core,
+    assay = "RNA.crypt",
+    features = marker_audit_genes,
+    group.by = plot_group_column,
+    dot.scale = 7
+  ) +
+    Seurat::RotatedAxis() +
+    ggplot2::labs(
+      title = paste0(
+        "Core WNN crypt marker audit: resolution ",
+        resolution_tag(resolution)
+      ),
+      subtitle = "Each focused subcluster is displayed separately by diet",
+      x = NULL,
+      y = "Focused cluster and diet"
+    ) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(size = 8),
+      axis.text.y = ggplot2::element_text(size = 10)
+    )
+
+  save_pdf(
+    paste0(
+      "09_core_marker_audit_resolution_",
+      resolution_tag(resolution),
+      ".pdf"
+    ),
+    p_markers,
+    width = 17,
+    height = 9
+  )
+}
+```
+
+# 16. Targeted RNA and exact-promoter evidence at resolution 0.3
+
+This audit directly pairs RNA detection with accessibility of consensus peaks
+overlapping the annotated TSS plus or minus 2 kb. Promoter accessibility is
+supporting regulatory evidence rather than proof of identity. Color is
+standardized within each gene; dot size reports the percentage of nuclei with
+detectable RNA or at least one promoter-overlapping ATAC fragment.
+
+```{r targeted-rna-promoter-evidence}
+primary_cluster_column <- resolution_column(
+  CORE_WNN_PREFIX,
+  PRIMARY_REVIEW_RESOLUTION
+)
+
+targeted_evidence <- make_targeted_rna_promoter_audit(
+  object = core,
+  cluster_column = primary_cluster_column,
+  targeted_programs = TARGETED_EVIDENCE_PROGRAMS,
+  promoter_window_bp = PROMOTER_WINDOW_BP
+)
+
+readr::write_csv(
+  targeted_evidence$cluster_summary,
+  file.path(
+    STEP5E_TABLE_DIR,
+    "primary_r0.3_targeted_RNA_promoter_summary_by_cluster.csv"
+  )
+)
+readr::write_csv(
+  targeted_evidence$cluster_diet_summary,
+  file.path(
+    STEP5E_TABLE_DIR,
+    "primary_r0.3_targeted_RNA_promoter_summary_by_cluster_diet.csv"
+  )
+)
+readr::write_csv(
+  targeted_evidence$promoter_peak_map,
+  file.path(
+    STEP5E_TABLE_DIR,
+    "primary_r0.3_targeted_promoter_peak_map.csv"
+  )
+)
+
+p_targeted_rna <- make_targeted_evidence_dotplot(
+  summary_table = targeted_evidence$cluster_diet_summary,
+  value_column = "RNA_mean_log_normalized",
+  detection_column = "RNA_percent_detected",
+  title = "Targeted RNA evidence for the primary focused solution",
+  color_label = "Within-gene RNA\nZ score"
+)
+
+p_targeted_promoter <- make_targeted_evidence_dotplot(
+  summary_table = targeted_evidence$cluster_diet_summary,
+  value_column = "promoter_mean_log_normalized",
+  detection_column = "promoter_percent_detected",
+  title = "Exact-promoter ATAC evidence for the primary focused solution",
+  color_label = "Within-gene ATAC\nZ score"
+)
+
+save_pdf(
+  "10_primary_r0.3_targeted_RNA_evidence.pdf",
+  p_targeted_rna,
+  width = 18,
+  height = 9
+)
+save_pdf(
+  "11_primary_r0.3_targeted_promoter_ATAC_evidence.pdf",
+  p_targeted_promoter,
+  width = 18,
+  height = 9
+)
+```
+
+# 17. Cluster-standardized program summaries
+
+Module-score magnitudes are not compared between gene sets. Within each
+resolution, every program is standardized across the focused clusters. The
+primary resolution receives a dedicated summary, while the full grid remains
+available as a stability visualization.
+
+```{r plot-program-summary-heatmaps}
+program_score_summary_long <- resolution_cluster_summary |>
+  dplyr::select(
+    analysis_scope,
+    resolution,
+    focused_subcluster,
+    nuclei,
+    dplyr::ends_with("_score_median")
+  ) |>
+  tidyr::pivot_longer(
+    cols = dplyr::ends_with("_score_median"),
+    names_to = "program",
+    values_to = "median_score"
+  ) |>
+  dplyr::mutate(
+    program = sub("_score_median$", "", program),
+    program_source = dplyr::if_else(
+      grepl("^curated_", program),
+      "Curated programs",
+      "Gourab d21 source programs"
+    ),
+    cluster_label = paste0(
+      "r", resolution_tag(resolution),
+      ":C", focused_subcluster,
+      " (n=", nuclei, ")"
+    ),
+    program = factor(
+      program,
+      levels = c(names(CURATED_PROGRAMS), names(SOURCE_PROGRAMS))
+    )
+  ) |>
+  dplyr::group_by(analysis_scope, resolution, program) |>
+  dplyr::mutate(program_z = safe_z_score(median_score)) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  program_score_summary_long,
+  file.path(STEP5E_TABLE_DIR, "focused_program_score_summary_long.csv")
+)
+
+for (scope in unique(program_score_summary_long$analysis_scope)) {
+  plot_data <- program_score_summary_long |>
+    dplyr::filter(analysis_scope == scope) |>
+    dplyr::arrange(resolution, suppressWarnings(as.numeric(focused_subcluster)))
+
+  plot_data$cluster_label <- factor(
+    plot_data$cluster_label,
+    levels = rev(unique(plot_data$cluster_label))
+  )
+
+  p_heatmap <- ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = program,
+      y = cluster_label,
+      fill = program_z
+    )
+  ) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      name = "Within-program\nZ score"
+    ) +
+    ggplot2::facet_grid(
+      cols = ggplot2::vars(program_source),
+      scales = "free_x",
+      space = "free_x"
+    ) +
+    ggplot2::labs(
+      title = paste0("Program support across resolutions: ", scope),
+      subtitle = "Each program is standardized across clusters within a resolution",
+      x = NULL,
+      y = "Resolution and focused cluster"
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(
+        angle = 45,
+        hjust = 1,
+        vjust = 1
+      ),
+      panel.grid = ggplot2::element_blank()
+    )
+
+  save_pdf(
+    paste0(
+      "10_program_heatmap_",
+      gsub("[^A-Za-z0-9]+", "_", scope),
+      ".pdf"
+    ),
+    p_heatmap,
+    width = 15,
+    height = 12
+  )
+}
+
+primary_program_plot_data <- program_score_summary_long |>
+  dplyr::filter(
+    analysis_scope == "core_WNN_0_6_8",
+    resolution == PRIMARY_REVIEW_RESOLUTION
+  ) |>
+  dplyr::arrange(suppressWarnings(as.numeric(focused_subcluster)))
+
+primary_program_plot_data$cluster_label <- factor(
+  primary_program_plot_data$cluster_label,
+  levels = rev(unique(primary_program_plot_data$cluster_label))
+)
+
+p_primary_program_heatmap <- ggplot2::ggplot(
+  primary_program_plot_data,
+  ggplot2::aes(x = program, y = cluster_label, fill = program_z)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.3) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Within-program\nZ score"
+  ) +
+  ggplot2::facet_grid(
+    cols = ggplot2::vars(program_source),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  ggplot2::labs(
+    title = "Program support in the primary focused WNN solution",
+    subtitle = paste0(
+      "Resolution ", resolution_tag(PRIMARY_REVIEW_RESOLUTION),
+      "; compare clusters within a program, not magnitudes between programs"
+    ),
+    x = NULL,
+    y = "Focused cluster"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    panel.grid = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold")
+  )
+
+save_pdf(
+  "12_primary_r0.3_program_heatmap.pdf",
+  p_primary_program_heatmap,
+  width = 16,
+  height = 7
+)
+```
+
+# 18. Save review objects and completion records
+
+```{r save-review-checkpoints}
+feature_filter_summary <- dplyr::bind_rows(
+  core_fit$feature_filter_summary,
+  boundary_fit$feature_filter_summary
+)
+
+readr::write_csv(
+  feature_filter_summary,
+  file.path(STEP5E_TABLE_DIR, "focused_ATAC_feature_filter_summary.csv")
+)
+
+saveRDS(
+  core,
+  file.path(STEP5E_OBJECT_DIR, "WT_crypt_core_0_6_8_focused.rds"),
+  compress = FALSE
+)
+saveRDS(
+  boundary,
+  file.path(
+    STEP5E_OBJECT_DIR,
+    "WT_crypt_boundary_0_1_6_8_18_focused.rds"
+  ),
+  compress = FALSE
+)
+
+step5e_summary <- tibble::tibble(
+  dataset_version = DATASET_VERSION,
+  cohort_id = COHORT_ID,
+  cohort_group = COHORT_GROUP,
+  analysis_version = ANALYSIS_VERSION,
+  core_parent_clusters = paste(CORE_PARENT_CLUSTERS, collapse = ";"),
+  core_nuclei = ncol(core),
+  boundary_parent_clusters = paste(
+    BOUNDARY_PARENT_CLUSTERS,
+    collapse = ";"
+  ),
+  boundary_nuclei = ncol(boundary),
+  resolutions_tested = paste(
+    vapply(FOCUSED_RESOLUTIONS, resolution_tag, character(1)),
+    collapse = ";"
+  ),
+  marker_review_resolutions = paste(
+    vapply(MARKER_REVIEW_RESOLUTIONS, resolution_tag, character(1)),
+    collapse = ";"
+  ),
+  primary_review_resolution = PRIMARY_REVIEW_RESOLUTION,
+  source_programs = length(SOURCE_PROGRAMS),
+  curated_programs = length(CURATED_PROGRAMS),
+  targeted_RNA_promoter_audit_completed = TRUE,
+  annotation_override_applied = FALSE,
+  biological_diet_inference_performed = FALSE
+)
+
+readr::write_csv(
+  step5e_summary,
+  file.path(STEP5E_DIR, "step5e_summary.csv")
+)
+
+writeLines(
+  c(
+    paste("Step 5E completed:", Sys.time()),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohort:", COHORT_ID),
+    paste("Core parent clusters:", paste(CORE_PARENT_CLUSTERS, collapse = ",")),
+    paste("Core nuclei:", ncol(core)),
+    paste(
+      "Boundary parent clusters:",
+      paste(BOUNDARY_PARENT_CLUSTERS, collapse = ",")
+    ),
+    paste("Boundary nuclei:", ncol(boundary)),
+    paste(
+      "Resolutions tested:",
+      paste(FOCUSED_RESOLUTIONS, collapse = ",")
+    ),
+    paste("Primary review resolution:", PRIMARY_REVIEW_RESOLUTION),
+    paste(
+      "Marker review resolutions:",
+      paste(MARKER_REVIEW_RESOLUTIONS, collapse = ",")
+    ),
+    "Core WNN analysis completed: TRUE",
+    "Core RNA-only sensitivity completed: TRUE",
+    "Expanded boundary sensitivity completed: TRUE",
+    "Targeted RNA and exact-promoter ATAC audit completed: TRUE",
+    "Annotation override applied: FALSE",
+    "Biological diet inference performed: FALSE"
+  ),
+  con = file.path(STEP5E_DIR, "STEP_05E_COMPLETE.txt")
+)
+
+writeLines(
+  c(
+    "Step 5E is ready for focused manual review.",
+    "No global or Step 6 annotation has been changed.",
+    "Review cluster stability across adjacent resolutions, WNN-versus-RNA ",
+    "agreement, boundary sensitivity, parent origins, marker coherence, ",
+    "cell-cycle composition, modality weights, QC, and diet representation.",
+    "A proposed refined label should not be promoted solely because it has ",
+    "the highest relative module score in a sparse comparison."
+  ),
+  con = file.path(STEP5E_DIR, "STEP_05E_READY_FOR_REVIEW.txt")
+)
+
+step5e_summary
+```
+
+# 19. Manual review rules
+
+Do not select a focused resolution or child label from UMAP geometry alone.
+A candidate canonical ISC, cycling stem/early-TA, or crypt-progenitor child
+should satisfy all of the following:
+
+1. it is stable across adjacent resolutions rather than appearing only once;
+2. it has a coherent detection-supported RNA marker program, not merely a high
+   relative module score;
+3. its broad biological program remains interpretable in the RNA-only
+   sensitivity, while exact one-to-one RNA/WNN cluster correspondence is not
+   required;
+4. the same core nuclei remain coherent when clusters 1 and 18 are added;
+5. its QC and modality weights do not indicate a low-complexity or
+   single-modality artifact;
+6. its cell-cycle composition is explicitly reported, without treating
+   proliferation as either proof against stemness or proof of stemness; and
+7. RNA expression and exact-promoter accessibility are evaluated separately;
+   promoter accessibility is supporting evidence and is not treated as proof
+   of expression or identity; and
+8. both diet libraries contribute enough nuclei for later descriptive
+   diet-effect comparisons. A one-diet child may be biologically interesting,
+   but it cannot anchor a within-state CON-versus-HFD comparison here.
+
+If a stable refinement is supported, record that decision in a new reviewed
+configuration table and apply it in a later workflow step. Step 5E itself is
+provenance-preserving and never mutates the approved Step 6 object.

@@ -1,0 +1,480 @@
+---
+title: "Step 08L | WT ISC HFD-opening and HFD-closing regions"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+Run from the repository root in the SOL R 4.4 session after Steps 08G, 08H,
+08J and 08K. This analysis uses the frozen 622 WT top-15% UCell C0/W0
+candidate intervals. HFD-opening and HFD-closing refer to the sign of the
+**pooled, depth-normalized WT ATAC effect**, not a replicate-level DAR test.
+The independently specified C0-supported 37 and higher-count 16 are
+sensitivity subsets; neither subset redefines the 622. Other evaluable WT
+top-15% consensus peaks provide a neutral, accessible sequence background.
+Motif tests ask whether DNA motifs are more frequent in candidate regions
+than in matched neutral regions. They do **not** test TF binding, TF activity,
+or a diet-by-genotype interaction. One pooled library per diet prevents
+mouse-level statistical inference. Use effect sizes, parent estimates, depth,
+sex-proxy sensitivity, and coverage when selecting illustrative loci.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run Step 08L from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(HELPER)) HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+source(HELPER)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges)
+  library(Matrix); library(Signac); library(SeuratObject)
+})
+motif_pkgs <- c("JASPAR2024", "TFBSTools", "motifmatchr", "Biostrings",
+  "Rsamtools", "DBI", "RSQLite")
+need(all(vapply(motif_pkgs, requireNamespace, logical(1), quietly = TRUE)),
+  paste("Missing packages:", paste(motif_pkgs[!vapply(motif_pkgs,
+    requireNamespace, logical(1), quietly = TRUE)], collapse = ", ")))
+STEP8G <- file.path(OUTPUT_DIR, "08g_C0_C2_and_C0W0_ISC")
+STEP8H <- file.path(OUTPUT_DIR, "08h_wt_ISC_region_freeze_sex_audit")
+STEP8J <- file.path(OUTPUT_DIR, "08j_recount_frozen_WT_intervals")
+STEP8K <- file.path(OUTPUT_DIR, "08k_wt_ISC_attenuation_motif_context")
+OUT <- file.path(OUTPUT_DIR, "08l_wt_ISC_open_close_motifs")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+FASTA <- Sys.getenv("MULTIOME_GRCM39_FASTA", unset = file.path(
+  PROJECT_DIR, "reference", "GRCm39_2024-A", "fasta", "genome.fa"))
+MOTIF_P <- 5e-5
+MATCH_Z_LIMIT <- 1.5  # hard limit for EACH of GC, log width and CON detection
+NEUTRAL_ABS_LOG2FC <- .25
+```
+
+## 1. Load fixed candidate intervals and the evaluable WT peak universe
+
+```{r inputs}
+files <- c(
+  frozen = file.path(STEP8H,
+    "02_all_622_top15_ATAC_peaks_with_evidence_flags.csv.gz"),
+  effects = file.path(STEP8K,
+    "01_all_622_region_effects_and_attenuation.csv.gz"),
+  universe = file.path(STEP8G,
+    "04_ATAC_evaluable_pooled_effects.csv.gz"),
+  bed = file.path(STEP8G, "09_evaluable_unmatched_universe.bed"),
+  sex = file.path(STEP8H,
+    "03_C0_supported_region_effects_by_Xist_detection.csv"),
+  fasta = FASTA, fai = paste0(FASTA, ".fai"),
+  wt_object = file.path(OUTPUT_DIR, "06_annotation", "multiome_annotated.rds"),
+  complete08j = file.path(STEP8J, "STEP_08J_COMPLETE.txt"),
+  complete08k = file.path(STEP8K, "STEP_08K_COMPLETE.txt"))
+need(all(file.exists(files)), paste("Missing inputs:",
+  paste(files[!file.exists(files)], collapse = "; ")))
+file_info <- file.info(files)
+write_table(tibble(input = names(files), path = normalizePath(files),
+  bytes = file_info$size, modified = as.character(file_info$mtime)),
+  OUT, "00_input_manifest.csv")
+frozen <- read_csv_checked(files[["frozen"]])
+wide <- read_csv_checked(files[["effects"]])
+need(nrow(frozen) == 622L && !anyDuplicated(frozen$feature) &&
+  setequal(frozen$feature, wide$feature) && nrow(wide) == 622L,
+  "08H/08K frozen interval identity changed.")
+require_columns(wide, c("feature", "chrom", "start_1based", "end_1based",
+  "anchor_log2FC_HFD_vs_CON", "C0_all_log2FC_HFD_vs_CON",
+  "C0_supported", "count_supported_40", "nested_top10",
+  "both_all_below_half_WT", "ppar_parent_opposite_signs",
+  "il17_parent_opposite_signs"), "08K region effects")
+need(all(wide$feature == frozen$feature) &&
+  isTRUE(all.equal(wide$anchor_log2FC_HFD_vs_CON,
+    frozen$anchor_log2FC_HFD_vs_CON, tolerance = 1e-9)),
+  "08K WT anchor effects differ from 08H.")
+wide$WT_direction <- ifelse(wide$anchor_log2FC_HFD_vs_CON > 0,
+  "HFD_open", "HFD_closed")
+need(!anyNA(wide$WT_direction) &&
+  all(wide$anchor_log2FC_HFD_vs_CON != 0),
+  "Candidate WT directions are missing.")
+print(wide |> dplyr::count(WT_direction, C0_supported,
+  count_supported_40, name = "regions"))
+
+# Read only needed columns from the Step 08G pooled-effects table.
+all_effects <- readr::read_csv(files[["universe"]],
+  col_select = c("contrast", "feature", "evaluable", "clear_effect",
+    "log2FC_HFD_vs_CON", "CON_percent", "HFD_percent",
+    "CON_counts", "HFD_counts"), show_col_types = FALSE,
+  progress = FALSE)
+pool <- all_effects |>
+  dplyr::filter(.data$contrast == "C0W0_top15", .data$evaluable)
+rm(all_effects); invisible(gc())
+need(!anyDuplicated(pool$feature) && nrow(pool) > nrow(wide) &&
+  all(wide$feature %in% pool$feature),
+  "Evaluable WT C0/W0 peak universe is missing frozen candidates.")
+verify <- pool[match(wide$feature, pool$feature), ]
+need(max(abs(verify$log2FC_HFD_vs_CON -
+  wide$anchor_log2FC_HFD_vs_CON)) < 1e-7 &&
+  all(verify$clear_effect), "08G effects differ from frozen WT effects.")
+bed <- readr::read_tsv(files[["bed"]], col_names = c("chrom", "start0",
+  "end", "feature"), col_types = "ciic", show_col_types = FALSE)
+need(!anyDuplicated(bed$feature) && setequal(bed$feature, pool$feature),
+  "08G evaluable BED and pooled effect universe disagree.")
+bed <- bed[match(pool$feature, bed$feature), ]
+need(identical(bed$feature, pool$feature), "BED alignment failed.")
+pool$chrom <- bed$chrom
+pool$start_1based <- bed$start0 + 1L
+pool$end_1based <- bed$end
+ix <- match(wide$feature, pool$feature)
+need(all(pool$chrom[ix] == wide$chrom &
+  pool$start_1based[ix] == wide$start_1based &
+  pool$end_1based[ix] == wide$end_1based),
+  "08G and 08H peak coordinates disagree.")
+```
+
+## 2. Direction, C0 support, and genotype behavior
+
+This table is the region-level result. A genotype union can have a small
+effect if its two parent clusters move in opposite directions. Keep all
+four parent estimates in the CSV. A 'both below half' label compares
+pooled magnitudes with WT C0 and is descriptive.
+
+```{r region-table}
+region <- dplyr::left_join(wide, pool |>
+  dplyr::select(feature, anchor_HFD_percent = HFD_percent),
+  by = "feature", relationship = "one-to-one")
+region$both_parents_below_half_C0 <- vapply(seq_len(nrow(region)),
+  function(i) {
+    reference <- abs(region$C0_all_log2FC_HFD_vs_CON[i])
+    parents <- c("ppar_parent_3_all", "ppar_parent_6_all",
+      "il17_parent_9_all", "il17_parent_10_all")
+    all(vapply(parents, function(prefix) {
+      isTRUE(region[[paste0(prefix, "_evaluable")]][i]) &&
+        abs(region[[paste0(prefix, "_log2FC_HFD_vs_CON")]][i]) <
+          .5 * reference
+    }, logical(1)))
+  }, logical(1))
+write_table(region, OUT, "01_all_622_open_close_genotype_and_support.csv.gz")
+strata <- list(all_622 = rep(TRUE, nrow(region)),
+  C0_supported_37 = region$C0_supported,
+  higher_count_C0_16 = region$C0_supported & region$count_supported_40)
+direction_summary <- dplyr::bind_rows(lapply(names(strata), function(key) {
+  region[strata[[key]], , drop = FALSE] |>
+    dplyr::group_by(WT_direction) |>
+    dplyr::summarise(set = key, n_regions = dplyr::n(),
+      n_both_union_below_half = sum(both_all_below_half_WT),
+      n_both_parent_below_half = sum(both_parents_below_half_C0),
+      n_ppar_opposing_parents = sum(ppar_parent_opposite_signs),
+      n_il17_opposing_parents = sum(il17_parent_opposite_signs),
+      median_WT_anchor_abs_log2FC = median(abs(anchor_log2FC_HFD_vs_CON)),
+      .groups = "drop")
+})) |> dplyr::select(set, dplyr::everything())
+write_table(direction_summary, OUT, "01_direction_and_attenuation_summary.csv")
+print(direction_summary)
+sex <- read_csv_checked(files[["sex"]])
+write_table(sex, OUT, "01_C0_regions_Xist_detection_sensitivity.csv")
+p <- ggplot2::ggplot(region,
+  ggplot2::aes(x = anchor_log2FC_HFD_vs_CON,
+    y = C0_all_log2FC_HFD_vs_CON, color = C0_supported)) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = .2) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = .2) +
+  ggplot2::geom_point(alpha = .55, size = 1.5) +
+  ggplot2::facet_wrap(~ WT_direction) +
+  ggplot2::scale_color_manual(values = c(`TRUE` = "#B45142",
+    `FALSE` = "#AAB6B7")) + ggplot2::theme_bw() +
+  ggplot2::labs(title = "WT ISC candidate region effects by direction",
+    subtitle = "622 top-15% candidates; C0 support is a sensitivity flag",
+    x = "WT C0/W0 top-15 pooled ATAC log2FC",
+    y = "WT C0 pooled ATAC log2FC")
+save_vector_plot(p, PLOTS, "01_WT_open_close_C0_support.pdf", 12, 5)
+```
+
+## 3. Define neutral accessible backgrounds and audit matchability
+
+Match a distinct neutral region for each candidate within the same genomic
+context, with hard limits on standardized GC, log(width), and WT CON
+detection. Neutral means evaluable, `abs(log2FC) <= 0.25`, and not one of
+the 622; it does not imply a replicate-verified null. An unmatched target
+stays visible in the audit but does not enter a motif test. We compare one
+target with one matched neutral region, allowing exact paired discordance
+tests. If fewer than 80% of a direction matches, report its motif analysis
+as insufficiently matched.
+
+```{r sequence-and-matching}
+pool$width <- pool$end_1based - pool$start_1based + 1L
+gr <- GenomicRanges::GRanges(seqnames = pool$chrom,
+  ranges = IRanges::IRanges(pool$start_1based, pool$end_1based))
+names(gr) <- pool$feature
+fa <- Rsamtools::FaFile(FASTA)
+index <- Rsamtools::scanFaIndex(fa)
+seq_width <- setNames(as.integer(BiocGenerics::width(index)),
+  as.character(GenomicRanges::seqnames(index)))
+valid <- pool$chrom %in% names(seq_width) &
+  pool$start_1based >= 1 &
+  pool$end_1based <= seq_width[pool$chrom] & pool$width > 0L
+need(all(valid[match(wide$feature, pool$feature)]),
+  "A frozen candidate lies outside the GRCm39 FASTA.")
+pool <- pool[which(valid), ]
+gr <- gr[which(valid)]
+seqs <- Rsamtools::scanFa(fa, param = gr)
+need(length(seqs) == nrow(pool) &&
+  all(as.integer(BiocGenerics::width(seqs)) == pool$width),
+  "FASTA sequence widths do not match WT peak widths.")
+names(seqs) <- pool$feature
+pool$gc_percent <- 100 * rowSums(Biostrings::letterFrequency(seqs,
+  letters = c("G", "C"), as.prob = TRUE))
+need(all(is.finite(pool$gc_percent)), "Invalid GC percentage.")
+obj <- readRDS(files[["wt_object"]])
+annotation <- Signac::Annotation(obj[["ATAC"]])
+need(length(annotation) > 0L, "WT annotation unavailable.")
+rm(obj); invisible(gc())
+promoters <- GenomicRanges::promoters(annotation,
+  upstream = 2000L, downstream = 2000L)
+pool$context <- dplyr::case_when(
+  GenomicRanges::countOverlaps(gr, promoters, ignore.strand = TRUE) > 0 ~
+    "promoter",
+  GenomicRanges::countOverlaps(gr, annotation, ignore.strand = TRUE) > 0 ~
+    "gene_body", TRUE ~ "intergenic")
+target_gr <- gr[match(wide$feature, names(gr))]
+target_vicinity <- GenomicRanges::GRanges(
+  seqnames = as.character(GenomicRanges::seqnames(target_gr)),
+  ranges = IRanges::IRanges(
+    start = pmax(1L, BiocGenerics::start(target_gr) - 1000L),
+    end = BiocGenerics::end(target_gr) + 1000L))
+pool$within_1kb_frozen <- GenomicRanges::countOverlaps(gr,
+  target_vicinity, ignore.strand = TRUE) > 0
+pool$membership <- dplyr::case_when(
+  pool$feature %in% wide$feature[wide$WT_direction == "HFD_open"] ~
+    "HFD_open",
+  pool$feature %in% wide$feature[wide$WT_direction == "HFD_closed"] ~
+    "HFD_closed",
+  pool$within_1kb_frozen ~ "near_frozen_excluded",
+  !(pool$feature %in% wide$feature) &
+    abs(pool$log2FC_HFD_vs_CON) <= NEUTRAL_ABS_LOG2FC ~ "neutral",
+  TRUE ~ "other")
+write_table(pool |>
+  dplyr::select(feature, chrom, start_1based, end_1based,
+    log2FC_HFD_vs_CON, CON_percent, HFD_percent, CON_counts,
+    HFD_counts, width, gc_percent, context, within_1kb_frozen,
+    membership), OUT,
+  "02_evaluable_WT_universe_sequence_covariates.csv.gz")
+z <- cbind(gc_percent = pool$gc_percent,
+  log_width = log1p(pool$width), CON_percent = pool$CON_percent)
+center <- colMeans(z)
+spread <- apply(z, 2, stats::sd)
+need(all(is.finite(spread) & spread > 0), "Invalid matching variances.")
+z <- sweep(sweep(z, 2, center, "-"), 2, spread, "/")
+rownames(z) <- pool$feature
+targets <- wide$feature
+remaining <- pool$feature[pool$membership == "neutral"]
+# Match the scarcest context first, so common promoter peaks do not consume
+# the few available intergenic controls. No context fallback or caliper relaxation.
+target_order <- order(vapply(targets, function(f) {
+  row <- match(f, pool$feature)
+  sum(pool$context[match(remaining, pool$feature)] == pool$context[row])
+}, integer(1)), targets)
+match_rows <- vector("list", length(target_order))
+for (k in seq_along(target_order)) {
+  f <- targets[target_order[k]]
+  i <- match(f, pool$feature)
+  candidates <- remaining[pool$context[match(remaining, pool$feature)] ==
+    pool$context[i]]
+  if (length(candidates)) {
+    delta <- abs(sweep(z[candidates, , drop = FALSE], 2, z[f, ], "-"))
+    good <- apply(delta <= MATCH_Z_LIMIT, 1, all)
+    candidates <- candidates[good]
+    delta <- delta[good, , drop = FALSE]
+  }
+  if (length(candidates)) {
+    dist <- rowSums(delta^2)
+    selected <- candidates[order(dist, candidates)][1]
+    j <- match(selected, pool$feature)
+    match_rows[[k]] <- tibble(target_feature = f,
+      background_feature = selected, WT_direction = wide$WT_direction[
+        match(f, wide$feature)], target_context = pool$context[i],
+      background_context = pool$context[j],
+      distance = dist[match(selected, candidates)],
+      delta_gc_sd = delta[selected, "gc_percent"],
+      delta_log_width_sd = delta[selected, "log_width"],
+      delta_CON_detection_sd = delta[selected, "CON_percent"])
+    remaining <- setdiff(remaining, selected)
+  } else {
+    match_rows[[k]] <- tibble(target_feature = f,
+      background_feature = NA_character_, WT_direction = wide$WT_direction[
+        match(f, wide$feature)], target_context = pool$context[i],
+      background_context = NA_character_, distance = NA_real_,
+      delta_gc_sd = NA_real_, delta_log_width_sd = NA_real_,
+      delta_CON_detection_sd = NA_real_)
+  }
+}
+matching <- dplyr::bind_rows(match_rows) |>
+  dplyr::arrange(match(target_feature, targets))
+need(nrow(matching) == 622L &&
+  !anyDuplicated(stats::na.omit(matching$background_feature)) &&
+  all(matching$target_context[!is.na(matching$background_feature)] ==
+    matching$background_context[!is.na(matching$background_feature)]),
+  "Matched pairs have invalid controls or contexts.")
+write_table(matching, OUT, "02_all_622_target_neutral_matches.csv")
+matched <- dplyr::filter(matching, !is.na(background_feature))
+need(nrow(matched) > 0L, "No neutral WT peaks met the matching criteria.")
+balance <- dplyr::bind_rows(lapply(c("HFD_open", "HFD_closed"), function(dir) {
+  pairs <- dplyr::filter(matched, WT_direction == dir)
+  dplyr::bind_rows(lapply(c("target", "background"), function(which) {
+    x <- pool[match(pairs[[paste0(which, "_feature")]], pool$feature), ]
+    x |>
+      dplyr::group_by(context) |>
+      dplyr::summarise(direction = dir, membership = which, n = dplyr::n(),
+        median_gc = median(gc_percent), median_width = median(width),
+        median_CON_detection = median(CON_percent),
+        .groups = "drop")
+  }))
+})) |> dplyr::select(direction, membership, dplyr::everything())
+write_table(balance, OUT, "02_matched_background_balance.csv")
+match_audit <- matching |>
+  dplyr::group_by(WT_direction) |>
+  dplyr::summarise(targets = dplyr::n(),
+    matched = sum(!is.na(background_feature)),
+    fraction_matched = matched / targets,
+    max_gc_sd = if (sum(!is.na(background_feature)) > 0)
+      max(delta_gc_sd, na.rm = TRUE)
+      else NA_real_,
+    max_log_width_sd = if (sum(!is.na(background_feature)) > 0)
+      max(delta_log_width_sd, na.rm = TRUE) else NA_real_,
+    max_CON_detection_sd = if (sum(!is.na(background_feature)) > 0)
+      max(delta_CON_detection_sd, na.rm = TRUE) else NA_real_,
+    .groups = "drop")
+write_table(match_audit, OUT, "02_matching_coverage_audit.csv")
+print(match_audit); print(balance)
+```
+
+## 4. JASPAR motifs by direction; C0 and count support as checks
+
+One-sided exact paired discordance P values compare the number of
+target-positive/control-negative pairs to the reverse. BH adjustment is
+performed **separately within each named region set**, across all tested
+JASPAR motif profiles. These P values are sequence-enrichment tests only.
+The C0-supported tests reuse the same targets and matching; they are
+dependent sensitivity checks, not independent validation. The count-supported
+16 are retained in the direction summary, but the three closing regions
+are too few for a separate motif test.
+Report full-universe direction tests as inconclusive if the match rate is
+below 80%, and treat the seven C0-supported closing regions as descriptive.
+
+```{r motif-tests}
+db <- JASPAR2024::JASPAR2024()
+con <- DBI::dbConnect(RSQLite::SQLite(), methods::slot(db, "db"))
+pfms <- tryCatch(TFBSTools::getMatrixSet(con,
+  opts = list(collection = "CORE", tax_group = "vertebrates",
+    all_versions = FALSE)), finally = DBI::dbDisconnect(con))
+need(length(pfms) > 0L, "JASPAR returned no CORE vertebrate motifs.")
+meta_motif <- tibble(motif_id = vapply(pfms, TFBSTools::ID,
+    character(1)), motif_name = vapply(pfms, TFBSTools::name,
+    character(1)), motif_family = vapply(pfms, function(x)
+    paste(TFBSTools::tags(x)$family, collapse = ";"), character(1)))
+scan_features <- unique(c(matched$target_feature,
+  matched$background_feature))
+hits <- motifmatchr::motifMatches(motifmatchr::matchMotifs(
+  pwms = pfms, subject = seqs[scan_features], bg = "subject",
+  out = "matches", p.cutoff = MOTIF_P))
+need(nrow(hits) == length(scan_features), "Motif scan rows disagree.")
+rownames(hits) <- scan_features
+motif_id <- vapply(colnames(hits), function(column) {
+  ids <- meta_motif$motif_id[startsWith(column, meta_motif$motif_id)]
+  if (!length(ids)) return(NA_character_)
+  ids[which.max(nchar(ids))]
+}, character(1))
+need(!anyNA(motif_id), "JASPAR hit column IDs could not be mapped.")
+motif_info <- dplyr::left_join(tibble(motif_column = colnames(hits),
+  motif_id = motif_id), meta_motif, by = "motif_id",
+  relationship = "many-to-one")
+pair_sets <- list(
+  HFD_open_622 = dplyr::filter(matched, WT_direction == "HFD_open"),
+  HFD_closed_622 = dplyr::filter(matched, WT_direction == "HFD_closed"),
+  HFD_open_C0 = dplyr::filter(matched, WT_direction == "HFD_open",
+    target_feature %in% region$feature[region$C0_supported]),
+  HFD_closed_C0 = dplyr::filter(matched, WT_direction == "HFD_closed",
+    target_feature %in% region$feature[region$C0_supported]))
+motif_results <- dplyr::bind_rows(lapply(names(pair_sets), function(key) {
+  pairs <- pair_sets[[key]]
+  if (!nrow(pairs)) return(NULL)
+  a <- hits[pairs$target_feature, , drop = FALSE]
+  b <- hits[pairs$background_feature, , drop = FALSE]
+  target_only <- as.integer(Matrix::colSums(a & !b))
+  background_only <- as.integer(Matrix::colSums(!a & b))
+  discordant <- target_only + background_only
+  p <- stats::pbinom(target_only - 1L, discordant, .5,
+    lower.tail = FALSE)
+  tibble(set = key, n_pairs = nrow(pairs),
+    target_hits = as.integer(Matrix::colSums(a)),
+    background_hits = as.integer(Matrix::colSums(b)),
+    target_only = target_only, background_only = background_only,
+    target_percent = 100 * target_hits / nrow(pairs),
+    background_percent = 100 * background_hits / nrow(pairs),
+    prevalence_difference_pp = target_percent - background_percent,
+    paired_one_sided_p = p,
+    paired_BH = stats::p.adjust(p, method = "BH"),
+    motif_column = colnames(hits)) |>
+    dplyr::left_join(motif_info, by = "motif_column",
+      relationship = "many-to-one")
+})) |>
+  dplyr::arrange(set, paired_BH, paired_one_sided_p,
+    dplyr::desc(prevalence_difference_pp))
+motif_results$direction <- ifelse(startsWith(motif_results$set, "HFD_open"),
+  "HFD_open", "HFD_closed")
+motif_results$direction_match_fraction <- match_audit$fraction_matched[
+  match(motif_results$direction, match_audit$WT_direction)]
+motif_results$interpretation_status <- dplyr::case_when(
+  motif_results$direction_match_fraction < .8 ~ "insufficient_matching",
+  motif_results$n_pairs < 10L ~ "very_small_descriptive_subset",
+  TRUE ~ "conditional_sequence_enrichment_only")
+write_table(motif_results, OUT,
+  "03_JASPAR2024_open_close_paired_motif_tests.csv.gz")
+motif_summary <- motif_results |>
+  dplyr::group_by(set) |>
+  dplyr::summarise(matched_pairs = dplyr::first(n_pairs),
+    n_profiles = dplyr::n(), n_BH_below_005 = sum(paired_BH < .05),
+    min_BH = min(paired_BH), .groups = "drop")
+write_table(motif_summary, OUT, "03_motif_result_summary.csv")
+print(motif_summary)
+for (key in c("HFD_open_622", "HFD_closed_622")) {
+  x <- motif_results |>
+    dplyr::filter(set == key, target_hits >= 5L,
+      prevalence_difference_pp > 0) |>
+    dplyr::slice_head(n = 20L)
+  if (!nrow(x)) next
+  x$label <- paste(x$motif_name, x$motif_id)
+  p <- ggplot2::ggplot(x, ggplot2::aes(
+    x = stats::reorder(label, prevalence_difference_pp),
+    y = prevalence_difference_pp, size = target_hits,
+    color = paired_BH)) +
+    ggplot2::geom_point() + ggplot2::coord_flip() +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::labs(title = paste(key, "motif sequence enrichment"),
+      subtitle = "Candidate vs matched neutral WT accessible regions; paired BH tests DNA sequence only",
+      x = NULL, y = "Candidate minus control motif prevalence (pp)")
+  save_vector_plot(p, PLOTS, paste0("03_", key, "_motif_context.pdf"),
+    12, 8)
+}
+```
+
+## 5. Review handoff
+
+Read the matching audit before any motif table. If either 622-direction
+match fraction is below 0.8, widen the candidate background universe or
+revisit matching **before** interpreting motif ranks; do not quietly
+relax the matching limits. A significant motif requires follow-up with
+TF expression and ideally footprinting or an independent assay. Adjacent
+peaks can share a regulatory locus; inspect regional redundancy before
+counting them as independent examples. Review the saved Xist sensitivity
+and individual genotype parents for each prioritized candidate. This step
+does not create replicate-level statistics.
+
+```{r finish}
+finish_run(OUT, "STEP_08L_COMPLETE.txt", c(
+  "Fixed 622 WT top-15 ISC candidates were split by HFD direction.",
+  "Neutral evaluable accessible peaks were matched on context, GC, width and WT CON detection.",
+  "Paired motif BH tests are sequence-enrichment tests, not biological diet tests.",
+  "No replicate-level DAR or genotype-by-diet inference from pooled libraries.",
+  paste("Outputs:", OUT)))
+```

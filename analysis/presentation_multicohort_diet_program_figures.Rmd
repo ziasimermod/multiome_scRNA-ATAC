@@ -1,0 +1,2659 @@
+---
+title: "Meeting figures: WT diet response and cross-cohort program projection"
+author: "Dominic Saiz"
+date: "2026-09-15"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Purpose and interpretation boundary
+
+This standalone notebook prepares editable, presentation-ready PDF figures for
+the WT diet-response update and projects the same expression programs into the
+PPAR and IL17 cohorts. It does not alter the primary pipeline objects.
+
+Each diet/genotype combination is represented by one pooled library. Therefore:
+
+- every CON-versus-HFD comparison is descriptive;
+- nuclei are not biological replicates;
+- balanced cell downsampling measures cell-sampling stability, not biological
+  uncertainty;
+- nearest-gene or nearby-peak concordance does not establish a regulatory
+  connection;
+- cross-cohort score differences may reflect genotype, pool composition, and
+  technical differences in addition to biology.
+
+The notebook writes the exact table underlying every plotted claim. The PDF
+pages use a 16:9 canvas and vector graphics for editing in Illustrator.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "Seurat",
+  "SeuratObject",
+  "UCell",
+  "Matrix",
+  "dplyr",
+  "tidyr",
+  "readr",
+  "ggplot2",
+  "patchwork",
+  "tibble",
+  "future",
+  "scales",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following package(s) before running this notebook: ",
+    paste(missing_packages, collapse = ", "),
+    "\nFor UCell, use BiocManager::install('UCell').",
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(UCell)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(patchwork)
+  library(tibble)
+})
+
+set.seed(12345)
+future::plan(future::sequential)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.align = "center"
+)
+```
+
+# 1. Configuration
+
+Change only the values in this chunk when the results root or meeting label
+changes.
+
+```{r configure-analysis}
+PROJECT_DIR <- "/scratch/dsaiz/Yesenia_scData2026"
+DATASET_VERSION <- "v2_resequenced"
+PRESENTATION_TAG <- "2026-09-15_diet_program_update"
+
+REFERENCE_DIET <- "CON"
+COMPARISON_DIET <- "HFD"
+COHORT_IDS <- c("wt", "ppar", "il17")
+COHORT_LABELS <- c(
+  wt = "WT",
+  ppar = "Ppar iKO",
+  il17 = "Il17ra iKO"
+)
+
+UCELL_MAX_RANK <- 1000L
+MIN_NUCLEI_PER_DIET <- 50L
+MAX_DOWNSAMPLED_NUCLEI_PER_DIET <- 500L
+DOWNSAMPLING_ITERATIONS <- 100L
+TOP_RNA_GENES_PER_STATE_AND_DIRECTION <- 3L
+TOP_MULTIMODAL_PAIRS_PER_STATE_AND_DIRECTION <- 3L
+NEARBY_GENE_DISTANCE_BP <- 2000L
+RANDOM_SEED <- 12345L
+
+RESULT_ROOT <- file.path(RESULTS_ROOT,
+  DATASET_VERSION,
+  "independent"
+)
+
+MEETING_OUTPUT_DIR <- file.path(RESULTS_ROOT,
+  DATASET_VERSION,
+  "presentation",
+  PRESENTATION_TAG
+)
+
+PLOT_DIR <- file.path(MEETING_OUTPUT_DIR, "plots")
+TABLE_DIR <- file.path(MEETING_OUTPUT_DIR, "tables")
+
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+STEP6_OBJECT_PATHS <- setNames(
+  file.path(
+    RESULT_ROOT,
+    COHORT_IDS,
+    "06_annotation",
+    "multiome_annotated.rds"
+  ),
+  COHORT_IDS
+)
+
+WT_STEP7C_TABLE_DIR <- file.path(
+  RESULT_ROOT,
+  "wt",
+  "07c_candidate_prioritization",
+  "tables"
+)
+
+WT_STEP7_TABLE_DIR <- file.path(
+  RESULT_ROOT,
+  "wt",
+  "07_diet_response",
+  "tables"
+)
+
+WT_COMPOSITION_EFFECT_PATH <- file.path(
+  WT_STEP7_TABLE_DIR,
+  "composition_effect_sizes.csv"
+)
+
+WT_STEP8_TABLE_DIR <- file.path(
+  RESULT_ROOT,
+  "wt",
+  "08_persistent_hfd_programs",
+  "tables"
+)
+
+WT_RNA_PRIORITY_PATH <- file.path(
+  WT_STEP7C_TABLE_DIR,
+  "RNA_prioritized_diet_candidates.csv"
+)
+
+WT_MULTIMODAL_PRIORITY_PATH <- file.path(
+  WT_STEP7C_TABLE_DIR,
+  "RNA_ATAC_concordant_prioritized_candidates.csv"
+)
+
+WT_PERSISTENT_EVIDENCE_PATH <- file.path(
+  WT_STEP8_TABLE_DIR,
+  "persistent_gene_primary_WT_stem_integrated_evidence.csv"
+)
+```
+
+## Plot styling
+
+```{r define-presentation-style}
+DIET_COLORS <- c(
+  CON = "#E69F00",
+  HFD = "#56B4E9"
+)
+
+COHORT_COLORS <- c(
+  WT = "#333333",
+  `Ppar iKO` = "#CC79A7",
+  `Il17ra iKO` = "#009E73"
+)
+
+DIRECTION_COLORS <- c(
+  CON_higher = DIET_COLORS[["CON"]],
+  HFD_higher = DIET_COLORS[["HFD"]]
+)
+
+STATE_COLORS <- c(
+  "ISC-like crypt" = "#4C78A8",
+  "Cycling ISC/TA" = "#72B7B2",
+  "Crypt progenitor" = "#54A24B",
+  "Deep crypt secretory" = "#F58518",
+  "Secretory progenitor" = "#E45756",
+  "Immature absorptive" = "#B279A2",
+  "Mature absorptive / colonocyte" = "#FF9DA6",
+  "Immature goblet" = "#9D755D",
+  "Mature goblet" = "#BAB0AC",
+  "Tuft" = "#EDC948",
+  "Enterochromaffin" = "#8CD17D",
+  "Other EEC" = "#499894",
+  "Other epithelial" = "#A0A0A0"
+)
+
+theme_presentation <- function(base_size = 18) {
+  ggplot2::theme_classic(base_size = base_size) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        size = base_size * 1.30,
+        margin = ggplot2::margin(b = 8)
+      ),
+      plot.subtitle = ggplot2::element_text(
+        size = base_size * 0.80,
+        color = "grey25",
+        margin = ggplot2::margin(b = 12)
+      ),
+      plot.caption = ggplot2::element_text(
+        size = base_size * 0.62,
+        color = "grey35",
+        hjust = 0,
+        margin = ggplot2::margin(t = 10)
+      ),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text = ggplot2::element_text(color = "black"),
+      strip.background = ggplot2::element_rect(
+        fill = "grey94",
+        color = NA
+      ),
+      strip.text = ggplot2::element_text(face = "bold"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      legend.position = "right",
+      panel.grid.major.y = ggplot2::element_line(
+        color = "grey90",
+        linewidth = 0.3
+      )
+    )
+}
+
+PREVIEW_PLOTS_IN_RSTUDIO <- FALSE
+
+preview_plot <- function(plot) {
+  if (isTRUE(PREVIEW_PLOTS_IN_RSTUDIO)) {
+    print(plot)
+  }
+
+  invisible(plot)
+}
+
+save_presentation_pdf <- function(filename, plot, width = 13.333,
+                                  height = 7.5) {
+  output_path <- file.path(PLOT_DIR, filename)
+
+  grDevices::pdf(
+    file = output_path,
+    width = width,
+    height = height,
+    onefile = TRUE,
+    family = "Helvetica",
+    paper = "special",
+    useDingbats = FALSE
+  )
+
+  opened_device <- grDevices::dev.cur()
+
+  on.exit(
+    {
+      open_devices <- grDevices::dev.list()
+      if (!is.null(open_devices) && opened_device %in% open_devices) {
+        grDevices::dev.off(which = opened_device)
+      }
+    },
+    add = TRUE
+  )
+
+  print(plot)
+  invisible(output_path)
+}
+```
+
+## Validation helpers
+
+```{r define-validation-helpers}
+assert_file <- function(path, label) {
+  if (!file.exists(path)) {
+    stop(label, " was not found:\n  ", path, call. = FALSE)
+  }
+  invisible(path)
+}
+
+assert_columns <- function(data, columns, label) {
+  missing_columns <- setdiff(columns, colnames(data))
+  if (length(missing_columns) > 0L) {
+    stop(
+      label,
+      " is missing column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+as_logical_safely <- function(x) {
+  if (is.logical(x)) {
+    return(x)
+  }
+  tolower(trimws(as.character(x))) %in% c("true", "t", "1", "yes")
+}
+
+safe_median <- function(x) {
+  if (length(x) == 0L || all(is.na(x))) {
+    return(NA_real_)
+  }
+  stats::median(x, na.rm = TRUE)
+}
+
+for (cohort_id in COHORT_IDS) {
+  assert_file(
+    STEP6_OBJECT_PATHS[[cohort_id]],
+    paste0(COHORT_LABELS[[cohort_id]], " Step 6 object")
+  )
+}
+
+assert_file(WT_RNA_PRIORITY_PATH, "WT Step 7c RNA priority table")
+assert_file(WT_COMPOSITION_EFFECT_PATH, "WT Step 7 composition effect table")
+assert_file(
+  WT_MULTIMODAL_PRIORITY_PATH,
+  "WT Step 7c RNA/ATAC priority table"
+)
+assert_file(WT_PERSISTENT_EVIDENCE_PATH, "WT Step 8 evidence table")
+```
+
+# 2. Define the expression programs
+
+The working descriptions are used in figures. The legacy labels remain in the
+program key for continuity with Gourab's terminology. `Atpif1` is represented
+by the current mouse symbol `Atp5if1`.
+
+```{r define-programs}
+HYPERMET_GENES <- c(
+  "Mgst1", "Gstm1", "Idh1", "Gss", "Gsta4", "Gclm", "Sod1",
+  "Sult1a1", "Hmgcs2", "Acsm3", "Csad", "Acss2", "Shmt1",
+  "Impdh2", "Akr7a5", "Adk", "Aprt", "Hao2", "Hadh", "Mecr",
+  "Scd2", "Mif", "Fads2", "Acads", "Sox9", "Aldob", "Atp5if1",
+  "Uqcrc1", "Slc4a4", "Hspd1", "Eef1a1", "Nox1", "Cyba", "Tkt",
+  "Gpx2", "Gsto1", "Adh1"
+)
+
+HYPOIMMUNE_GENES <- c(
+  "Nupr1", "Crip1", "Atp2a3", "Cdkn1a", "Cd74", "Herpud1",
+  "Dnajc10", "Ern2", "Itpr1", "Xbp1", "P4hb", "Selenok", "Selenos",
+  "Creb3l1", "Serinc3", "Sh3glb1", "H2-K1", "H2-D1", "B2m",
+  "H2-T23", "Psmb8", "Calr", "Ceacam1", "Klf4", "Mia3", "Cd24a",
+  "Rap1gap", "Pla2g2f", "Spint2", "Trp53inp1", "Gabarap",
+  "Gabarapl2", "Camk2n1", "S100a13", "Oit1", "Syt7", "Serp1",
+  "Rab3d", "Rab15", "Agr2", "Hspa5", "Manf", "Dnajc3", "Creb3l4",
+  "Pdia3", "Pdia6", "Sdf2l1", "Sec61b", "Ramp1", "Galnt7",
+  "C1galt1", "Gfpt1", "Gcnt3", "St3gal6", "Tmem59", "St6galnac6",
+  "Galnt10", "C1galt1c1", "Fut2", "Galnt3", "Rpn1", "Krtcap2",
+  "Pmm2", "Prdx6", "Qsox1", "Sh3bgrl3", "Txndc5", "Pdia5", "Dap",
+  "Foxa3", "Clca1", "Tspan13", "Atp2c2", "P2rx4", "Stim2", "Asph",
+  "Fxyd3", "Lrrc26", "Kit", "Plpp1", "Pdxdc1", "Rrbp1", "Tram1",
+  "Sec62", "Ssr1", "Bag1", "Lman1", "Actb", "Fos", "Il13ra1",
+  "Ifngr1"
+)
+
+persistent_evidence <- suppressMessages(
+  readr::read_csv(
+    WT_PERSISTENT_EVIDENCE_PATH,
+    show_col_types = FALSE
+  )
+)
+
+assert_columns(
+  persistent_evidence,
+  c(
+    "gene", "reference_direction", "reference_program",
+    "gene_in_RNA_assay", "RNA_reference_direction_concordant",
+    "RNA_clear_effect", "RNA_direction_stable",
+    "RNA_downsampling_iqr_excludes_zero", "RNA_validation_class",
+    "RNA_reference_aligned_log2FC",
+    "representative_ATAC_reference_aligned_log2FC",
+    "representative_promoter_peak",
+    "representative_peak_offset_bp",
+    "representative_peak_overlaps_tss",
+    "promoter_ATAC_summary_class",
+    "multimodal_validation_class"
+  ),
+  "WT Step 8 evidence table"
+)
+
+persistent_evidence <- persistent_evidence |>
+  dplyr::mutate(
+    dplyr::across(
+      c(
+        gene_in_RNA_assay,
+        RNA_reference_direction_concordant,
+        RNA_clear_effect,
+        RNA_direction_stable,
+        RNA_downsampling_iqr_excludes_zero
+      ),
+      as_logical_safely
+    )
+  )
+
+persistent_stringent <- persistent_evidence |>
+  dplyr::filter(
+    gene_in_RNA_assay,
+    RNA_reference_direction_concordant,
+    RNA_clear_effect,
+    RNA_direction_stable,
+    RNA_downsampling_iqr_excludes_zero
+  )
+
+persistent_extended <- persistent_evidence |>
+  dplyr::filter(
+    gene_in_RNA_assay,
+    RNA_reference_direction_concordant,
+    RNA_direction_stable
+  )
+
+genes_by_reference_direction <- function(data, direction) {
+  data |>
+    dplyr::filter(reference_direction == direction) |>
+    dplyr::pull(gene) |>
+    unique() |>
+    sort()
+}
+
+requested_signatures <- list(
+  HyperMet = unique(HYPERMET_GENES),
+  HypoImmune = unique(HYPOIMMUNE_GENES),
+  Persistent_up_stringent = genes_by_reference_direction(
+    persistent_stringent,
+    "HFD_higher"
+  ),
+  Persistent_down_stringent = genes_by_reference_direction(
+    persistent_stringent,
+    "CON_higher"
+  ),
+  Persistent_up_extended = genes_by_reference_direction(
+    persistent_extended,
+    "HFD_higher"
+  ),
+  Persistent_down_extended = genes_by_reference_direction(
+    persistent_extended,
+    "CON_higher"
+  )
+)
+
+empty_signatures <- names(requested_signatures)[
+  lengths(requested_signatures) == 0L
+]
+
+if (length(empty_signatures) > 0L) {
+  stop(
+    "Step 8 produced an empty signature for: ",
+    paste(empty_signatures, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+program_key <- tibble::tribble(
+  ~program, ~working_descriptor, ~legacy_label, ~expected_HFD_direction,
+  "HyperMet", "Persistent HFD-associated metabolic/redox module",
+  "HyperMet", "higher",
+  "HypoImmune", "Persistent HFD-depleted immune/ER-secretory module",
+  "HypoImmune", "lower",
+  "Persistent_up_stringent", "Stringent WT-recovered persistent HFD-up arm",
+  NA_character_, "higher",
+  "Persistent_down_stringent", "Stringent WT-recovered persistent HFD-down arm",
+  NA_character_, "lower",
+  "Persistent_up_extended", "Extended stable WT-recovered persistent HFD-up arm",
+  NA_character_, "higher",
+  "Persistent_down_extended", "Extended stable WT-recovered persistent HFD-down arm",
+  NA_character_, "lower"
+)
+
+program_definition_requested <- dplyr::bind_rows(
+  lapply(
+    names(requested_signatures),
+    function(program_name) {
+      tibble::tibble(
+        program = program_name,
+        gene = requested_signatures[[program_name]]
+      )
+    }
+  )
+) |>
+  dplyr::left_join(program_key, by = "program")
+
+readr::write_csv(
+  program_definition_requested,
+  file.path(TABLE_DIR, "program_definition_requested.csv")
+)
+
+readr::write_csv(
+  tibble::tibble(
+    source_symbol = "Atpif1",
+    scoring_symbol = "Atp5if1",
+    program = "HyperMet",
+    rationale = "Use the current mouse gene symbol for assay matching."
+  ),
+  file.path(TABLE_DIR, "program_symbol_updates.csv")
+)
+
+program_key
+```
+
+# 3. Harmonize epithelial state labels across cohorts
+
+The mapping preserves each original annotation and only creates a shared label
+for descriptive cross-cohort displays. It does not claim that similarly named
+states are perfectly equivalent.
+
+```{r define-state-harmonization}
+harmonize_epithelial_state <- function(cell_state, cell_state_full) {
+  label <- paste(
+    tolower(as.character(cell_state)),
+    tolower(as.character(cell_state_full))
+  )
+
+  dplyr::case_when(
+    grepl("unresolved|low-complexity|low information|low-information", label) ~
+      "Unresolved / low-information",
+    grepl("cycling isc|early ta|transit-ampl", label) ~ "Cycling ISC/TA",
+    grepl("isc-like", label) ~ "ISC-like crypt",
+    grepl("crypt progenitor", label) ~ "Crypt progenitor",
+    grepl("reg4|deep crypt secretory|dcs-like|dcs cell|dcs$", label) ~
+      "Deep crypt secretory",
+    grepl("cycling secretory|secretory progenitor", label) ~
+      "Secretory progenitor",
+    grepl("immature absorptive", label) ~ "Immature absorptive",
+    grepl(
+      "mature absorptive|mature colonocyte|surface colonocyte|car4|aqp8|slc40a1|hmgcs2[+] absorptive",
+      label
+    ) ~ "Mature absorptive / colonocyte",
+    grepl("immature goblet", label) ~ "Immature goblet",
+    grepl("mature goblet|goblet cell", label) ~ "Mature goblet",
+    grepl("tuft", label) ~ "Tuft",
+    grepl("enterochromaffin|tph1", label) ~ "Enterochromaffin",
+    grepl("l cell|l-cell|enteroendocrine|eec", label) ~ "Other EEC",
+    TRUE ~ "Other epithelial"
+  )
+}
+
+STATE_ORDER <- c(
+  "ISC-like crypt",
+  "Cycling ISC/TA",
+  "Crypt progenitor",
+  "Secretory progenitor",
+  "Deep crypt secretory",
+  "Immature absorptive",
+  "Mature absorptive / colonocyte",
+  "Immature goblet",
+  "Mature goblet",
+  "Tuft",
+  "Enterochromaffin",
+  "Other EEC",
+  "Other epithelial",
+  "Unresolved / low-information"
+)
+
+PRIMARY_CRYPT_STATES <- c(
+  "ISC-like crypt",
+  "Cycling ISC/TA",
+  "Crypt progenitor",
+  "Deep crypt secretory"
+)
+
+PRESENTATION_EPITHELIAL_STATES <- setdiff(
+  STATE_ORDER,
+  c(
+    "Other epithelial",
+    "Unresolved / low-information"
+  )
+)
+```
+
+# 4. Load and score the three cohorts
+
+The WT feature set defines the common signature genes. The PPAR and IL17 RNA
+assays must contain those same genes, ensuring that cohort scores use identical
+signature membership.
+
+```{r define-cohort-loader}
+resolve_analysis_unit <- function(metadata) {
+  if ("annotation_unit" %in% colnames(metadata)) {
+    return(as.character(metadata$annotation_unit))
+  }
+
+  if ("wnn_cluster" %in% colnames(metadata)) {
+    return(as.character(metadata$wnn_cluster))
+  }
+
+  stop(
+    "Metadata contains neither annotation_unit nor wnn_cluster.",
+    call. = FALSE
+  )
+}
+
+extract_joined_rna_data <- function(object, metadata) {
+  if (!"RNA" %in% names(object)) {
+    stop("The object has no RNA assay.", call. = FALSE)
+  }
+
+  rna_layers <- SeuratObject::Layers(object[["RNA"]])
+
+  if (!"data" %in% rna_layers) {
+    stop(
+      "The RNA assay must contain a joined data layer. Available layers: ",
+      paste(rna_layers, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  rna_data <- SeuratObject::LayerData(
+    object[["RNA"]],
+    layer = "data"
+  )
+
+  if (!setequal(colnames(rna_data), rownames(metadata))) {
+    stop("RNA data and metadata do not contain the same cells.", call. = FALSE)
+  }
+
+  if (!identical(colnames(rna_data), rownames(metadata))) {
+    rna_data <- rna_data[, rownames(metadata), drop = FALSE]
+  }
+
+  rna_data
+}
+
+score_one_cohort <- function(cohort_id, signatures_to_use = NULL) {
+  cohort_id_value <- as.character(cohort_id)[[1]]
+  cohort_label_value <- unname(COHORT_LABELS[[cohort_id_value]])
+
+  message("Loading and scoring ", cohort_label_value, " ...")
+
+  object <- readRDS(STEP6_OBJECT_PATHS[[cohort_id]])
+  metadata <- object[[]]
+
+  required_metadata <- c(
+    "sample_id", "diet", "broad_compartment", "cell_state",
+    "cell_state_full", "annotation_confidence", "nCount_RNA"
+  )
+
+  assert_columns(
+    metadata,
+    required_metadata,
+    paste0(COHORT_LABELS[[cohort_id]], " metadata")
+  )
+
+  observed_diets <- unique(as.character(metadata$diet))
+  if (!setequal(observed_diets, c(REFERENCE_DIET, COMPARISON_DIET))) {
+    stop(
+      COHORT_LABELS[[cohort_id]],
+      " must contain exactly ",
+      REFERENCE_DIET,
+      " and ",
+      COMPARISON_DIET,
+      "; observed: ",
+      paste(sort(observed_diets), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  metadata$analysis_unit <- resolve_analysis_unit(metadata)
+  metadata$cell_barcode <- rownames(metadata)
+
+  rna_data <- extract_joined_rna_data(object, metadata)
+  available_genes <- rownames(rna_data)
+
+  if (is.null(signatures_to_use)) {
+    signatures_to_use <- lapply(
+      requested_signatures,
+      intersect,
+      y = available_genes
+    )
+  } else {
+    missing_used_genes <- unique(
+      unlist(signatures_to_use, use.names = FALSE)
+    )
+    missing_used_genes <- setdiff(missing_used_genes, available_genes)
+
+    if (length(missing_used_genes) > 0L) {
+      stop(
+        COHORT_LABELS[[cohort_id]],
+        " is missing WT-defined signature gene(s): ",
+        paste(missing_used_genes, collapse = ", "),
+        call. = FALSE
+      )
+    }
+  }
+
+  too_small <- names(signatures_to_use)[lengths(signatures_to_use) < 2L]
+  if (length(too_small) > 0L) {
+    stop(
+      "Fewer than two evaluable genes remain for: ",
+      paste(too_small, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  ucell_scores <- UCell::ScoreSignatures_UCell(
+    rna_data,
+    features = signatures_to_use,
+    maxRank = UCELL_MAX_RANK
+  ) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("cell_barcode")
+
+  expected_score_columns <- paste0(names(signatures_to_use), "_UCell")
+  assert_columns(
+    ucell_scores,
+    c("cell_barcode", expected_score_columns),
+    paste0(COHORT_LABELS[[cohort_id]], " UCell scores")
+  )
+
+  metadata_key <- metadata |>
+    tibble::as_tibble(rownames = NULL) |>
+    dplyr::transmute(
+      cell_barcode,
+      cohort_id = cohort_id_value,
+      cohort = cohort_label_value,
+      sample_id = as.character(sample_id),
+      diet = as.character(diet),
+      analysis_unit = as.character(analysis_unit),
+      broad_compartment = tolower(as.character(broad_compartment)),
+      cell_state = as.character(cell_state),
+      cell_state_full = as.character(cell_state_full),
+      annotation_confidence = tolower(
+        as.character(annotation_confidence)
+      ),
+      nCount_RNA = as.numeric(nCount_RNA),
+      nCount_ATAC = if ("nCount_ATAC" %in% colnames(metadata)) {
+        as.numeric(metadata$nCount_ATAC)
+      } else {
+        NA_real_
+      }
+    )
+
+  if ("Lcn2" %in% rownames(rna_data)) {
+    metadata_key$Lcn2_log_normalized <- as.numeric(
+      rna_data["Lcn2", metadata_key$cell_barcode]
+    )
+    metadata_key$Lcn2_detected <- metadata_key$Lcn2_log_normalized > 0
+  } else {
+    metadata_key$Lcn2_log_normalized <- NA_real_
+    metadata_key$Lcn2_detected <- FALSE
+  }
+
+  reduction_names <- names(object@reductions)
+  wnn_reduction <- intersect(
+    c("wnn.umap", "wnn_umap", "umap.wnn"),
+    reduction_names
+  )
+
+  if (length(wnn_reduction) > 0L) {
+    wnn_coordinates <- Seurat::Embeddings(
+      object,
+      reduction = wnn_reduction[[1]]
+    )
+
+    if (!setequal(rownames(wnn_coordinates), metadata_key$cell_barcode)) {
+      stop("WNN coordinates and metadata have different cells.", call. = FALSE)
+    }
+
+    wnn_coordinates <- wnn_coordinates[
+      metadata_key$cell_barcode,
+      1:2,
+      drop = FALSE
+    ]
+
+    colnames(wnn_coordinates) <- c("wnn_1", "wnn_2")
+
+    metadata_key <- dplyr::bind_cols(
+      metadata_key,
+      as.data.frame(wnn_coordinates)
+    )
+  } else {
+    warning(
+      "No WNN UMAP was found for ",
+      COHORT_LABELS[[cohort_id]],
+      "; WNN score maps will be omitted for this cohort."
+    )
+    metadata_key$wnn_1 <- NA_real_
+    metadata_key$wnn_2 <- NA_real_
+  }
+
+  output <- metadata_key |>
+    dplyr::left_join(ucell_scores, by = "cell_barcode") |>
+    dplyr::mutate(
+      harmonized_state = harmonize_epithelial_state(
+        cell_state,
+        cell_state_full
+      )
+    )
+
+  coverage <- dplyr::bind_rows(
+    lapply(
+      names(requested_signatures),
+      function(program_name) {
+        requested <- requested_signatures[[program_name]]
+        used <- signatures_to_use[[program_name]]
+        tibble::tibble(
+          cohort_id = cohort_id,
+          cohort = unname(COHORT_LABELS[[cohort_id]]),
+          program = program_name,
+          requested_genes = length(requested),
+          genes_present_in_assay = sum(requested %in% available_genes),
+          genes_used_for_common_score = length(used),
+          missing_requested_genes = paste(
+            setdiff(requested, available_genes),
+            collapse = ";"
+          )
+        )
+      }
+    )
+  )
+
+  rm(object, metadata, metadata_key, rna_data, ucell_scores)
+  invisible(gc())
+
+  list(
+    cells = output,
+    signatures = signatures_to_use,
+    coverage = coverage
+  )
+}
+```
+
+```{r score-cohorts, cache=FALSE}
+wt_scored <- score_one_cohort("wt")
+common_signatures <- wt_scored$signatures
+
+ppar_scored <- score_one_cohort(
+  "ppar",
+  signatures_to_use = common_signatures
+)
+
+il17_scored <- score_one_cohort(
+  "il17",
+  signatures_to_use = common_signatures
+)
+
+cell_scores <- dplyr::bind_rows(
+  wt_scored$cells,
+  ppar_scored$cells,
+  il17_scored$cells
+) |>
+  dplyr::mutate(
+    cohort = factor(
+      cohort,
+      levels = unname(COHORT_LABELS[COHORT_IDS])
+    ),
+    diet = factor(diet, levels = c(REFERENCE_DIET, COMPARISON_DIET)),
+    harmonized_state = factor(harmonized_state, levels = STATE_ORDER)
+  )
+
+program_gene_coverage <- dplyr::bind_rows(
+  wt_scored$coverage,
+  ppar_scored$coverage,
+  il17_scored$coverage
+)
+
+input_inventory <- tibble::tibble(
+  input = c(
+    paste0(COHORT_IDS, " Step 6 object"),
+    "WT Step 7 composition effect table",
+    "WT Step 7c RNA priority table",
+    "WT Step 7c RNA/ATAC priority table",
+    "WT Step 8 persistent evidence table"
+  ),
+  path = c(
+    unname(STEP6_OBJECT_PATHS[COHORT_IDS]),
+    WT_COMPOSITION_EFFECT_PATH,
+    WT_RNA_PRIORITY_PATH,
+    WT_MULTIMODAL_PRIORITY_PATH,
+    WT_PERSISTENT_EVIDENCE_PATH
+  )
+) |>
+  dplyr::mutate(
+    exists = file.exists(path),
+    size_bytes = file.info(path)$size,
+    modified = as.character(file.info(path)$mtime)
+  )
+
+readr::write_csv(
+  input_inventory,
+  file.path(MEETING_OUTPUT_DIR, "meeting_figure_input_inventory.csv")
+)
+
+common_program_definition <- dplyr::bind_rows(
+  lapply(
+    names(common_signatures),
+    function(program_name) {
+      tibble::tibble(
+        program = program_name,
+        gene = common_signatures[[program_name]]
+      )
+    }
+  )
+) |>
+  dplyr::left_join(program_key, by = "program")
+
+readr::write_csv(
+  program_gene_coverage,
+  file.path(TABLE_DIR, "program_gene_coverage_by_cohort.csv")
+)
+
+readr::write_csv(
+  common_program_definition,
+  file.path(TABLE_DIR, "program_definition_used_for_scoring.csv")
+)
+
+state_harmonization_audit <- cell_scores |>
+  dplyr::count(
+    cohort_id,
+    cohort,
+    broad_compartment,
+    analysis_unit,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    harmonized_state,
+    diet,
+    name = "nuclei"
+  )
+
+readr::write_csv(
+  state_harmonization_audit,
+  file.path(TABLE_DIR, "cell_state_harmonization_audit.csv")
+)
+
+rm(wt_scored, ppar_scored, il17_scored)
+invisible(gc())
+
+program_gene_coverage
+```
+
+# 5. Construct signed program contrasts and WT anchors
+
+The raw signed contrasts subtract the down-associated arm from the up-associated
+arm. WT anchoring is performed only in the harmonized ISC-like crypt state:
+
+\[
+\mathrm{WT\ anchored\ score} =
+\frac{x - \mathrm{median}(WT\ CON)}
+{\mathrm{median}(WT\ HFD) - \mathrm{median}(WT\ CON)}.
+\]
+
+Thus, the WT CON median is 0 and the WT HFD median is 1. Values outside 0--1
+are valid. Anchoring is a descriptive coordinate transformation, not a
+classifier and not an estimate of genotype rescue.
+
+```{r create-program-contrasts}
+cell_scores <- cell_scores |>
+  dplyr::mutate(
+    Persistent_stringent_raw =
+      Persistent_up_stringent_UCell -
+      Persistent_down_stringent_UCell,
+    Persistent_extended_raw =
+      Persistent_up_extended_UCell -
+      Persistent_down_extended_UCell,
+    HyperMet_minus_HypoImmune_raw =
+      HyperMet_UCell - HypoImmune_UCell
+  )
+
+axis_specification <- tibble::tribble(
+  ~raw_score, ~axis_score, ~axis_label,
+  "Persistent_stringent_raw", "Persistent_stringent_WT_axis",
+  "Stringent WT-recovered persistent axis",
+  "Persistent_extended_raw", "Persistent_extended_WT_axis",
+  "Extended WT-recovered persistent axis",
+  "HyperMet_minus_HypoImmune_raw", "HyperMet_minus_HypoImmune_WT_axis",
+  "Metabolic/redox minus immune/ER-secretory contrast"
+)
+
+axis_anchor_parameters <- dplyr::bind_rows(
+  lapply(
+    seq_len(nrow(axis_specification)),
+    function(axis_index) {
+      raw_score <- axis_specification$raw_score[[axis_index]]
+
+      anchor_cells <- cell_scores |>
+        dplyr::filter(
+          cohort_id == "wt",
+          harmonized_state == "ISC-like crypt",
+          broad_compartment == "epithelial",
+          annotation_confidence %in% c("high", "moderate")
+        )
+
+      con_anchor <- safe_median(
+        anchor_cells[[raw_score]][
+          anchor_cells$diet == REFERENCE_DIET
+        ]
+      )
+
+      hfd_anchor <- safe_median(
+        anchor_cells[[raw_score]][
+          anchor_cells$diet == COMPARISON_DIET
+        ]
+      )
+
+      anchor_delta <- hfd_anchor - con_anchor
+
+      if (!is.finite(anchor_delta) || abs(anchor_delta) < 1e-8) {
+        stop(
+          "WT ISC-like anchors do not separate for ",
+          raw_score,
+          "; do not construct this axis.",
+          call. = FALSE
+        )
+      }
+
+      tibble::tibble(
+        raw_score = raw_score,
+        axis_score = axis_specification$axis_score[[axis_index]],
+        axis_label = axis_specification$axis_label[[axis_index]],
+        WT_CON_median = con_anchor,
+        WT_HFD_median = hfd_anchor,
+        WT_HFD_minus_CON = anchor_delta,
+        WT_HFD_is_higher = anchor_delta > 0
+      )
+    }
+  )
+)
+
+for (axis_index in seq_len(nrow(axis_anchor_parameters))) {
+  raw_score <- axis_anchor_parameters$raw_score[[axis_index]]
+  axis_score <- axis_anchor_parameters$axis_score[[axis_index]]
+  con_anchor <- axis_anchor_parameters$WT_CON_median[[axis_index]]
+  anchor_delta <- axis_anchor_parameters$WT_HFD_minus_CON[[axis_index]]
+
+  cell_scores[[axis_score]] <-
+    (cell_scores[[raw_score]] - con_anchor) / anchor_delta
+}
+
+readr::write_csv(
+  axis_anchor_parameters,
+  file.path(TABLE_DIR, "WT_ISC_axis_anchor_parameters.csv")
+)
+
+axis_anchor_parameters
+```
+
+# 6. Define the curated population and summarize program scores
+
+```{r summarize-program-scores}
+curated_epithelial <- cell_scores |>
+  dplyr::filter(
+    broad_compartment == "epithelial",
+    annotation_confidence %in% c("high", "moderate"),
+    as.character(harmonized_state) %in% PRESENTATION_EPITHELIAL_STATES
+  )
+
+lcn2_detection_audit <- curated_epithelial |>
+  dplyr::group_by(cohort_id, cohort, diet) |>
+  dplyr::summarise(
+    epithelial_nuclei = dplyr::n(),
+    Lcn2_positive_nuclei = sum(Lcn2_detected, na.rm = TRUE),
+    Lcn2_positive_percent = 100 * mean(Lcn2_detected, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  lcn2_detection_audit,
+  file.path(TABLE_DIR, "epithelial_Lcn2_detection_audit.csv")
+)
+
+PLOTTED_SCORE_KEY <- tibble::tribble(
+  ~score_column, ~program_display, ~expected_sign,
+  "HyperMet_UCell",
+  "Metabolic/redox module\n(HyperMet)", 1,
+  "HypoImmune_UCell",
+  "Immune/ER-secretory module\n(HypoImmune)", -1,
+  "Persistent_extended_raw",
+  "WT-recovered persistent\nexpression contrast", 1
+)
+
+program_scores_long <- curated_epithelial |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(PLOTTED_SCORE_KEY$score_column),
+    names_to = "score_column",
+    values_to = "score"
+  ) |>
+  dplyr::left_join(PLOTTED_SCORE_KEY, by = "score_column")
+
+program_score_summary <- program_scores_long |>
+  dplyr::group_by(
+    cohort_id,
+    cohort,
+    diet,
+    harmonized_state,
+    score_column,
+    program_display,
+    expected_sign
+  ) |>
+  dplyr::summarise(
+    nuclei = dplyr::n(),
+    median_score = stats::median(score, na.rm = TRUE),
+    q25_score = stats::quantile(score, 0.25, na.rm = TRUE),
+    q75_score = stats::quantile(score, 0.75, na.rm = TRUE),
+    mean_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  program_score_summary,
+  file.path(TABLE_DIR, "program_score_summary_by_cohort_state_and_diet.csv")
+)
+```
+
+## Balanced cell-sampling stability
+
+```{r calculate-balanced-score-effects}
+balanced_score_effects <- function(score_data) {
+  grouping_columns <- c(
+    "cohort_id", "cohort", "harmonized_state",
+    "score_column", "program_display", "expected_sign"
+  )
+
+  grouped_data <- score_data |>
+    dplyr::group_by(
+      dplyr::across(dplyr::all_of(grouping_columns))
+    ) |>
+    dplyr::group_split(.keep = TRUE)
+
+  dplyr::bind_rows(
+    lapply(
+      seq_along(grouped_data),
+      function(group_index) {
+        group_data <- grouped_data[[group_index]]
+        con_scores <- group_data$score[
+          group_data$diet == REFERENCE_DIET
+        ]
+        hfd_scores <- group_data$score[
+          group_data$diet == COMPARISON_DIET
+        ]
+
+        con_scores <- con_scores[is.finite(con_scores)]
+        hfd_scores <- hfd_scores[is.finite(hfd_scores)]
+
+        con_n <- length(con_scores)
+        hfd_n <- length(hfd_scores)
+        sampled_n <- min(
+          con_n,
+          hfd_n,
+          MAX_DOWNSAMPLED_NUCLEI_PER_DIET
+        )
+
+        eligible <- sampled_n >= MIN_NUCLEI_PER_DIET
+        full_delta <- safe_median(hfd_scores) - safe_median(con_scores)
+
+        if (eligible) {
+          set.seed(RANDOM_SEED + group_index)
+
+          sampled_deltas <- replicate(
+            DOWNSAMPLING_ITERATIONS,
+            {
+              safe_median(sample(hfd_scores, sampled_n)) -
+                safe_median(sample(con_scores, sampled_n))
+            }
+          )
+
+          downsampled_median <- safe_median(sampled_deltas)
+          downsampled_q25 <- stats::quantile(sampled_deltas, 0.25)
+          downsampled_q75 <- stats::quantile(sampled_deltas, 0.75)
+          sign_concordance <- 100 * mean(
+            sign(sampled_deltas) == sign(full_delta)
+          )
+        } else {
+          downsampled_median <- NA_real_
+          downsampled_q25 <- NA_real_
+          downsampled_q75 <- NA_real_
+          sign_concordance <- NA_real_
+        }
+
+        tibble::tibble(
+          cohort_id = group_data$cohort_id[[1]],
+          cohort = group_data$cohort[[1]],
+          harmonized_state = group_data$harmonized_state[[1]],
+          score_column = group_data$score_column[[1]],
+          program_display = group_data$program_display[[1]],
+          expected_sign = group_data$expected_sign[[1]],
+          CON_nuclei = con_n,
+          HFD_nuclei = hfd_n,
+          sampled_nuclei_per_diet = sampled_n,
+          eligible = eligible,
+          full_HFD_minus_CON = full_delta,
+          balanced_HFD_minus_CON_median = downsampled_median,
+          balanced_HFD_minus_CON_q25 = downsampled_q25,
+          balanced_HFD_minus_CON_q75 = downsampled_q75,
+          full_effect_expected_direction =
+            full_delta * group_data$expected_sign[[1]],
+          balanced_effect_expected_direction =
+            downsampled_median * group_data$expected_sign[[1]],
+          balanced_expected_direction_q25 = if (
+            group_data$expected_sign[[1]] > 0
+          ) {
+            downsampled_q25
+          } else {
+            -downsampled_q75
+          },
+          balanced_expected_direction_q75 = if (
+            group_data$expected_sign[[1]] > 0
+          ) {
+            downsampled_q75
+          } else {
+            -downsampled_q25
+          },
+          sign_concordance_percent = sign_concordance
+        )
+      }
+    )
+  )
+}
+
+program_score_effects <- balanced_score_effects(program_scores_long)
+
+readr::write_csv(
+  program_score_effects,
+  file.path(TABLE_DIR, "program_score_balanced_cell_sampling_effects.csv")
+)
+
+program_score_effects |>
+  dplyr::filter(
+    harmonized_state == "ISC-like crypt",
+    eligible
+  )
+```
+
+# 7. Figure 1A: audited WT cell-state composition effects
+
+This first composition panel preserves the denominator and eligibility calls
+from Step 7 exactly. It is the cleanest opening figure for the WT diet effect.
+
+```{r figure-01a-wt-composition}
+wt_step7_composition <- suppressMessages(
+  readr::read_csv(
+    WT_COMPOSITION_EFFECT_PATH,
+    show_col_types = FALSE
+  )
+)
+
+assert_columns(
+  wt_step7_composition,
+  c(
+    "analysis_unit", "cell_state", "CON", "HFD",
+    "difference_percentage_points", "abundance_ratio",
+    "display_label", "eligibility_tier"
+  ),
+  "WT Step 7 composition effects"
+)
+
+wt_primary_composition <- wt_step7_composition |>
+  dplyr::filter(eligibility_tier %in% c("Tier_A", "Tier_B", "Tier_C")) |>
+  dplyr::arrange(difference_percentage_points) |>
+  dplyr::mutate(
+    display_label = factor(display_label, levels = display_label),
+    direction = dplyr::if_else(
+      difference_percentage_points > 0,
+      "HFD_higher",
+      "CON_higher"
+    )
+  )
+
+readr::write_csv(
+  wt_step7_composition,
+  file.path(TABLE_DIR, "WT_Step7_composition_effect_sizes.csv")
+)
+
+p_wt_composition <- ggplot2::ggplot(
+  wt_primary_composition,
+  ggplot2::aes(
+    x = difference_percentage_points,
+    y = display_label,
+    color = direction
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey55",
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      xend = difference_percentage_points,
+      yend = display_label
+    ),
+    linewidth = 1.0
+  ) +
+  ggplot2::geom_point(size = 3.8) +
+  ggplot2::scale_color_manual(
+    values = DIRECTION_COLORS,
+    labels = c(CON_higher = "CON enriched", HFD_higher = "HFD enriched")
+  ) +
+  ggplot2::labs(
+    title = "WT HFD shifts the balance of annotated cell states",
+    subtitle = paste0(
+      "Step 7 primary analysis units; positive values indicate a larger ",
+      "fraction of all retained nuclei in HFD"
+    ),
+    x = "HFD minus CON composition (percentage points)",
+    y = NULL,
+    color = "Direction",
+    caption = paste0(
+      "One pooled library per diet. Composition changes are descriptive and ",
+      "may include biological and pool-specific effects."
+    )
+  ) +
+  theme_presentation(base_size = 16) +
+  ggplot2::theme(legend.position = "bottom")
+
+preview_plot(p_wt_composition)
+save_presentation_pdf(
+  "01A_WT_cell_state_composition_HFD_minus_CON.pdf",
+  p_wt_composition
+)
+```
+
+# 8. Figure 1B: harmonized epithelial composition across cohorts
+
+```{r figure-01-composition}
+epithelial_composition <- curated_epithelial |>
+  dplyr::count(
+    cohort_id,
+    cohort,
+    diet,
+    harmonized_state,
+    name = "nuclei"
+  ) |>
+  dplyr::group_by(cohort_id, cohort, diet) |>
+  dplyr::mutate(
+    curated_epithelial_nuclei = sum(nuclei),
+    percent = 100 * nuclei / curated_epithelial_nuclei
+  ) |>
+  dplyr::ungroup()
+
+epithelial_composition_effects <- epithelial_composition |>
+  dplyr::select(
+    cohort_id,
+    cohort,
+    harmonized_state,
+    diet,
+    nuclei,
+    curated_epithelial_nuclei,
+    percent
+  ) |>
+  tidyr::pivot_wider(
+    names_from = diet,
+    values_from = c(nuclei, curated_epithelial_nuclei, percent),
+    values_fill = 0
+  ) |>
+  dplyr::mutate(
+    HFD_minus_CON_percentage_points =
+      percent_HFD - percent_CON,
+    HFD_to_CON_abundance_ratio =
+      (percent_HFD + 0.01) / (percent_CON + 0.01)
+  )
+
+readr::write_csv(
+  epithelial_composition,
+  file.path(TABLE_DIR, "epithelial_composition_by_cohort_and_diet.csv")
+)
+
+readr::write_csv(
+  epithelial_composition_effects,
+  file.path(TABLE_DIR, "epithelial_composition_HFD_minus_CON.csv")
+)
+
+composition_plot_data <- epithelial_composition_effects |>
+  dplyr::filter(
+    as.character(harmonized_state) %in% PRESENTATION_EPITHELIAL_STATES
+  ) |>
+  dplyr::mutate(
+    harmonized_state = factor(
+      harmonized_state,
+      levels = rev(PRESENTATION_EPITHELIAL_STATES)
+    )
+  )
+
+p_composition <- ggplot2::ggplot(
+  composition_plot_data,
+  ggplot2::aes(
+    x = HFD_minus_CON_percentage_points,
+    y = harmonized_state,
+    color = cohort
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey55",
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      xend = HFD_minus_CON_percentage_points,
+      yend = harmonized_state
+    ),
+    linewidth = 1.0,
+    alpha = 0.75
+  ) +
+  ggplot2::geom_point(size = 3.4) +
+  ggplot2::facet_wrap(~ cohort, nrow = 1) +
+  ggplot2::scale_color_manual(values = COHORT_COLORS, guide = "none") +
+  ggplot2::labs(
+    title = "HFD-associated epithelial composition shifts",
+    subtitle = paste0(
+      "HFD minus CON within curated high/moderate-confidence epithelial nuclei; ",
+      "positive values indicate HFD enrichment"
+    ),
+    x = "Difference in epithelial composition (percentage points)",
+    y = NULL,
+    caption = paste0(
+      "Descriptive pooled-library comparison: one CON and one HFD library per cohort. ",
+      "Shared state labels are a harmonized display layer."
+    )
+  ) +
+  theme_presentation(base_size = 16)
+
+preview_plot(p_composition)
+save_presentation_pdf(
+  "01B_cross_cohort_epithelial_composition_HFD_minus_CON.pdf",
+  p_composition
+)
+```
+
+# 9. Figure 2: strongest stable WT RNA effects in key epithelial states
+
+```{r prepare-wt-rna-candidates}
+wt_rna_prioritized <- suppressMessages(
+  readr::read_csv(WT_RNA_PRIORITY_PATH, show_col_types = FALSE)
+)
+
+assert_columns(
+  wt_rna_prioritized,
+  c(
+    "analysis_unit", "feature", "log2FC_comparison_vs_reference",
+    "detection_difference_percentage_points", "cell_state",
+    "cell_state_full", "direction", "RNA_support_class",
+    "support_order", "within_unit_direction_rank"
+  ),
+  "WT prioritized RNA candidates"
+)
+
+wt_rna_prioritized <- wt_rna_prioritized |>
+  dplyr::mutate(
+    harmonized_state = harmonize_epithelial_state(
+      cell_state,
+      cell_state_full
+    ),
+    RNA_direction_stable = if (
+      "RNA_direction_stable" %in% colnames(wt_rna_prioritized)
+    ) {
+      as_logical_safely(RNA_direction_stable)
+    } else {
+      support_order <= 2L
+    },
+    RNA_downsampling_iqr_excludes_zero = if (
+      "RNA_downsampling_iqr_excludes_zero" %in%
+        colnames(wt_rna_prioritized)
+    ) {
+      as_logical_safely(RNA_downsampling_iqr_excludes_zero)
+    } else {
+      support_order == 1L
+    }
+  )
+
+WT_RNA_FOCUS_STATES <- c(
+  PRIMARY_CRYPT_STATES,
+  "Mature absorptive / colonocyte",
+  "Mature goblet"
+)
+
+wt_rna_meeting_candidates <- wt_rna_prioritized |>
+  dplyr::filter(
+    harmonized_state %in% WT_RNA_FOCUS_STATES,
+    RNA_direction_stable,
+    support_order <= 2L
+  ) |>
+  dplyr::group_by(harmonized_state, direction) |>
+  dplyr::arrange(
+    support_order,
+    within_unit_direction_rank,
+    dplyr::desc(abs(log2FC_comparison_vs_reference)),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = TOP_RNA_GENES_PER_STATE_AND_DIRECTION) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    harmonized_state = factor(
+      harmonized_state,
+      levels = WT_RNA_FOCUS_STATES
+    ),
+    gene_label = feature
+  )
+
+if (nrow(wt_rna_meeting_candidates) == 0L) {
+  stop("No stable WT RNA meeting candidates were retained.", call. = FALSE)
+}
+
+readr::write_csv(
+  wt_rna_meeting_candidates,
+  file.path(TABLE_DIR, "WT_RNA_meeting_candidates.csv")
+)
+```
+
+```{r figure-02-wt-rna-effects}
+p_wt_rna <- ggplot2::ggplot(
+  wt_rna_meeting_candidates,
+  ggplot2::aes(
+    x = log2FC_comparison_vs_reference,
+    y = stats::reorder(gene_label, log2FC_comparison_vs_reference),
+    color = direction
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey55",
+    linewidth = 0.5
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      xend = log2FC_comparison_vs_reference,
+      yend = stats::reorder(
+        gene_label,
+        log2FC_comparison_vs_reference
+      )
+    ),
+    linewidth = 0.9
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      size = abs(detection_difference_percentage_points),
+      shape = RNA_downsampling_iqr_excludes_zero
+    ),
+    stroke = 1.0
+  ) +
+  ggplot2::facet_wrap(
+    ~ harmonized_state,
+    scales = "free_y",
+    ncol = 3
+  ) +
+  ggplot2::scale_color_manual(
+    values = DIRECTION_COLORS,
+    labels = c(CON_higher = "CON higher", HFD_higher = "HFD higher")
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c(`FALSE` = 1, `TRUE` = 16),
+    labels = c(`FALSE` = "Stable sign", `TRUE` = "IQR excludes zero")
+  ) +
+  ggplot2::scale_size_continuous(range = c(2.5, 6.5)) +
+  ggplot2::labs(
+    title = "Strongest cell-sampling-stable WT RNA diet effects",
+    subtitle = paste0(
+      "Top candidates per state and direction; point size is the absolute ",
+      "difference in detection frequency"
+    ),
+    x = "RNA log2 fold-change (HFD versus CON)",
+    y = NULL,
+    color = "Direction",
+    shape = "Balanced sampling",
+    size = "|Δ detected|\n(percentage points)",
+    caption = paste0(
+      "Descriptive pooled-library effects. Balanced cell sampling tests ",
+      "robustness to unequal nucleus counts, not biological replication."
+    )
+  ) +
+  theme_presentation(base_size = 14) +
+  ggplot2::theme(legend.position = "bottom")
+
+preview_plot(p_wt_rna)
+save_presentation_pdf("02_WT_stable_RNA_diet_effects.pdf", p_wt_rna)
+```
+
+# 10. Figure 3: WT RNA/ATAC concordance near the assigned gene
+
+The distance filter below uses Step 7c nearest-gene distance. It is not an exact
+TSS window and must not be called promoter evidence. Exact +/-2 kb TSS evidence
+for the persistent-gene set is shown in Figure 5.
+
+```{r prepare-wt-multimodal-candidates}
+wt_multimodal_prioritized <- suppressMessages(
+  readr::read_csv(
+    WT_MULTIMODAL_PRIORITY_PATH,
+    show_col_types = FALSE
+  )
+)
+
+assert_columns(
+  wt_multimodal_prioritized,
+  c(
+    "analysis_unit", "peak", "nearest_gene", "distance",
+    "ATAC_log2FC", "RNA_log2FC", "cell_state", "cell_state_full",
+    "effect_direction", "multimodal_support_class", "support_order",
+    "within_unit_direction_rank", "joint_effect_magnitude"
+  ),
+  "WT prioritized RNA/ATAC candidates"
+)
+
+wt_multimodal_meeting_candidates <- wt_multimodal_prioritized |>
+  dplyr::mutate(
+    harmonized_state = harmonize_epithelial_state(
+      cell_state,
+      cell_state_full
+    ),
+    nearby_gene_context = dplyr::case_when(
+      distance == 0 ~ "Overlaps gene annotation",
+      is.finite(distance) & abs(distance) <= NEARBY_GENE_DISTANCE_BP ~
+        "Within 2 kb of assigned gene",
+      TRUE ~ "More than 2 kb away"
+    )
+  ) |>
+  dplyr::filter(
+    harmonized_state %in% WT_RNA_FOCUS_STATES,
+    support_order <= 2L,
+    is.finite(distance),
+    abs(distance) <= NEARBY_GENE_DISTANCE_BP
+  ) |>
+  dplyr::group_by(harmonized_state, effect_direction) |>
+  dplyr::arrange(
+    support_order,
+    within_unit_direction_rank,
+    dplyr::desc(joint_effect_magnitude),
+    .by_group = TRUE
+  ) |>
+  dplyr::slice_head(n = TOP_MULTIMODAL_PAIRS_PER_STATE_AND_DIRECTION) |>
+  dplyr::ungroup()
+
+if (nrow(wt_multimodal_meeting_candidates) == 0L) {
+  warning(
+    "No Tier 1/2 WT concordant pairs were found within the 2-kb ",
+    "nearest-gene filter; Figure 3 will be omitted."
+  )
+} else {
+  readr::write_csv(
+    wt_multimodal_meeting_candidates,
+    file.path(TABLE_DIR, "WT_nearby_RNA_ATAC_meeting_candidates.csv")
+  )
+}
+```
+
+```{r figure-03-wt-multimodal-effects}
+if (nrow(wt_multimodal_meeting_candidates) > 0L) {
+  label_candidates <- wt_multimodal_meeting_candidates |>
+    dplyr::arrange(support_order, dplyr::desc(joint_effect_magnitude)) |>
+    dplyr::distinct(nearest_gene, .keep_all = TRUE)
+
+  p_wt_multimodal <- ggplot2::ggplot(
+    wt_multimodal_meeting_candidates,
+    ggplot2::aes(
+      y = RNA_log2FC,
+      x = ATAC_log2FC,
+      color = harmonized_state,
+      shape = nearby_gene_context
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      color = "grey65",
+      linewidth = 0.5
+    ) +
+    ggplot2::geom_vline(
+      xintercept = 0,
+      color = "grey65",
+      linewidth = 0.5
+    ) +
+    ggplot2::geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dotted",
+      color = "grey55"
+    ) +
+    ggplot2::geom_point(size = 4.2, alpha = 0.85, stroke = 1.1) +
+    ggplot2::geom_text(
+      data = label_candidates,
+      ggplot2::aes(label = nearest_gene),
+      color = "black",
+      size = 4.0,
+      check_overlap = TRUE,
+      nudge_y = 0.10,
+      show.legend = FALSE
+    ) +
+    ggplot2::scale_color_manual(values = STATE_COLORS) +
+    ggplot2::scale_shape_manual(
+      values = c(
+        "Overlaps gene annotation" = 16,
+        "Within 2 kb of assigned gene" = 17
+      )
+    ) +
+    ggplot2::labs(
+      title = "WT genes with directionally concordant nearby accessibility",
+      subtitle = paste0(
+        "Tier 1/2 RNA-ATAC pairs assigned within 2 kb of the nearest gene; ",
+        "upper-right is HFD-higher in both modalities"
+      ),
+      y = "RNA log2 fold-change (HFD versus CON)",
+      x = "ATAC log2 fold-change (HFD versus CON)",
+      color = "Harmonized state",
+      shape = "Genomic context",
+      caption = paste0(
+        "Nearest-gene assignment is contextual and does not establish a ",
+        "peak-to-gene regulatory relationship."
+      )
+    ) +
+    theme_presentation(base_size = 15) +
+    ggplot2::theme(legend.position = "bottom")
+
+  preview_plot(p_wt_multimodal)
+  save_presentation_pdf(
+    "03_WT_nearby_RNA_ATAC_concordance.pdf",
+    p_wt_multimodal
+  )
+}
+```
+
+# 11. Figure 4: how much of the persistent program reappears in WT
+
+```{r figure-04-persistent-summary}
+persistent_class_summary <- persistent_evidence |>
+  dplyr::mutate(
+    validation_group = dplyr::case_when(
+      RNA_reference_direction_concordant &
+        RNA_clear_effect &
+        RNA_direction_stable ~ "Clear, stable concordance",
+      RNA_reference_direction_concordant &
+        RNA_direction_stable ~ "Stable, subthreshold concordance",
+      RNA_reference_direction_concordant ~ "Other directional concordance",
+      !RNA_reference_direction_concordant &
+        RNA_clear_effect &
+        RNA_direction_stable ~ "Clear, stable discordance",
+      !RNA_reference_direction_concordant ~ "Other discordance",
+      TRUE ~ "Not evaluable"
+    ),
+    reference_program = dplyr::recode(
+      reference_program,
+      persistent_HFD_up = "Reference HFD-up",
+      persistent_HFD_down = "Reference HFD-down"
+    )
+  ) |>
+  dplyr::count(reference_program, validation_group, name = "genes") |>
+  dplyr::group_by(reference_program) |>
+  dplyr::mutate(percent = 100 * genes / sum(genes)) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  persistent_class_summary,
+  file.path(TABLE_DIR, "persistent_program_WT_validation_summary.csv")
+)
+
+PERSISTENT_CLASS_COLORS <- c(
+  "Clear, stable concordance" = "#0072B2",
+  "Stable, subthreshold concordance" = "#56B4E9",
+  "Other directional concordance" = "#A6CEE3",
+  "Clear, stable discordance" = "#D55E00",
+  "Other discordance" = "#E69F00",
+  "Not evaluable" = "#BDBDBD"
+)
+
+p_persistent_summary <- ggplot2::ggplot(
+  persistent_class_summary,
+  ggplot2::aes(
+    x = reference_program,
+    y = percent,
+    fill = validation_group
+  )
+) +
+  ggplot2::geom_col(width = 0.68, color = "white", linewidth = 0.4) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = ifelse(percent >= 5, paste0(genes, " (", round(percent), "%)"), "")
+    ),
+    position = ggplot2::position_stack(vjust = 0.5),
+    color = "white",
+    fontface = "bold",
+    size = 4.4
+  ) +
+  ggplot2::scale_fill_manual(values = PERSISTENT_CLASS_COLORS) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 100),
+    expand = ggplot2::expansion(mult = c(0, 0.02))
+  ) +
+  ggplot2::labs(
+    title = "The persistent d21-to-d50 program is only partially recovered in WT",
+    subtitle = paste0(
+      "Primary WT ISC-like state; the HFD-up arm is more directionally ",
+      "coherent than the HFD-down arm"
+    ),
+    x = NULL,
+    y = "Genes (%)",
+    fill = "WT RNA validation",
+    caption = paste0(
+      "Direction is compared with the supplied persistent reference list. ",
+      "This is a targeted validation, not discovery of a globally preserved module."
+    )
+  ) +
+  theme_presentation(base_size = 17) +
+  ggplot2::theme(legend.position = "right")
+
+preview_plot(p_persistent_summary)
+save_presentation_pdf(
+  "04_persistent_program_WT_validation_summary.pdf",
+  p_persistent_summary
+)
+```
+
+# 12. Figure 5: stringent persistent genes and exact TSS-window ATAC context
+
+Positive values in this plot agree with the supplied persistent reference
+direction. The ATAC layer is exact +/-2 kb TSS-window context from Step 8.
+
+```{r figure-05-persistent-gene-evidence}
+persistent_gene_meeting_table <- persistent_stringent |>
+  dplyr::select(
+    gene,
+    reference_direction,
+    reference_program,
+    RNA_reference_aligned_log2FC,
+    representative_promoter_peak,
+    representative_peak_offset_bp,
+    representative_peak_overlaps_tss,
+    representative_ATAC_reference_aligned_log2FC,
+    promoter_ATAC_summary_class,
+    multimodal_validation_class
+  ) |>
+  dplyr::arrange(
+    reference_direction,
+    dplyr::desc(RNA_reference_aligned_log2FC)
+  )
+
+readr::write_csv(
+  persistent_gene_meeting_table,
+  file.path(TABLE_DIR, "persistent_stringent_gene_RNA_TSS_ATAC_evidence.csv")
+)
+
+persistent_gene_long <- persistent_gene_meeting_table |>
+  dplyr::select(
+    gene,
+    reference_direction,
+    RNA_reference_aligned_log2FC,
+    representative_ATAC_reference_aligned_log2FC
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(
+      RNA_reference_aligned_log2FC,
+      representative_ATAC_reference_aligned_log2FC
+    ),
+    names_to = "modality",
+    values_to = "reference_aligned_log2FC"
+  ) |>
+  dplyr::mutate(
+    modality = dplyr::recode(
+      modality,
+      RNA_reference_aligned_log2FC = "RNA",
+      representative_ATAC_reference_aligned_log2FC =
+        "Representative exact TSS-window ATAC"
+    ),
+    reference_direction = dplyr::recode(
+      reference_direction,
+      HFD_higher = "Reference HFD-up",
+      CON_higher = "Reference HFD-down"
+    )
+  )
+
+gene_order <- persistent_gene_meeting_table |>
+  dplyr::arrange(reference_direction, RNA_reference_aligned_log2FC) |>
+  dplyr::pull(gene)
+
+persistent_gene_long$gene <- factor(
+  persistent_gene_long$gene,
+  levels = unique(gene_order)
+)
+
+p_persistent_genes <- ggplot2::ggplot(
+  persistent_gene_long,
+  ggplot2::aes(
+    x = reference_aligned_log2FC,
+    y = gene,
+    color = reference_direction,
+    shape = modality
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey55",
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_segment(
+    data = persistent_gene_meeting_table,
+    ggplot2::aes(
+      x = RNA_reference_aligned_log2FC,
+      xend = representative_ATAC_reference_aligned_log2FC,
+      y = factor(gene, levels = unique(gene_order)),
+      yend = factor(gene, levels = unique(gene_order))
+    ),
+    inherit.aes = FALSE,
+    color = "grey75",
+    linewidth = 0.8,
+    na.rm = TRUE
+  ) +
+  ggplot2::geom_point(size = 4.2, stroke = 1.1, na.rm = TRUE) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Reference HFD-up" = DIET_COLORS[["HFD"]],
+      "Reference HFD-down" = DIET_COLORS[["CON"]]
+    )
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c(
+      RNA = 16,
+      `Representative exact TSS-window ATAC` = 17
+    )
+  ) +
+  ggplot2::labs(
+    title = "Nine stringent WT-recovered persistent genes",
+    subtitle = paste0(
+      "Positive values agree with the supplied persistent direction; ",
+      "RNA and exact +/-2 kb TSS-window ATAC are shown separately"
+    ),
+    x = "Reference-aligned log2 fold-change",
+    y = NULL,
+    color = "Reference arm",
+    shape = "Evidence layer",
+    caption = paste0(
+      "Exact TSS-window accessibility is regulatory context, not proof of ",
+      "activation or direct peak-to-gene control."
+    )
+  ) +
+  theme_presentation(base_size = 17) +
+  ggplot2::theme(legend.position = "bottom")
+
+preview_plot(p_persistent_genes)
+save_presentation_pdf(
+  "05_persistent_stringent_RNA_and_TSS_ATAC.pdf",
+  p_persistent_genes
+)
+```
+
+# 13. Figure 6: WT ISC-like program scores
+
+```{r figure-06-wt-isc-scores}
+wt_isc_scores <- program_scores_long |>
+  dplyr::filter(
+    cohort_id == "wt",
+    harmonized_state == "ISC-like crypt"
+  )
+
+readr::write_csv(
+  wt_isc_scores,
+  file.path(TABLE_DIR, "WT_ISC_cell_level_program_scores.csv.gz")
+)
+
+p_wt_isc_scores <- ggplot2::ggplot(
+  wt_isc_scores,
+  ggplot2::aes(x = diet, y = score, fill = diet)
+) +
+  ggplot2::geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = NA,
+    alpha = 0.60
+  ) +
+  ggplot2::geom_boxplot(
+    width = 0.20,
+    outlier.shape = NA,
+    color = "black",
+    fill = "white",
+    linewidth = 0.7
+  ) +
+  ggplot2::stat_summary(
+    fun = median,
+    geom = "point",
+    shape = 23,
+    size = 3.2,
+    fill = "black"
+  ) +
+  ggplot2::facet_wrap(
+    ~ program_display,
+    scales = "free_y",
+    nrow = 1
+  ) +
+  ggplot2::scale_fill_manual(values = DIET_COLORS) +
+  ggplot2::labs(
+    title = "WT ISC-like cells: targeted program scores",
+    subtitle = paste0(
+      "UCell scores for HyperMet and HypoImmune plus the signed extended ",
+      "WT-recovered persistent contrast"
+    ),
+    x = NULL,
+    y = "Per-nucleus score",
+    fill = "Diet",
+    caption = paste0(
+      "Distributions describe nuclei from one pooled CON and one pooled HFD ",
+      "library; no cell-level P values are reported."
+    )
+  ) +
+  theme_presentation(base_size = 16) +
+  ggplot2::theme(legend.position = "bottom")
+
+preview_plot(p_wt_isc_scores)
+save_presentation_pdf("06_WT_ISC_program_scores.pdf", p_wt_isc_scores)
+```
+
+# 14. Figure 7: the same ISC-like scores across cohorts
+
+```{r figure-07-cross-cohort-isc-scores}
+cross_cohort_isc_scores <- program_scores_long |>
+  dplyr::filter(harmonized_state == "ISC-like crypt")
+
+readr::write_csv(
+  cross_cohort_isc_scores,
+  file.path(TABLE_DIR, "cross_cohort_ISC_cell_level_program_scores.csv.gz")
+)
+
+p_cross_cohort_isc_scores <- ggplot2::ggplot(
+  cross_cohort_isc_scores,
+  ggplot2::aes(
+    x = diet,
+    y = score,
+    fill = diet
+  )
+) +
+  ggplot2::geom_violin(
+    width = 0.84,
+    scale = "width",
+    trim = TRUE,
+    color = NA,
+    alpha = 0.60
+  ) +
+  ggplot2::geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    color = "black",
+    fill = "white",
+    linewidth = 0.65
+  ) +
+  ggplot2::facet_grid(
+    rows = ggplot2::vars(program_display),
+    cols = ggplot2::vars(cohort),
+    scales = "free_y"
+  ) +
+  ggplot2::scale_fill_manual(values = DIET_COLORS) +
+  ggplot2::labs(
+    title = "Matched ISC-like states scored with identical gene sets",
+    subtitle = paste0(
+      "The same WT-defined signatures are projected without retraining into ",
+      "Ppar iKO and Il17ra iKO"
+    ),
+    x = NULL,
+    y = "Per-nucleus score",
+    fill = "Diet",
+    caption = paste0(
+      "Cross-cohort shifts are descriptive. Pool composition and technical ",
+      "differences remain inseparable from genotype effects."
+    )
+  ) +
+  theme_presentation(base_size = 14) +
+  ggplot2::theme(legend.position = "bottom")
+
+preview_plot(p_cross_cohort_isc_scores)
+save_presentation_pdf(
+  "07_cross_cohort_ISC_program_scores.pdf",
+  p_cross_cohort_isc_scores
+)
+```
+
+# 15. Figure 8: direction and stability of ISC-like score changes
+
+All effects are oriented so positive means movement in the expected direction:
+HyperMet higher in HFD, HypoImmune lower in HFD, or a more HFD-like persistent
+contrast. Error bars are the interquartile range across balanced cell samples,
+not confidence intervals.
+
+```{r figure-08-cross-cohort-isc-effects}
+isc_score_effects <- program_score_effects |>
+  dplyr::filter(
+    harmonized_state == "ISC-like crypt",
+    eligible
+  ) |>
+  dplyr::mutate(
+    cohort = factor(cohort, levels = unname(COHORT_LABELS[COHORT_IDS])),
+    program_display = factor(
+      program_display,
+      levels = PLOTTED_SCORE_KEY$program_display
+    )
+  )
+
+readr::write_csv(
+  isc_score_effects,
+  file.path(TABLE_DIR, "cross_cohort_ISC_program_effects.csv")
+)
+
+p_isc_effects <- ggplot2::ggplot(
+  isc_score_effects,
+  ggplot2::aes(
+    x = balanced_effect_expected_direction,
+    y = cohort,
+    color = cohort
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    color = "grey50",
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(
+      xmin = balanced_expected_direction_q25,
+      xmax = balanced_expected_direction_q75
+    ),
+    height = 0.16,
+    linewidth = 1.0
+  ) +
+  ggplot2::geom_point(size = 4.4) +
+  ggplot2::facet_wrap(
+    ~ program_display,
+    scales = "free_x",
+    nrow = 1
+  ) +
+  ggplot2::scale_color_manual(values = COHORT_COLORS, guide = "none") +
+  ggplot2::labs(
+    title = "Do matched ISC-like cells move in the expected HFD direction?",
+    subtitle = paste0(
+      "Point = median HFD-minus-CON effect across 100 balanced cell samples; ",
+      "positive values support the expected program direction"
+    ),
+    x = "Expected-direction score difference",
+    y = NULL,
+    caption = paste0(
+      "Bars are cell-sampling IQRs, not biological confidence intervals. ",
+      "One pooled library represents each diet within each cohort."
+    )
+  ) +
+  theme_presentation(base_size = 15)
+
+preview_plot(p_isc_effects)
+save_presentation_pdf(
+  "08_cross_cohort_ISC_expected_direction_effects.pdf",
+  p_isc_effects
+)
+```
+
+# 16. Figure 9: program effects across matched epithelial states
+
+Color is rescaled separately within each program to emphasize direction and
+relative pattern. It must not be used to compare absolute effect magnitude
+between programs; the raw effect table contains the exact values.
+
+```{r figure-09-state-program-heatmap}
+state_program_effects <- program_score_effects |>
+  dplyr::filter(
+    eligible,
+    as.character(harmonized_state) %in% PRESENTATION_EPITHELIAL_STATES
+  ) |>
+  dplyr::group_by(score_column) |>
+  dplyr::mutate(
+    program_scale = max(
+      abs(balanced_effect_expected_direction),
+      na.rm = TRUE
+    ),
+    relative_expected_direction_effect = dplyr::if_else(
+      is.finite(program_scale) & program_scale > 0,
+      balanced_effect_expected_direction / program_scale,
+      NA_real_
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    harmonized_state = factor(
+      harmonized_state,
+      levels = rev(PRESENTATION_EPITHELIAL_STATES)
+    ),
+    cohort = factor(cohort, levels = unname(COHORT_LABELS[COHORT_IDS])),
+    display_value = sprintf("%+.3f", balanced_effect_expected_direction)
+  )
+
+readr::write_csv(
+  state_program_effects,
+  file.path(TABLE_DIR, "cross_cohort_state_program_effects.csv")
+)
+
+p_state_program <- ggplot2::ggplot(
+  state_program_effects,
+  ggplot2::aes(
+    x = cohort,
+    y = harmonized_state,
+    fill = relative_expected_direction_effect
+  )
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.7) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = display_value),
+    size = 3.3,
+    color = "black"
+  ) +
+  ggplot2::facet_wrap(
+    ~ program_display,
+    nrow = 1
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = DIET_COLORS[["CON"]],
+    mid = "white",
+    high = DIET_COLORS[["HFD"]],
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish
+  ) +
+  ggplot2::labs(
+    title = "Program direction across matched epithelial states",
+    subtitle = paste0(
+      "Cell labels show raw expected-direction HFD-minus-CON score differences; ",
+      "tile color is scaled within each program"
+    ),
+    x = NULL,
+    y = NULL,
+    fill = "Relative effect\nwithin program",
+    caption = paste0(
+      "Blank state/cohort cells failed the minimum of ",
+      MIN_NUCLEI_PER_DIET,
+      " nuclei per diet. Color magnitude is not comparable between programs."
+    )
+  ) +
+  theme_presentation(base_size = 13) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 25, hjust = 1),
+    legend.position = "bottom"
+  )
+
+preview_plot(p_state_program)
+save_presentation_pdf(
+  "09_cross_cohort_state_program_effects.pdf",
+  p_state_program
+)
+```
+
+# 17. Supporting figures: WT epithelial WNN program maps
+
+These maps show where a score resides in the existing multimodal embedding.
+They do not imply trajectory direction or RNA velocity.
+
+```{r define-wnn-score-map}
+plot_wnn_score <- function(data, score_column, display_label, filename) {
+  plot_data <- data |>
+    dplyr::filter(
+      cohort_id == "wt",
+      broad_compartment == "epithelial",
+      annotation_confidence %in% c("high", "moderate"),
+      is.finite(wnn_1),
+      is.finite(wnn_2),
+      is.finite(.data[[score_column]])
+    )
+
+  if (nrow(plot_data) == 0L) {
+    warning("No WT WNN coordinates available for ", display_label)
+    return(invisible(NULL))
+  }
+
+  score_limits <- stats::quantile(
+    plot_data[[score_column]],
+    probs = c(0.02, 0.98),
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  if (
+    !all(is.finite(score_limits)) ||
+      score_limits[[1]] == score_limits[[2]]
+  ) {
+    score_center <- stats::median(
+      plot_data[[score_column]],
+      na.rm = TRUE
+    )
+
+    score_padding <- max(
+      abs(score_center) * 0.01,
+      1e-6
+    )
+
+    score_limits <- score_center + c(
+      -score_padding,
+      score_padding
+    )
+  }
+
+  # Draw low-scoring cells first so high-scoring cells remain visible.
+  plot_data <- plot_data |>
+    dplyr::arrange(.data[[score_column]])
+
+  score_plot <- ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(
+      x = wnn_1,
+      y = wnn_2,
+      color = .data[[score_column]]
+    )
+  ) +
+    ggplot2::geom_point(
+      size = 0.35,
+      alpha = 0.90
+    ) +
+    ggplot2::facet_wrap(
+      ~ diet,
+      nrow = 1
+    ) +
+    ggplot2::scale_color_gradient(
+      low = "lightgrey",
+      high = "blue",
+      limits = score_limits,
+      oob = scales::squish,
+      na.value = "grey90"
+    ) +
+    ggplot2::coord_equal() +
+    ggplot2::labs(
+      title = paste0(
+        "WT epithelial WNN: ",
+        display_label
+      ),
+      subtitle = paste0(
+        "Same embedding and UCell score scale in CON and HFD"
+      ),
+      x = "wnnUMAP_1",
+      y = "wnnUMAP_2",
+      color = "UCell score\n(2nd–98th pct.)",
+      caption = paste0(
+        "The WNN embedding represents multimodal neighborhoods; ",
+        "score gradients are descriptive."
+      )
+    ) +
+    theme_presentation(base_size = 16) +
+    ggplot2::theme(
+      panel.grid = ggplot2::element_blank(),
+      axis.line = ggplot2::element_blank(),
+      axis.text = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank()
+    )
+
+  preview_plot(score_plot)
+  save_presentation_pdf(filename, score_plot)
+
+  invisible(score_plot)
+}
+```
+
+```{r figure-10-11-wnn-score-maps}
+plot_wnn_score(
+  cell_scores,
+  "HyperMet_UCell",
+  "Persistent HFD-associated metabolic/redox module (HyperMet)",
+  "10_supporting_WT_epithelial_WNN_HyperMet.pdf"
+)
+
+plot_wnn_score(
+  cell_scores,
+  "HypoImmune_UCell",
+  "Persistent HFD-depleted immune/ER-secretory module (HypoImmune)",
+  "11_supporting_WT_epithelial_WNN_HypoImmune.pdf"
+)
+```
+
+# 18. Meeting-ready result inventory
+
+This section writes a compact numerical scorecard and a manifest that gives the
+recommended figure order, the question answered by each PDF, and the principal
+interpretive limitation.
+
+```{r create-meeting-scorecard}
+top_wt_composition_changes <- epithelial_composition_effects |>
+  dplyr::filter(cohort_id == "wt") |>
+  dplyr::arrange(dplyr::desc(abs(HFD_minus_CON_percentage_points))) |>
+  dplyr::slice_head(n = 8L) |>
+  dplyr::transmute(
+    result_family = "WT epithelial composition",
+    item = as.character(harmonized_state),
+    estimate = HFD_minus_CON_percentage_points,
+    estimate_definition = "HFD minus CON percentage points",
+    direction = dplyr::if_else(estimate > 0, "HFD enriched", "CON enriched")
+  )
+
+top_wt_rna_changes <- wt_rna_meeting_candidates |>
+  dplyr::arrange(dplyr::desc(abs(log2FC_comparison_vs_reference))) |>
+  dplyr::slice_head(n = 12L) |>
+  dplyr::transmute(
+    result_family = "WT stable RNA effect",
+    item = paste0(feature, " | ", harmonized_state),
+    estimate = log2FC_comparison_vs_reference,
+    estimate_definition = "RNA log2FC HFD versus CON",
+    direction = dplyr::recode(
+      direction,
+      HFD_higher = "HFD higher",
+      CON_higher = "CON higher"
+    )
+  )
+
+persistent_scorecard <- persistent_class_summary |>
+  dplyr::transmute(
+    result_family = "Persistent program validation",
+    item = paste0(reference_program, " | ", validation_group),
+    estimate = genes,
+    estimate_definition = "genes",
+    direction = NA_character_
+  )
+
+isc_program_scorecard <- isc_score_effects |>
+  dplyr::transmute(
+    result_family = "Matched ISC-like program effect",
+    item = paste0(as.character(cohort), " | ", program_display),
+    estimate = balanced_effect_expected_direction,
+    estimate_definition =
+      "expected-direction median HFD-CON score difference",
+    direction = dplyr::if_else(
+      balanced_effect_expected_direction > 0,
+      "expected direction",
+      "opposite direction"
+    )
+  )
+
+lcn2_scorecard <- lcn2_detection_audit |>
+  dplyr::transmute(
+    result_family = "Epithelial Lcn2 detection",
+    item = paste0(as.character(cohort), " | ", as.character(diet)),
+    estimate = Lcn2_positive_percent,
+    estimate_definition = "percent of curated epithelial nuclei with Lcn2 detected",
+    direction = NA_character_
+  )
+
+meeting_key_results <- dplyr::bind_rows(
+  top_wt_composition_changes,
+  top_wt_rna_changes,
+  persistent_scorecard,
+  isc_program_scorecard,
+  lcn2_scorecard
+)
+
+readr::write_csv(
+  meeting_key_results,
+  file.path(TABLE_DIR, "meeting_key_results.csv")
+)
+
+figure_manifest <- tibble::tribble(
+  ~order, ~priority, ~pdf, ~question, ~safe_talk_track, ~backing_table,
+  1L, "core", "01A_WT_cell_state_composition_HFD_minus_CON.pdf",
+  "Which annotated WT states change in relative abundance with HFD?",
+  "Lead with the increase in cycling ISC/TA, mature colonocyte, and Reg4-positive DCS states, alongside depletion of ISC-like and immature absorptive states.",
+  "WT_Step7_composition_effect_sizes.csv",
+  2L, "core", "01B_cross_cohort_epithelial_composition_HFD_minus_CON.pdf",
+  "Do harmonized epithelial composition patterns stack similarly across cohorts?",
+  "Describe direction and size in WT first, then show whether Ppar iKO or Il17ra iKO displays the same pattern.",
+  "epithelial_composition_HFD_minus_CON.csv",
+  3L, "core", "02_WT_stable_RNA_diet_effects.pdf",
+  "Which WT genes show the clearest state-matched diet effects?",
+  "Emphasize effect size, detection shift, and cell-sampling stability; do not describe significance.",
+  "WT_RNA_meeting_candidates.csv",
+  4L, "core", "03_WT_nearby_RNA_ATAC_concordance.pdf",
+  "Which WT RNA effects have concordant nearby accessibility?",
+  "Call these prioritized multimodal candidates, not validated regulatory links.",
+  "WT_nearby_RNA_ATAC_meeting_candidates.csv",
+  5L, "core", "04_persistent_program_WT_validation_summary.pdf",
+  "Does the supplied persistent d21-to-d50 program reproduce in WT?",
+  "The recovery is partial and asymmetric, with better support for the HFD-up arm.",
+  "persistent_program_WT_validation_summary.csv",
+  6L, "core", "05_persistent_stringent_RNA_and_TSS_ATAC.pdf",
+  "Which persistent genes have the strongest WT RNA evidence and exact TSS-window context?",
+  "Separate RNA agreement from chromatin context and point out discordant loci explicitly.",
+  "persistent_stringent_gene_RNA_TSS_ATAC_evidence.csv",
+  7L, "core", "06_WT_ISC_program_scores.pdf",
+  "Do the targeted modules move within WT ISC-like cells?",
+  "Use raw per-nucleus score distributions descriptively; the pool is the experimental unit.",
+  "WT_ISC_cell_level_program_scores.csv.gz",
+  8L, "core", "07_cross_cohort_ISC_program_scores.pdf",
+  "Where do Ppar iKO and Il17ra iKO sit under the same scoring definitions?",
+  "The signatures are fixed from WT, but cross-cohort offsets are not pure genotype effects.",
+  "cross_cohort_ISC_cell_level_program_scores.csv.gz",
+  9L, "core", "08_cross_cohort_ISC_expected_direction_effects.pdf",
+  "Does each cohort move in the expected program direction under HFD?",
+  "Compare signs and descriptive magnitudes; the bars are cell-sampling IQRs, not confidence intervals.",
+  "cross_cohort_ISC_program_effects.csv",
+  10L, "supporting", "09_cross_cohort_state_program_effects.pdf",
+  "Are program shifts restricted to ISC-like cells or shared across epithelial states?",
+  "Use color for relative pattern within a program, and the printed values for raw effects.",
+  "cross_cohort_state_program_effects.csv",
+  11L, "supporting", "10_supporting_WT_epithelial_WNN_HyperMet.pdf",
+  "Where is the metabolic/redox program located in WT epithelial WNN space?",
+  "Treat the map as spatial context, not trajectory or RNA velocity.",
+  "program_score_summary_by_cohort_state_and_diet.csv",
+  12L, "supporting", "11_supporting_WT_epithelial_WNN_HypoImmune.pdf",
+  "Where is the immune/ER-secretory program located in WT epithelial WNN space?",
+  "Treat the map as spatial context, not trajectory or RNA velocity.",
+  "program_score_summary_by_cohort_state_and_diet.csv"
+)
+
+readr::write_csv(
+  figure_manifest,
+  file.path(MEETING_OUTPUT_DIR, "meeting_figure_manifest.csv")
+)
+
+figure_manifest
+```
+
+# 19. Run summary and completion marker
+
+```{r save-final-audits}
+cell_score_export <- cell_scores |>
+  dplyr::select(
+    cell_barcode,
+    cohort_id,
+    cohort,
+    sample_id,
+    diet,
+    analysis_unit,
+    broad_compartment,
+    cell_state,
+    cell_state_full,
+    annotation_confidence,
+    harmonized_state,
+    Lcn2_log_normalized,
+    Lcn2_detected,
+    dplyr::ends_with("_UCell"),
+    dplyr::ends_with("_raw"),
+    dplyr::ends_with("_WT_axis")
+  )
+
+readr::write_csv(
+  cell_score_export,
+  file.path(TABLE_DIR, "all_cohort_cell_level_program_scores.csv.gz")
+)
+
+run_summary <- tibble::tibble(
+  dataset_version = DATASET_VERSION,
+  presentation_tag = PRESENTATION_TAG,
+  cohorts = paste(COHORT_IDS, collapse = ";"),
+  total_nuclei = nrow(cell_scores),
+  curated_epithelial_nuclei = nrow(curated_epithelial),
+  harmonized_epithelial_states = dplyr::n_distinct(
+    curated_epithelial$harmonized_state
+  ),
+  UCell_max_rank = UCELL_MAX_RANK,
+  minimum_nuclei_per_diet = MIN_NUCLEI_PER_DIET,
+  balanced_sampling_iterations = DOWNSAMPLING_ITERATIONS,
+  replicated_diet_design = FALSE,
+  biological_inference_performed = FALSE,
+  PDFs_requested = nrow(figure_manifest),
+  PDFs_created = sum(
+    file.exists(file.path(PLOT_DIR, figure_manifest$pdf))
+  )
+)
+
+readr::write_csv(
+  run_summary,
+  file.path(MEETING_OUTPUT_DIR, "meeting_figure_run_summary.csv")
+)
+
+writeLines(
+  capture.output(utils::sessionInfo()),
+  file.path(MEETING_OUTPUT_DIR, "sessionInfo.txt")
+)
+
+missing_figures <- figure_manifest$pdf[
+  !file.exists(file.path(PLOT_DIR, figure_manifest$pdf))
+]
+
+writeLines(
+  c(
+    paste("Meeting figure preparation completed:", Sys.time()),
+    paste("Dataset version:", DATASET_VERSION),
+    paste("Cohorts:", paste(COHORT_IDS, collapse = ", ")),
+    paste("Total nuclei scored:", nrow(cell_scores)),
+    paste("Curated epithelial nuclei:", nrow(curated_epithelial)),
+    paste("PDFs created:", run_summary$PDFs_created),
+    paste(
+      "Missing/omitted PDFs:",
+      if (length(missing_figures) == 0L) {
+        "none"
+      } else {
+        paste(missing_figures, collapse = "; ")
+      }
+    ),
+    "Replicated diet design: FALSE",
+    "Biological inference performed: FALSE"
+  ),
+  file.path(MEETING_OUTPUT_DIR, "STEP_MEETING_FIGURES_COMPLETE.txt")
+)
+
+run_summary
+```
+
+# 20. Console debrief
+
+```{r print-debrief}
+cat("\nOutput directory:\n", MEETING_OUTPUT_DIR, "\n\n", sep = "")
+
+cat("WT composition changes with largest absolute values:\n")
+print(
+  epithelial_composition_effects |>
+    dplyr::filter(cohort_id == "wt") |>
+    dplyr::arrange(dplyr::desc(abs(HFD_minus_CON_percentage_points))) |>
+    dplyr::select(
+      harmonized_state,
+      percent_CON,
+      percent_HFD,
+      HFD_minus_CON_percentage_points
+    ) |>
+    dplyr::slice_head(n = 8L),
+  n = Inf,
+  width = Inf
+)
+
+cat("\nMatched ISC-like expected-direction program effects:\n")
+print(
+  isc_score_effects |>
+    dplyr::select(
+      cohort,
+      program_display,
+      CON_nuclei,
+      HFD_nuclei,
+      balanced_effect_expected_direction,
+      balanced_expected_direction_q25,
+      balanced_expected_direction_q75,
+      sign_concordance_percent
+    ),
+  n = Inf,
+  width = Inf
+)
+
+cat("\nPersistent stringent genes:\n")
+print(
+  persistent_gene_meeting_table |>
+    dplyr::select(
+      gene,
+      reference_direction,
+      RNA_reference_aligned_log2FC,
+      representative_ATAC_reference_aligned_log2FC,
+      multimodal_validation_class
+    ),
+  n = Inf,
+  width = Inf
+)
+```

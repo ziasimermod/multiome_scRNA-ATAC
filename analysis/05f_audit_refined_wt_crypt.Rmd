@@ -1,0 +1,257 @@
+---
+title: "Step 05F | Review WT crypt refinement and fetal/repair sentinels"
+author: "Mana Lab"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This **versioned follow-up** reads the completed Step 05E focused object. It
+does not rerun clustering, change Step 06 annotations, or treat a marker panel
+as a fetal/revival cell-state classifier. r0.3 is fixed from the preceding
+manual review. C0 and C2 are provisional primary comparators; C3 and C5 are
+retained as stem-associated sensitivities. C1 is HFD-enriched, but population
+composition and within-state diet effects will be reported separately.
+
+`Clu` marks the damage-associated revival cells in Ayyaz et al. (2019), and
+`Ly6a`, `Anxa1`, `Tacstd2` plus YAP-associated targets are review markers
+from Yui et al. (2018). These contexts involve tissue damage. A small panel
+in uninjured diet samples is **not** a full published signature or proof of
+revival/fetal state. `Egr1`, `Jun`, `Errfi1` and `Ifrd1` are reported separately
+as nonspecific response-context genes. `Olfm4` is a regional context marker,
+and absence of an overlapping ATAC peak means *not assayed by these peaks*.
+
+Run from the repository project root with `MULTIOME_COHORT_ID=wt` and
+`MULTIOME_DATASET_VERSION=v2_resequenced`. R 4.4.2 and the existing Seurat,
+Signac, tidyverse, Matrix and presto packages are used. The formal marker
+audit can take several minutes. For interactive execution, run chunks in order.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
+  fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) {
+  normalizePath(".")
+} else if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj"))) {
+  normalizePath("..")
+} else stop("Open the project root before running 05F.", call. = FALSE)
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+source(file.path(REPO_ROOT, "R", "helpers.R"))
+source(file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R"))
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") && identical(COHORT_ID, "wt"),
+  "05F must run against v2_resequenced WT.")
+future::plan(future::sequential)
+set.seed(12345)
+```
+
+```{r inputs-and-provenance}
+STEP5E <- file.path(OUTPUT_DIR, "05_wnn", "focused_wt_crypt_stem_progenitor")
+OBJECT <- file.path(STEP5E, "objects", "WT_crypt_core_0_6_8_focused.rds")
+COMPLETE <- file.path(STEP5E, "STEP_05E_COMPLETE.txt")
+MARKERS <- file.path(STEP5E, "tables",
+  "core_WNN_positive_markers_review_resolutions.csv.gz")
+EVIDENCE <- file.path(STEP5E, "tables",
+  "primary_r0.3_targeted_RNA_promoter_summary_by_cluster_diet.csv")
+WW_RNA <- file.path(STEP5E, "tables", "core_WNN_vs_RNA_crosswalk.csv")
+WW_BOUNDARY <- file.path(STEP5E, "tables", "core_vs_boundary_WNN_crosswalk.csv")
+OUT <- file.path(OUTPUT_DIR, "05_wnn", FOLLOWUP_RELEASE, "05f_review")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+for (p in c(OBJECT, COMPLETE, MARKERS, EVIDENCE, WW_RNA, WW_BOUNDARY))
+  need(file.exists(p), paste("Required Step 05E input absent:", p))
+need(any(grepl("Primary review resolution: 0.3", readLines(COMPLETE), fixed = TRUE)),
+  "Step 05E completion marker does not report primary r0.3.")
+manifest <- capture_manifest(c(OBJECT, COMPLETE, MARKERS, EVIDENCE,
+  WW_RNA, WW_BOUNDARY), OUT)
+working <- working_labels()
+write_table(working, OUT, "refined_working_labels.csv")
+```
+
+```{r load-object}
+focused <- load_focused(OBJECT)
+obj <- focused$object
+meta <- focused$metadata
+rna <- focused$matrices$RNA_counts
+rna_data <- focused$matrices$RNA_data
+write_table(focused$alignment, OUT, "matrix_cell_alignment_audit.csv")
+require_columns(meta, "annotation_confidence", "Step 05E metadata")
+require_columns(working, "focused_annotation_confidence", "05F working labels")
+metadata_labels <- dplyr::left_join(
+  dplyr::rename(meta, parent_annotation_confidence = annotation_confidence),
+  working, by = "focused_cluster", relationship = "many-to-one")
+need(!anyNA(metadata_labels$analysis_unit), "Unmapped focused cluster.")
+require_columns(metadata_labels,
+  c("parent_annotation_confidence", "focused_annotation_confidence"),
+  "joined 05F metadata")
+write_table(metadata_labels |>
+  dplyr::select(cell_barcode, sample_id, diet, parent_wnn_cluster,
+    focused_cluster, rna_cluster, analysis_unit, working_label,
+    label_status, approved_for_global_annotation, analysis_role,
+    parent_annotation_confidence, focused_annotation_confidence,
+    Phase, S.Score, G2M.Score,
+    nCount_RNA, nCount_ATAC), OUT, "refined_cell_assignments.csv.gz")
+```
+
+```{r resolution-and-diet-audit}
+census <- metadata_labels |>
+  dplyr::count(analysis_unit, working_label, analysis_role, diet,
+    name = "nuclei") |>
+  dplyr::group_by(diet) |>
+  dplyr::mutate(percent_of_focused_diet = 100*nuclei/sum(nuclei)) |>
+  dplyr::ungroup()
+write_table(census, OUT, "focused_composition_by_diet.csv")
+qc <- metadata_labels |>
+  dplyr::group_by(analysis_unit, diet, Phase) |>
+  dplyr::summarise(nuclei = dplyr::n(),
+    RNA_median = median(nCount_RNA), ATAC_median = median(nCount_ATAC),
+    mt_median = median(percent.mt), TSS_median = median(TSS.enrichment),
+    .groups = "drop") |>
+  dplyr::group_by(analysis_unit, diet) |>
+  dplyr::mutate(phase_percent = 100*nuclei/sum(nuclei)) |>
+  dplyr::ungroup()
+write_table(qc, OUT, "qc_and_phase_by_working_unit_diet.csv")
+
+check_crosswalk <- function(path, right_prefix, filename) {
+  data <- read_csv_checked(path) |> dplyr::filter(resolution == 0.3) |>
+    dplyr::mutate(left_cluster = as.character(left_cluster),
+      right_cluster = as.character(right_cluster))
+  require_columns(data, c("left_cluster", "right_cluster", "nuclei"), filename)
+  data |>
+    dplyr::group_by(left_cluster) |>
+    dplyr::arrange(dplyr::desc(nuclei), .by_group = TRUE) |>
+    dplyr::mutate(fraction_of_left = nuclei/sum(nuclei)) |>
+    dplyr::slice_head(n = 1) |>
+    dplyr::ungroup() |>
+    dplyr::transmute(focused_cluster = left_cluster,
+      comparison = right_prefix, largest_matching_cluster = right_cluster,
+      nuclei_in_largest_match = nuclei, largest_fraction = fraction_of_left)
+}
+stability <- dplyr::bind_rows(
+  check_crosswalk(WW_RNA, "RNA-only", "RNA comparison"),
+  check_crosswalk(WW_BOUNDARY, "expanded boundary", "boundary comparison"))
+write_table(stability, OUT, "r0.3_graph_and_boundary_stability.csv")
+
+lsi_name <- "crypt.core.lsi"
+pca_name <- "crypt.core.pca"
+get_depth_cor <- function(reduction, counts_column) {
+  if (!reduction %in% names(obj@reductions)) return(tibble::tibble())
+  emb <- Seurat::Embeddings(obj[[reduction]])
+  emb <- emb[meta$cell_barcode, , drop = FALSE]
+  tibble::tibble(reduction = reduction, dimension = seq_len(ncol(emb)),
+    spearman_log_depth = vapply(seq_len(ncol(emb)), function(i)
+      safe_cor(emb[, i], log1p(meta[[counts_column]])), numeric(1)),
+    depth_variable = counts_column)
+}
+depth_cor <- dplyr::bind_rows(get_depth_cor(lsi_name, "nCount_ATAC"),
+  get_depth_cor(pca_name, "nCount_RNA"))
+write_table(depth_cor, OUT, "focused_reduction_depth_correlations.csv")
+```
+
+```{r fetal-revival-sentinel-audit}
+panel <- resolve_panel(sentinel_panel(), rownames(rna))
+write_table(panel, OUT, "fetal_repair_sentinel_feature_availability.csv")
+sentinel <- gene_audit(rna, rna_data, meta, panel, "focused_cluster") |>
+  dplyr::left_join(working |>
+    dplyr::select(focused_cluster, working_label, analysis_role),
+    by = c("group" = "focused_cluster"))
+write_table(sentinel, OUT, "sentinel_detection_by_cluster_diet.csv")
+
+co_detect <- dplyr::bind_rows(lapply(split(seq_len(nrow(meta)),
+  paste(meta$focused_cluster, meta$diet, sep = "__")), function(ix) {
+  gene_feature <- stats::setNames(panel$matched_feature, panel$gene)
+  inspect <- c("Clu", "Ly6a", "Anxa1", "Tacstd2")
+  available <- !is.na(gene_feature[inspect])
+  if (!all(available)) {
+    return(tibble::tibble(focused_cluster = meta$focused_cluster[ix[1]],
+      diet = meta$diet[ix[1]], nuclei = length(ix), available_genes = sum(available),
+      all_four_n = NA_integer_, at_least_two_of_four_n = NA_integer_,
+      Clu_and_any_other_n = NA_integer_, assessment = "not_assessed_missing_features"))
+  }
+  det <- as.matrix(rna[gene_feature[inspect], ix, drop = FALSE] > 0)
+  tibble::tibble(focused_cluster = meta$focused_cluster[ix[1]],
+    diet = meta$diet[ix[1]], nuclei = length(ix), available_genes = 4L,
+    all_four_n = sum(colSums(det) == 4),
+    at_least_two_of_four_n = sum(colSums(det) >= 2),
+    Clu_and_any_other_n = sum(det[1, ] & colSums(det[-1, , drop = FALSE]) > 0),
+    assessment = "exploratory_marker_co_detection_only")
+}))
+write_table(co_detect, OUT, "fetal_revival_sentinel_co_detection.csv")
+
+p_sentinel <- sentinel |>
+  dplyr::filter(panel %in% c("revival_sentinel", "fetal_repair_sentinels",
+    "YAP_associated_targets", "response_context_not_fetal_specific")) |>
+  ggplot2::ggplot(ggplot2::aes(x = gene,
+    y = paste0("C", group, " ", diet), size = percent_detected,
+    color = mean_log_normalized)) +
+  ggplot2::geom_point(na.rm = TRUE) +
+  ggplot2::facet_grid(. ~ panel, scales = "free_x", space = "free_x") +
+  ggplot2::scale_color_viridis_c(na.value = "grey80") +
+  ggplot2::labs(title = "WT crypt: selected fetal/repair sentinels and response markers",
+    subtitle = "Grey = gene unavailable; size = percent detected; no state call",
+    x = NULL, y = "Focused WNN cluster and diet") +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 50, hjust = 1),
+    panel.grid.minor = ggplot2::element_blank())
+save_vector_plot(p_sentinel, PLOTS, "01_fetal_repair_sentinel_detection.pdf", 14, 6)
+```
+
+```{r cross-diet-marker-replication}
+# Cell-level marker P values here describe within-object separation only;
+# with one pooled library per diet, they are not diet-replicate statistics.
+need(requireNamespace("presto", quietly = TRUE),
+  "Install presto for this formal Wilcoxon marker audit.")
+SeuratObject::DefaultAssay(obj) <- "RNA.crypt"
+marker_run <- function(x, graph_label, diet_value) {
+  SeuratObject::Idents(x) <- graph_label
+  result <- Seurat::FindAllMarkers(x, assay = "RNA.crypt", only.pos = TRUE,
+    min.pct = 0.1, logfc.threshold = 0.25, test.use = "wilcox",
+    return.thresh = 0.05, verbose = FALSE)
+  if (!nrow(result)) return(tibble::tibble())
+  tibble::as_tibble(result) |>
+    dplyr::mutate(graph = graph_label, diet = diet_value,
+      cluster = as.character(cluster))
+}
+rn_markers <- marker_run(obj, "crypt_core_rna_res_0.3", "pooled")
+wnn_by_diet <- dplyr::bind_rows(lapply(c("CON", "HFD"), function(d) {
+  cells <- meta$cell_barcode[meta$diet == d]
+  marker_run(subset(obj, cells = cells), "crypt_core_wnn_res_0.3", d)
+}))
+write_table(rn_markers, OUT, "RNA_only_r0.3_positive_markers.csv.gz")
+write_table(wnn_by_diet, OUT, "WNN_r0.3_positive_markers_separately_by_diet.csv.gz")
+marker_audit <- dplyr::bind_rows(rn_markers, wnn_by_diet) |>
+  dplyr::group_by(graph, diet, cluster) |>
+  dplyr::summarise(padj_lt_0_05_n = sum(p_val_adj < 0.05, na.rm = TRUE),
+    detected_gene_n = dplyr::n(), .groups = "drop")
+write_table(marker_audit, OUT, "marker_program_audit_summary.csv")
+```
+
+```{r promoter-availability-status}
+evidence <- read_csv_checked(EVIDENCE)
+require_columns(evidence, c("focused_subcluster", "diet", "gene",
+  "RNA_available", "promoter_peak_count", "RNA_percent_detected",
+  "promoter_percent_detected"), "Step 05E targeted evidence")
+promoter_status <- evidence |>
+  dplyr::mutate(promoter_status = dplyr::case_when(
+    promoter_peak_count == 0L ~ "not_assayed_no_overlapping_peak",
+    is.na(promoter_peak_count) ~ "not_assessed",
+    TRUE ~ "overlapping_peak_present"),
+    promoter_percent_interpretable = dplyr::if_else(
+      promoter_peak_count > 0, promoter_percent_detected, NA_real_))
+write_table(promoter_status, OUT, "targeted_promoter_evidence_with_availability.csv")
+need(ncol(obj) == 4468L, "Unexpected nucleus count; check the saved Step 05E release.")
+finish_run(OUT, "STEP_05F_COMPLETE.txt", c(
+  "Core nuclei: 4468 (must match Step 05E r0.3 object)",
+  paste("Observed core nuclei:", ncol(obj)),
+  "Global Step 06 annotation altered: FALSE",
+  "Fetal/revival state annotation assigned: FALSE",
+  "Diet biological inference performed: FALSE"))
+```
+
+After review, pass the saved Step 05E object and this working map to Step 08E.
+No independent animal-level diet variance can be estimated from these pools.

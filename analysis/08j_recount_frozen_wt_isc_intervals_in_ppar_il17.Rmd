@@ -1,0 +1,406 @@
+---
+title: "Step 08J | Recount frozen WT intervals in PPAR and IL17"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+**Correction to Step 08I.** Step 03 built one shared peak set *within each
+cohort*. The WT, PPAR, and IL17 sets have different exact coordinates.
+Consequently, finding only four or five exact WT feature names in a genotype
+ATAC assay is a feature-space mismatch, not evidence of no accessibility or
+no diet response. Do not interpret Step 08I's genotype peak effects,
+effect summary, scatterplot, or heatmap. Its saved six-gene UCell scores,
+approved state identities, nucleus gates, and WT exclusive sex-proxy audit
+remain useful.
+
+This notebook uses `Signac::FeatureMatrix()` to recount the original
+indexed PPAR and IL17 fragments over **all 622 frozen WT GRCm39 intervals**.
+It uses the exact previously saved 08I nuclei and gate memberships. The
+37 C0-supported, 16 higher-count, and six nested WT candidates remain flags.
+No peak is selected using a genotype result. Before calculating effects,
+the few intervals with identical coordinates in the existing cohort ATAC
+assay must reproduce that assay's per-nucleus counts exactly. If they do
+not, the notebook stops.
+
+These are descriptive pooled effects. One library per diet per genotype
+precludes replicate-level DAR inference and genotype-by-diet tests. The
+normalization uses each cohort's full Step 03 peak-assay depth, as in 08I.
+Since the cohort-specific peak universes differ, effect-size comparisons
+still need care. Read individual fragment counts, detection, depth balance,
+and parent-state composition along with any direction comparison.
+
+Run from the repository root on SOL in the R 4.4 environment. The script
+requires both indexed fragment files still linked to each annotated object.
+It writes a **new** directory under WT results:
+`08j_recount_frozen_WT_intervals`.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 12, fig.height = 7)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Open the repository root before running 08J.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced", MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) FOLLOWUP_HELPER <- file.path(REPO_ROOT, "analysis", "R",
+  "wt_crypt_followup_helpers.R")
+if (!file.exists(FOLLOWUP_HELPER)) stop("Missing WT crypt follow-up helper.")
+source(FOLLOWUP_HELPER)
+suppressPackageStartupMessages({
+  library(SeuratObject); library(Signac); library(Matrix)
+  library(dplyr); library(tidyr); library(tibble); library(readr)
+  library(ggplot2); library(GenomicRanges); library(IRanges)
+})
+need(identical(DATASET_VERSION, "v2_resequenced") &&
+  identical(COHORT_ID, "wt"), "08J expects WT v2_resequenced.")
+MIN_PER_DIET <- 30L
+PARENTS <- list(ppar = c("3", "6"), il17 = c("9", "10"))
+CONTEXT <- c(ppar = "2", il17 = "0")
+RESULT_ROOT <- file.path(RESULTS_ROOT, DATASET_VERSION,
+  "independent")
+STEP8H <- file.path(OUTPUT_DIR,
+  "08h_wt_ISC_region_freeze_sex_audit")
+STEP8I <- file.path(OUTPUT_DIR,
+  "08i_frozen_WT_peaks_genotype_context")
+OUT <- file.path(OUTPUT_DIR, "08j_recount_frozen_WT_intervals")
+PLOTS <- file.path(OUT, "plots")
+dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Freeze the exact WT intervals and saved UCell gate membership
+
+```{r inputs}
+PEAK_PATH <- file.path(STEP8H,
+  "02_all_622_top15_ATAC_peaks_with_evidence_flags.csv.gz")
+paths <- c(PEAK_PATH, file.path(STEP8H, "STEP_08H_COMPLETE.txt"),
+  file.path(STEP8I, "STEP_08I_COMPLETE.txt"))
+for (cohort in names(PARENTS)) paths <- c(paths,
+  file.path(STEP8I, paste0("02_", cohort, "_crypt_nuclei_scores.csv.gz")),
+  file.path(STEP8I, paste0("02_", cohort, "_contrast_eligibility.csv")),
+  file.path(RESULT_ROOT, cohort, "06_annotation", "multiome_annotated.rds"))
+need(all(file.exists(paths)), paste("Missing input(s):",
+  paste(paths[!file.exists(paths)], collapse = "; ")))
+info <- file.info(paths)
+manifest <- tibble(path = normalizePath(paths), bytes = info$size,
+  modified = as.character(info$mtime), md5 = NA_character_)
+small <- !grepl("\\.rds$", paths, ignore.case = TRUE)
+manifest$md5[small] <- unname(tools::md5sum(paths[small]))
+write_table(manifest, OUT, "00_input_manifest.csv")
+
+anchor <- read_csv_checked(PEAK_PATH)
+require_columns(anchor, c("feature", "chrom", "start_1based", "end_1based",
+  "anchor_log2FC_HFD_vs_CON", "anchor_CON_counts", "anchor_HFD_counts",
+  "C0_all_log2FC_HFD_vs_CON", "C0_supported", "count_supported_40",
+  "nested_top10"), "frozen WT peak reference")
+need(nrow(anchor) == 622L && !anyDuplicated(anchor$feature) &&
+  sum(anchor$C0_supported) == 37L &&
+  sum(anchor$C0_supported & anchor$count_supported_40) == 16L &&
+  sum(anchor$nested_top10) == 6L &&
+  all(anchor$start_1based >= 1 &
+    anchor$end_1based >= anchor$start_1based),
+  "WT 622/37/16/6 interval contract changed.")
+intervals <- GenomicRanges::GRanges(
+  seqnames = anchor$chrom,
+  ranges = IRanges::IRanges(start = anchor$start_1based,
+    end = anchor$end_1based))
+expected_names <- paste0(as.character(GenomicRanges::seqnames(intervals)),
+  "-", BiocGenerics::start(intervals), "-", BiocGenerics::end(intervals))
+need(identical(expected_names, anchor$feature),
+  "WT peak names and stored GRanges coordinates disagree.")
+names(intervals) <- anchor$feature
+write_table(anchor, OUT, "00_frozen_WT_622_interval_reference.csv.gz")
+```
+
+## 2. Recount PPAR and IL17 fragments on the WT intervals
+
+`keep_all_features=FALSE` follows the validated Step 03 workflow. Every
+input interval must be returned; otherwise the run stops. A count mismatch at the four or five already
+identical intervals also stops the run. This guards against wrong fragment
+paths, barcode maps, or coordinate conventions.
+
+```{r recount-and-effects}
+make_spec <- function(meta, parents, context) {
+  out <- list()
+  add <- function(key, role, ix) {
+    out[[length(out) + 1L]] <<- tibble(contrast = key, role = role,
+      indices = list(as.integer(ix)))
+  }
+  for (parent in parents) {
+    ix <- which(meta$wnn_cluster == parent)
+    add(paste0("parent_", parent, "_all"), "approved_ISC_parent", ix)
+    add(paste0("parent_", parent, "_top15"), "within_parent_top15",
+      ix[meta$top15[ix]])
+    add(paste0("parent_", parent, "_WTcal"), "WT_reference_score_gate",
+      ix[meta$WTcal[ix]])
+  }
+  for (gate in c("all", "top15", "WTcal")) {
+    ix <- unlist(lapply(parents, function(parent) {
+      k <- which(meta$wnn_cluster == parent)
+      if (gate == "all") k else k[meta[[gate]][k]]
+    }), use.names = FALSE)
+    add(paste0("annotated_union_", gate),
+      paste0("union_of_parent_", gate), sort(unique(ix)))
+  }
+  add("crypt_progenitor_context", "approved_nonprimary_crypt_progenitor",
+    which(meta$wnn_cluster == context))
+  dplyr::bind_rows(out) |>
+    dplyr::mutate(n_CON = vapply(indices, function(ix)
+      as.integer(sum(meta$diet[ix] == "CON")), integer(1)),
+      n_HFD = vapply(indices, function(ix)
+        as.integer(sum(meta$diet[ix] == "HFD")), integer(1)),
+      eligible = n_CON >= MIN_PER_DIET & n_HFD >= MIN_PER_DIET)
+}
+
+all_effects <- list()
+all_recount_qc <- list()
+for (cohort in names(PARENTS)) {
+  message("Recounting 622 WT intervals in ", toupper(cohort))
+  obj <- readRDS(file.path(RESULT_ROOT, cohort, "06_annotation",
+    "multiome_annotated.rds"))
+  need("ATAC" %in% names(obj) &&
+    "counts" %in% SeuratObject::Layers(obj[["ATAC"]]),
+    paste(cohort, "annotated ATAC assay lacks joined counts."))
+  meta <- obj[[]]
+  require_columns(meta, c("sample_id", "diet", "wnn_cluster"),
+    paste(cohort, "annotated metadata"))
+  meta$cell_barcode <- rownames(meta)
+  meta$wnn_cluster <- as.character(meta$wnn_cluster)
+  meta$diet <- as.character(meta$diet)
+  need(!anyDuplicated(meta$cell_barcode) &&
+    setequal(meta$cell_barcode, colnames(obj)) &&
+    setequal(unique(meta$diet), c("CON", "HFD")),
+    paste(cohort, "metadata barcodes/diets are invalid."))
+  saved <- read_csv_checked(file.path(STEP8I,
+    paste0("02_", cohort, "_crypt_nuclei_scores.csv.gz")))
+  require_columns(saved, c("cell_barcode", "diet", "wnn_cluster", "top15",
+    "WTcal", "ISC_core6_UCell", "ISC_core_genes_detected"),
+    paste(cohort, "08I fixed gate table"))
+  chosen <- c(PARENTS[[cohort]], CONTEXT[[cohort]])
+  need(!anyDuplicated(saved$cell_barcode) &&
+    setequal(saved$cell_barcode,
+      meta$cell_barcode[meta$wnn_cluster %in% chosen]),
+    paste(cohort, "08I gates and annotated crypt nuclei differ."))
+  ix <- match(saved$cell_barcode, meta$cell_barcode)
+  need(identical(as.character(saved$diet), meta$diet[ix]) &&
+    identical(as.character(saved$wnn_cluster), meta$wnn_cluster[ix]) &&
+    !anyNA(saved$top15) && !anyNA(saved$WTcal),
+    paste(cohort, "08I gate labels changed or are incomplete."))
+  meta$top15 <- FALSE
+  meta$WTcal <- FALSE
+  meta$top15[ix] <- as.logical(saved$top15)
+  meta$WTcal[ix] <- as.logical(saved$WTcal)
+  spec <- make_spec(meta, PARENTS[[cohort]], CONTEXT[[cohort]])
+  prior <- read_csv_checked(file.path(STEP8I,
+    paste0("02_", cohort, "_contrast_eligibility.csv")))
+  require_columns(prior, c("contrast", "n_CON", "n_HFD", "eligible"),
+    paste(cohort, "08I contrast definitions"))
+  prior <- prior[match(spec$contrast, prior$contrast), ]
+  need(!anyNA(prior$contrast) && !anyDuplicated(prior$contrast) &&
+    identical(spec$contrast, prior$contrast) &&
+    identical(spec$n_CON, as.integer(prior$n_CON)) &&
+    identical(spec$n_HFD, as.integer(prior$n_HFD)) &&
+    identical(spec$eligible, as.logical(prior$eligible)),
+    paste(cohort, "saved 08I gate sizes do not match the reloaded cells."))
+  write_table(dplyr::select(spec, -indices) |>
+    dplyr::mutate(cohort = .env$cohort, .before = 1), OUT,
+    paste0("01_", cohort, "_fixed_contrasts.csv"))
+
+  frags <- Signac::Fragments(obj[["ATAC"]])
+  need(length(frags) > 0L,
+    paste(cohort, "has no attached indexed ATAC Fragment objects."))
+  fragment_cells <- unique(unlist(lapply(frags, SeuratObject::Cells),
+    use.names = FALSE))
+  need(all(meta$cell_barcode %in% fragment_cells),
+    paste(cohort, "has cells missing from its fragment barcode mappings."))
+  message(cohort, ": FeatureMatrix for ", length(intervals),
+    " frozen intervals and ", nrow(meta), " nuclei")
+  recounted <- Signac::FeatureMatrix(fragments = frags,
+    features = intervals, cells = meta$cell_barcode,
+    keep_all_features = FALSE, verbose = TRUE)
+  need(nrow(recounted) == length(intervals) &&
+    setequal(colnames(recounted), meta$cell_barcode),
+    paste(cohort, "FeatureMatrix omitted peaks or cells; inspect fragment files."))
+  recounted <- recounted[, meta$cell_barcode, drop = FALSE]
+  if (!is.null(rownames(recounted))) {
+    need(!anyDuplicated(rownames(recounted)) &&
+      setequal(rownames(recounted), anchor$feature),
+      paste(cohort, "FeatureMatrix returned unexpected peak names."))
+    recounted <- recounted[anchor$feature, , drop = FALSE]
+  }
+  rownames(recounted) <- anchor$feature
+  original <- SeuratObject::LayerData(obj[["ATAC"]], layer = "counts")
+  original <- align_columns(original, meta$cell_barcode,
+    paste0(cohort, " original ATAC"))$matrix
+  overlap <- intersect(anchor$feature, rownames(original))
+  need(length(overlap) >= 1L,
+    paste(cohort, "has no identical peaks for recount parity validation."))
+  differing_entries <- Matrix::nnzero(
+    recounted[overlap, , drop = FALSE] -
+      original[overlap, , drop = FALSE])
+  all_recount_qc[[cohort]] <- tibble(cohort = cohort,
+    requested_WT_intervals = length(intervals),
+    previous_exact_name_overlap = length(overlap),
+    original_shared_peak_count_mismatches = differing_entries,
+    recount_nonzero_intervals = sum(Matrix::rowSums(recounted) > 0),
+    recount_CON_fragments = sum(recounted[, meta$diet == "CON", drop = FALSE]),
+    recount_HFD_fragments = sum(recounted[, meta$diet == "HFD", drop = FALSE]))
+  write_table(all_recount_qc[[cohort]], OUT,
+    paste0("01_", cohort, "_fragment_recount_parity.csv"))
+  need(differing_entries == 0L,
+    paste(cohort, "recount disagrees with its saved assay at matching peaks."))
+  # The cohort-wide ATAC assay depth is the same denominator used in 08I.
+  depth <- Matrix::colSums(original)
+  cohort_effect <- dplyr::bind_rows(lapply(which(spec$eligible), function(i) {
+    key <- spec$contrast[[i]]
+    message(cohort, ": ", key, " (", spec$n_CON[[i]],
+      " CON / ", spec$n_HFD[[i]], " HFD)")
+    pooled_effect(recounted, meta, spec$indices[[i]], "ATAC",
+      features = anchor$feature, total_depth = depth) |>
+      dplyr::mutate(contrast = .env$key, .before = 1)
+  }))
+  full <- tidyr::expand_grid(contrast = spec$contrast,
+    feature = anchor$feature) |>
+    dplyr::left_join(cohort_effect, by = c("contrast", "feature"),
+      relationship = "one-to-one") |>
+    dplyr::left_join(dplyr::select(spec, contrast, role, n_CON, n_HFD,
+      eligible), by = "contrast", relationship = "many-to-one") |>
+    dplyr::mutate(cohort = .env$cohort, .before = 1) |>
+    dplyr::left_join(dplyr::select(anchor, feature, chrom, start_1based,
+      end_1based, C0_supported, count_supported_40, nested_top10,
+      anchor_log2FC_HFD_vs_CON, C0_all_log2FC_HFD_vs_CON,
+      anchor_CON_counts, anchor_HFD_counts), by = "feature",
+      relationship = "many-to-one") |>
+    dplyr::mutate(status = dplyr::case_when(
+      !eligible ~ "gate_ineligible", !evaluable ~ "peak_below_evaluability",
+      TRUE ~ "evaluable"),
+      same_WT_direction = dplyr::if_else(status == "evaluable",
+        sign(log2FC_HFD_vs_CON) ==
+          sign(anchor_log2FC_HFD_vs_CON), NA))
+  need(nrow(full) == 622L * nrow(spec) &&
+    !anyNA(full$status) &&
+    !anyDuplicated(full[c("contrast", "feature")]),
+    paste(cohort, "recounted effect table is incomplete."))
+  all_effects[[cohort]] <- full
+  rm(obj, meta, saved, spec, prior, frags, fragment_cells, recounted,
+    original, depth, cohort_effect, full)
+  invisible(gc())
+}
+write_table(dplyr::bind_rows(all_recount_qc), OUT,
+  "01_both_cohorts_fragment_recount_parity.csv")
+effects <- dplyr::bind_rows(all_effects)
+write_table(effects, OUT, "02_recounted_622_interval_genotype_effects.csv.gz")
+write_table(dplyr::filter(effects, C0_supported), OUT,
+  "02_recounted_37_C0_supported_interval_effects.csv.gz")
+```
+
+## 3. Summaries and figures from the recounted intervals
+
+`evaluable` requires 30 pooled fragment counts across CON+HFD and at
+least 1% of nuclei with fragments in either diet. `clear_effect` also
+requires absolute depth-normalized log2FC >=0.5. These are descriptive
+cutoffs, not significance thresholds. Display missing gates as `NA`.
+
+```{r summaries-and-figures}
+summarize_tier <- function(tier, flag) {
+  effects |>
+    dplyr::filter(.env$flag) |>
+    dplyr::group_by(cohort, contrast, role, n_CON, n_HFD, eligible) |>
+    dplyr::summarise(tier = .env$tier, frozen_regions = dplyr::n(),
+      intervals_with_any_fragments = sum(CON_counts + HFD_counts > 0,
+        na.rm = TRUE),
+      evaluable_regions = sum(evaluable, na.rm = TRUE),
+      clear_regions = sum(clear_effect, na.rm = TRUE),
+      evaluable_same_WT_direction = sum(evaluable & same_WT_direction,
+        na.rm = TRUE),
+      clear_same_WT_direction = sum(clear_effect & same_WT_direction,
+        na.rm = TRUE),
+      clear_opposite_WT_direction = sum(clear_effect &
+        !same_WT_direction, na.rm = TRUE),
+      .groups = "drop") |>
+    dplyr::mutate(dplyr::across(c(intervals_with_any_fragments,
+      evaluable_regions, clear_regions, evaluable_same_WT_direction,
+      clear_same_WT_direction, clear_opposite_WT_direction),
+      ~dplyr::if_else(eligible, .x, NA_integer_)))
+}
+summary <- dplyr::bind_rows(
+  summarize_tier("all_622", rep(TRUE, nrow(effects))),
+  summarize_tier("C0_supported_37", effects$C0_supported),
+  summarize_tier("count_supported_16", effects$C0_supported &
+    effects$count_supported_40),
+  summarize_tier("nested_top10_6", effects$nested_top10))
+write_table(summary, OUT, "03_recounted_cohort_gate_peak_summary.csv")
+print(summary |>
+  dplyr::filter(tier %in% c("all_622", "C0_supported_37"),
+    contrast %in% c("annotated_union_all", "annotated_union_top15",
+      "parent_3_all", "parent_6_all", "parent_9_all", "parent_10_all")))
+
+p_scatter <- effects |>
+  dplyr::filter(status == "evaluable",
+    contrast %in% c("annotated_union_all", "annotated_union_top15")) |>
+  ggplot2::ggplot(ggplot2::aes(x = anchor_log2FC_HFD_vs_CON,
+    y = log2FC_HFD_vs_CON,
+    color = ifelse(C0_supported, "WT C0-supported 37", "Other WT top-15 peaks"))) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = .25) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = .25) +
+  ggplot2::geom_point(alpha = .6, size = .9) +
+  ggplot2::facet_grid(cohort ~ contrast) +
+  ggplot2::scale_color_manual(values = c("WT C0-supported 37" = "#B24B3A",
+    "Other WT top-15 peaks" = "#5C7080")) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::labs(title = "WT intervals recounted from genotype fragments",
+    subtitle = "Evaluable pooled effects; each cohort and parent state must be reviewed separately",
+    x = "WT top-15 HFD-versus-CON log2FC",
+    y = "Genotype HFD-versus-CON log2FC", color = NULL)
+save_vector_plot(p_scatter, PLOTS,
+  "03_WT_vs_genotype_recounted_622_effects.pdf", 13, 8)
+
+ordered37 <- dplyr::filter(anchor, C0_supported) |>
+  dplyr::arrange(anchor_log2FC_HFD_vs_CON) |>
+  dplyr::pull(feature)
+p_heat <- effects |>
+  dplyr::filter(C0_supported,
+    contrast %in% c("annotated_union_all", "annotated_union_top15",
+      "parent_3_all", "parent_6_all", "parent_9_all", "parent_10_all")) |>
+  dplyr::mutate(feature = factor(feature, levels = ordered37),
+    effect_for_display = ifelse(status == "evaluable",
+      log2FC_HFD_vs_CON, NA_real_)) |>
+  ggplot2::ggplot(ggplot2::aes(x = feature, y = contrast,
+    fill = effect_for_display)) +
+  ggplot2::geom_tile(color = "white", linewidth = .1) +
+  ggplot2::facet_wrap(~cohort, ncol = 1, scales = "free_y") +
+  ggplot2::scale_fill_gradient2(low = "#3279A8", mid = "white",
+    high = "#C45F48", midpoint = 0, na.value = "grey85") +
+  ggplot2::theme_bw(base_size = 8) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90,
+    hjust = 1, vjust = .5, size = 6)) +
+  ggplot2::labs(title = "WT C0-supported intervals recounted in PPAR and IL17",
+    subtitle = "Grey: below evaluability or gate ineligible; no statistical DAR call",
+    x = "Frozen WT GRCm39 interval", y = NULL,
+    fill = "HFD vs CON\nlog2FC")
+save_vector_plot(p_heat, PLOTS,
+  "03_recounted_37_interval_parent_context.pdf", 17, 7)
+```
+
+## 4. Review order
+
+Start with `01_both_cohorts_fragment_recount_parity.csv`: both cohorts must
+show 622 requested intervals and **zero** mismatched counts at previously
+matching peaks. Next inspect `03_recounted_cohort_gate_peak_summary.csv`
+alongside the saved 08I group/depth/sex balances and parent-composition
+tables. Review `02_recounted_622_interval_genotype_effects.csv.gz` before
+selecting any illustrative locus. Keep the WT-selected 622 peak universe
+visible; treat the 37 and 16 only as prespecified WT evidence strata.
+
+```{r finish}
+finish_run(OUT, "STEP_08J_COMPLETE.txt", c(
+  "Corrects 08I genotype peak-name mismatch by fragment recount on all 622 WT intervals.",
+  "Previously identical peak coordinates passed per-nucleus ATAC count parity checks.",
+  "Uses exactly the saved 08I ISC UCell gates and approved genotype parent populations.",
+  "WT Xist/Y proxy results from 08I are unchanged.",
+  "One pooled library per diet per genotype: no significant DARs or genotype interaction test.",
+  paste("Results:", OUT)))
+```

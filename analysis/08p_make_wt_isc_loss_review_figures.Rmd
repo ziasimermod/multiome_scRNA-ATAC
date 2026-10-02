@@ -1,0 +1,300 @@
+---
+title: "Step 08P | WT ISC loss comparison figures"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This standalone notebook recreates the three 08N/08O review figures from
+their completed output directories. Run from the repository root, after
+Steps 08N and 08O. It does not require a Seurat object or fragments. It
+saves PDF, SVG, PNG, and the two small figure audit tables under
+`08p_wt_ISC_loss_review_figures/` in the WT output directory.
+If needed, override the input/output directories using `STEP08N_DIR`,
+`STEP08O_DIR`, and `STEP08P_FIGURE_DIR` environment variables.
+
+The 622 WT candidate intervals were selected on pooled WT accessibility
+effects. The knockout gates contain different nuclei; both genotype
+comparisons are descriptive. In particular, an interval called "lost" is
+still present. It has an effect at most half as large as the WT effect, or
+an effect of opposite sign. The overlap comparison is a diagnostic among
+selected intervals, not a biological replicate or interaction test.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+REPO_ROOT <- if (file.exists("multiome_scRNA-ATAC.Rproj")) normalizePath(".") else
+  if (file.exists(file.path("..", "multiome_scRNA-ATAC.Rproj")))
+    normalizePath("..") else stop("Run from the repository root.")
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = "wt")
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble)
+  library(readr); library(ggplot2)
+})
+need <- function(ok, why) if (!isTRUE(ok)) stop(why, call. = FALSE)
+STEP08N <- Sys.getenv("STEP08N_DIR", unset = file.path(OUTPUT_DIR,
+  "08n_wt_ISC_interval_loss_pathways"))
+STEP08O <- Sys.getenv("STEP08O_DIR", unset = file.path(OUTPUT_DIR,
+  "08o_wt_ISC_loss_group_motifs"))
+OUT <- Sys.getenv("STEP08P_FIGURE_DIR", unset = file.path(OUTPUT_DIR,
+  "08p_wt_ISC_loss_review_figures"))
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+input <- c(region = file.path(STEP08N,
+    "01_all_622_annotated_loss_audit.csv.gz"),
+  sets = file.path(STEP08N, "03_set_manifest.csv"),
+  motif_audit = file.path(STEP08O, "00_six_set_motif_audit.csv"),
+  complete08n = file.path(STEP08N, "STEP_08N_COMPLETE.txt"),
+  complete08o = file.path(STEP08O, "STEP_08O_COMPLETE.txt"))
+need(all(file.exists(input)), paste("Missing inputs:",
+  paste(input[!file.exists(input)], collapse = "; ")))
+region <- readr::read_csv(input[["region"]], show_col_types = FALSE,
+  progress = FALSE)
+set_manifest <- readr::read_csv(input[["sets"]], show_col_types = FALSE)
+motif_audit <- readr::read_csv(input[["motif_audit"]], show_col_types = FALSE)
+required <- c("feature", "WT_direction", "anchor_log2FC_HFD_vs_CON",
+  "C0_all_log2FC_HFD_vs_CON", "C0_supported", "count_supported_40",
+  "ppar_evaluable", "il17_evaluable", "both_evaluable", "comparison",
+  "ppar_effect", "il17_effect", "nearest_symbol", "anchor_CON_counts",
+  "anchor_HFD_counts", "ppar_parent_effect", "il17_parent_effect")
+need(all(required %in% names(region)),
+  paste("Missing 08N audit columns:",
+    paste(setdiff(required, names(region)), collapse = ", ")))
+need(nrow(region) == 622L && !anyDuplicated(region$feature) &&
+  all(!is.na(region$both_evaluable)) && nrow(motif_audit) == 6L &&
+  all(c("shared_HFD_open_lost", "shared_HFD_closed_lost") %in%
+    set_manifest$set), "Step 08N/08O review inputs disagree.")
+readr::write_csv(tibble::tibble(source = names(input),
+  path = normalizePath(input), bytes = file.info(input)$size,
+  md5 = unname(tools::md5sum(input))),
+  file.path(OUT, "00_figure_input_manifest.csv"))
+save_figure <- function(plot, stem, width, height) {
+  ggplot2::ggsave(file.path(OUT, paste0(stem, ".pdf")), plot = plot,
+    device = grDevices::pdf, useDingbats = FALSE,
+    width = width, height = height)
+  ggplot2::ggsave(file.path(OUT, paste0(stem, ".png")), plot = plot,
+    device = "png", width = width, height = height, dpi = 220,
+    bg = "white")
+  # SVG remains editable in Illustrator. The PDF and PNG are saved first.
+  tryCatch(ggplot2::ggsave(file.path(OUT, paste0(stem, ".svg")),
+    plot = plot, device = grDevices::svg, width = width, height = height),
+    error = function(e) warning("SVG unavailable for ", stem, ": ",
+      conditionMessage(e)))
+}
+```
+
+## Figure 1: four-way overlap among doubly evaluable intervals
+
+The PPAR-only and IL17-only counts have the **same denominator** as the
+shared and retained counts. Marginal expectation conditions on the separate
+PPAR and IL17 loss totals in that WT-direction subset. A large shared count
+need not indicate a special common program when each knockout has a high
+loss rate.
+
+```{r overlap}
+dirs <- c("HFD_open", "HFD_closed")
+status <- c("shared_loss", "PPAR_only_loss", "IL17_only_loss",
+  "retained_in_both")
+status_labels <- c(shared_loss = "Lost in both",
+  PPAR_only_loss = "PPAR only", IL17_only_loss = "IL17 only",
+  retained_in_both = "Retained in both")
+status_colors <- c(shared_loss = "#6B31A7", PPAR_only_loss = "#C26345",
+  IL17_only_loss = "#277A9B", retained_in_both = "#758175")
+joint <- region |>
+  dplyr::filter(.data$both_evaluable)
+need(all(joint$comparison %in% status),
+  "A doubly evaluable interval lacks a four-way classification.")
+overlap <- dplyr::bind_rows(lapply(dirs, function(direction) {
+  x <- joint[joint$WT_direction == direction, , drop = FALSE]
+  counts <- table(factor(x$comparison, levels = status))
+  a <- unname(counts[["shared_loss"]])
+  b <- unname(counts[["PPAR_only_loss"]])
+  c <- unname(counts[["IL17_only_loss"]])
+  d <- unname(counts[["retained_in_both"]])
+  need(a + b + c + d == nrow(x), "Four-way counts are incomplete.")
+  ft <- stats::fisher.test(matrix(c(a, b, c, d), nrow = 2L,
+    byrow = TRUE), alternative = "greater")
+  tibble::tibble(WT_direction = direction, n_doubly_evaluable = nrow(x),
+    observed_shared = a, expected_shared_under_independent_loss_calls =
+      (a+b)*(a+c)/nrow(x), PPAR_only = b, IL17_only = c,
+    retained_both = d, conditional_overlap_odds_ratio =
+      (a*d)/(b*c), exploratory_one_sided_fisher_p = ft$p.value)
+}))
+readr::write_csv(overlap, file.path(OUT, "01_overlap_diagnostic.csv"))
+print(overlap)
+segments <- joint |>
+  dplyr::count(.data$WT_direction, .data$comparison, name = "n") |>
+  tidyr::complete(WT_direction = dirs, comparison = status,
+    fill = list(n = 0L)) |>
+  dplyr::mutate(status_index = match(.data$comparison, status),
+    y = ifelse(.data$WT_direction == "HFD_open", 2, 1)) |>
+  dplyr::group_by(.data$WT_direction) |>
+  dplyr::arrange(.data$status_index, .by_group = TRUE) |>
+  dplyr::mutate(x0 = dplyr::lag(cumsum(.data$n), default = 0L),
+    x1 = cumsum(.data$n), mid = (.data$x0 + .data$x1) / 2) |>
+  dplyr::ungroup()
+right <- overlap |>
+  dplyr::mutate(y = ifelse(.data$WT_direction == "HFD_open", 2, 1),
+    note = sprintf("Observed %d; expected %.1f from loss rates\nOverlap OR %.2f",
+      .data$observed_shared,
+      .data$expected_shared_under_independent_loss_calls,
+      .data$conditional_overlap_odds_ratio))
+right_x <- max(overlap$n_doubly_evaluable) + 50
+p_overlap <- ggplot2::ggplot(segments) +
+  ggplot2::geom_rect(ggplot2::aes(xmin = .data$x0, xmax = .data$x1,
+    ymin = .data$y - .29, ymax = .data$y + .29,
+    fill = .data$comparison)) +
+  ggplot2::geom_text(data = dplyr::filter(segments, .data$n >= 9L),
+    ggplot2::aes(x = .data$mid, y = .data$y, label = .data$n),
+    color = "white", fontface = "bold", size = 4) +
+  ggplot2::geom_text(data = right,
+    ggplot2::aes(x = .data$n_doubly_evaluable + 14, y = .data$y,
+      label = paste0("n=", .data$n_doubly_evaluable)),
+    hjust = 0, inherit.aes = FALSE, size = 3.7) +
+  ggplot2::geom_text(data = right,
+    ggplot2::aes(x = right_x, y = .data$y, label = .data$note),
+    hjust = 0, lineheight = 1.4, inherit.aes = FALSE, size = 3.4) +
+  ggplot2::scale_fill_manual(values = status_colors,
+    breaks = status, labels = status_labels, name = NULL) +
+  ggplot2::scale_y_continuous(breaks = c(2, 1),
+    labels = c("WT HFD-opening", "WT HFD-closing"),
+    limits = c(.55, 2.45), expand = c(0, 0)) +
+  ggplot2::scale_x_continuous(limits = c(0, right_x + 205),
+    breaks = seq(0, 350, by = 50), expand = c(0, 0)) +
+  ggplot2::labs(title = "WT ISC-enriched HFD regions in PPAR and IL17",
+    subtitle = "Loss categories among intervals evaluable in both knockouts",
+    x = "Exact WT candidate intervals", y = NULL,
+    caption = "Shared-loss expectation uses the two marginal loss rates. Overlap OR is a selected-interval diagnostic, not a genotype-by-diet test.") +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(legend.position = "bottom",
+    plot.caption = ggplot2::element_text(hjust = 0, size = 8),
+    panel.grid.major.y = ggplot2::element_blank()) +
+  ggplot2::guides(fill = ggplot2::guide_legend(nrow = 2, byrow = TRUE))
+save_figure(p_overlap, "01_directional_loss_and_overlap", 13, 5)
+```
+
+## Figure 2: effects at the same consensus intervals
+
+Grey points are all evaluable WT candidates. Purple points were independently
+designated C0-supported before the genotype comparison. The diagonal shows
+equal effects; the dotted line shows half the WT effect on the same sign.
+WT candidate selection at `|log2FC| >= 0.5` means regression to the mean is
+an alternative explanation for some of the apparent drop-off.
+
+```{r effect-scatter}
+effect_long <- dplyr::bind_rows(lapply(c("ppar", "il17"), function(g) {
+  keep <- region[[paste0(g, "_evaluable")]]
+  tibble::tibble(feature = region$feature[keep],
+    WT_direction = region$WT_direction[keep],
+    genotype = toupper(g),
+    WT_effect = region$anchor_log2FC_HFD_vs_CON[keep],
+    KO_effect = region[[paste0(g, "_effect")]][keep],
+    C0_supported = region$C0_supported[keep])
+})) |>
+  dplyr::mutate(direction = factor(.data$WT_direction,
+    levels = dirs, labels = c("WT HFD opening", "WT HFD closing")),
+    genotype = factor(.data$genotype, levels = c("PPAR", "IL17")))
+need(all(is.finite(effect_long$WT_effect)) &&
+  all(is.finite(effect_long$KO_effect)) &&
+  all(!is.na(effect_long$C0_supported)),
+  "Nonfinite effect or missing C0 status in an evaluable interval.")
+limits <- range(c(effect_long$WT_effect, effect_long$KO_effect, 0))
+limits <- c(floor(limits[[1]] * 5)/5, ceiling(limits[[2]] * 5)/5)
+p_effect <- ggplot2::ggplot(effect_long,
+  ggplot2::aes(x = .data$WT_effect, y = .data$KO_effect)) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey55", linewidth = .35) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, linetype = "dashed",
+    color = "grey55", linewidth = .45) +
+  ggplot2::geom_abline(intercept = 0, slope = .5, linetype = "dotted",
+    color = "grey72", linewidth = .45) +
+  ggplot2::geom_point(data = dplyr::filter(effect_long,
+    !.data$C0_supported), color = "#B7BBC1", size = 1,
+    alpha = .6) +
+  ggplot2::geom_point(data = dplyr::filter(effect_long,
+    .data$C0_supported), color = "#6933A6", shape = 21,
+    fill = "#6933A6", stroke = .2, size = 2.3) +
+  ggplot2::facet_grid(direction ~ genotype) +
+  ggplot2::coord_equal(xlim = limits, ylim = limits) +
+  ggplot2::labs(title = "Effect estimates at the same WT-selected coordinates",
+    subtitle = "Purple = previously identified WT C0-supported intervals; dashed = WT magnitude; dotted = half WT magnitude",
+    x = "WT top-15% pooled ATAC log2(HFD/CON)",
+    y = "Knockout top-15% pooled ATAC log2(HFD/CON)",
+    caption = "Each dot is an exact consensus interval. WT was screened on |log2FC| >= 0.5; knockout gates contain distinct nuclei. No mouse-level P values.") +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0,
+    size = 8))
+save_figure(p_effect, "02_same_interval_effects_by_genotype", 11.5, 9)
+```
+
+## Figure 3: four C0-supported, higher-count examples
+
+These exact regions were selected from the C0-supported and higher-count
+set. All four have the shared-loss label and are evaluable in both knockouts.
+The adjacent gene is a locus label **only**. This figure does not demonstrate
+RNA change, gene regulation, TF binding, or replicate-level significance.
+Fragment coverage with a common scale remains the necessary next view.
+
+```{r loci}
+examples <- c("chr4-40142794-40143817",
+  "chr13-69759275-69760309", "chr18-65563454-65564359",
+  "chr5-97144996-97145914")
+need(all(examples %in% region$feature),
+  "A preselected illustrative interval is missing.")
+chosen <- region[match(examples, region$feature), , drop = FALSE]
+need(all(chosen$C0_supported & chosen$count_supported_40 &
+  chosen$comparison == "shared_loss" & chosen$both_evaluable),
+  "An example no longer meets its prespecified evidence criteria.")
+readr::write_csv(chosen |>
+  dplyr::select(feature, nearest_symbol, WT_direction,
+    anchor_CON_counts, anchor_HFD_counts,
+    anchor_log2FC_HFD_vs_CON, C0_all_log2FC_HFD_vs_CON,
+    ppar_effect, il17_effect, ppar_parent_effect, il17_parent_effect),
+  file.path(OUT, "03_four_loci_audit.csv"))
+source_levels <- c("WT selected", "WT C0 all", "PPAR top 15%",
+  "IL17 top 15%")
+source_colors <- c(`WT selected` = "#E59F26", `WT C0 all` = "#B57817",
+  `PPAR top 15%` = "#C26345", `IL17 top 15%` = "#277A9B")
+loci <- chosen |>
+  dplyr::mutate(locus = paste0(.data$nearest_symbol, "\n",
+    ifelse(.data$WT_direction == "HFD_open", "HFD open", "HFD closed"),
+    "\n", .data$feature)) |>
+  dplyr::select(feature, locus,
+    `WT selected` = anchor_log2FC_HFD_vs_CON,
+    `WT C0 all` = C0_all_log2FC_HFD_vs_CON,
+    `PPAR top 15%` = ppar_effect,
+    `IL17 top 15%` = il17_effect) |>
+  tidyr::pivot_longer(cols = dplyr::all_of(source_levels),
+    names_to = "source", values_to = "effect") |>
+  dplyr::mutate(locus = factor(.data$locus,
+    levels = unique(.data$locus)),
+    source = factor(.data$source, levels = source_levels),
+    label = sprintf("%+.2f", ifelse(abs(.data$effect) < .005,
+      0, .data$effect)),
+    label_vjust = ifelse(.data$effect >= 0, -1, 1.7))
+need(all(is.finite(loci$effect)), "Example effects are not finite.")
+p_loci <- ggplot2::ggplot(loci,
+  ggplot2::aes(x = .data$source, y = .data$effect,
+    color = .data$source)) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey55",
+    linewidth = .35) +
+  ggplot2::geom_point(size = 3.1) +
+  ggplot2::geom_text(ggplot2::aes(label = .data$label,
+    vjust = .data$label_vjust), size = 3, show.legend = FALSE) +
+  ggplot2::facet_wrap(~ locus, nrow = 1) +
+  ggplot2::scale_color_manual(values = source_colors, guide = "none") +
+  ggplot2::scale_y_continuous(limits = c(-1.1, 2.1),
+    breaks = seq(-1, 2, by = .5)) +
+  ggplot2::labs(title = "Illustrative C0-supported, higher-count intervals",
+    x = NULL, y = "Pooled ATAC log2(HFD/CON)",
+    caption = "Nearest gene names indicate genomic proximity, not regulatory targets. WT C0 all is a within-cohort sensitivity estimate; inspect matched-scale coverage and RNA separately.") +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40,
+    hjust = 1), plot.caption = ggplot2::element_text(hjust = 0,
+    size = 8))
+save_figure(p_loci, "03_four_loci_pooled_effects", 14, 5)
+writeLines(c("08P figures complete.",
+  "Opening and closing status bars use only doubly evaluable exact intervals.",
+  "No genotype-by-diet P values or peak-to-gene claims are established."),
+  file.path(OUT, "STEP_08P_COMPLETE.txt"))
+```

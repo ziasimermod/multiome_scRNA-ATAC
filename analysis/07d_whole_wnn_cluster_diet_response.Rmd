@@ -1,0 +1,487 @@
+---
+title: "Step 07D v3 | Diet response in whole annotated WNN clusters"
+author: "Mana Lab multiome teaching pipeline"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+# Aim and scope
+
+This companion to Step 07 calculates descriptive HFD-versus-CON RNA and ATAC
+changes **within each whole Step 06 WNN cluster**. Step 07 can use refined
+`annotation_unit` children; this notebook deliberately uses `wnn_cluster`.
+It looks up approved *parent-cluster* labels in the cohort's Step 06 decision
+file and audits any difference from nucleus-level refined labels. A parent
+with an approved child is explicitly labeled as a **mixed whole cluster**;
+the residual parent's label is not asserted for every nucleus in that WNN
+cluster.
+
+Run the same notebook separately for WT (`wt`), PPAR (`ppar`), and IL17
+(`il17`). Numeric cluster IDs belong to their own cohort; do not join a WT
+cluster to a knockout cluster by number. The full ATAC peak sets may also
+differ between cohorts. The frozen-interval recount in Step 08J addresses
+exact-locus comparison separately.
+
+There is **one pooled library per diet per cohort**. The reported nucleus
+counts, CPM, detection differences, fold changes, and candidate counts are
+descriptive statistics. They do not supply animal-level P values, significant
+DARs, or a genotype-by-diet interaction test. A clear-effect threshold is an
+inspectable screen, not a significance threshold.
+
+The notebook requires the standard `config/project_config.R` and the saved
+Step 06 object/annotation CSV already used by the teaching pipeline. All
+calculation helpers are defined below; the dated `deliverables/` helper is
+**not** required. Allow substantial RAM (the Step 06 object plus one assay
+matrix) and time for the ATAC tables.
+
+## 1. Select one cohort and load the standard configuration
+
+From the repository root on SOL, set `MULTIOME_COHORT_ID` to `wt`, `ppar`, or
+`il17` before running the chunks or rendering. If unset, this notebook starts
+with `wt`. The project root is explicit so it also works when RStudio's working
+directory is different. Results are separated by cohort.
+
+For a noninteractive run after downloading this Rmd to `analysis/`:
+
+```bash
+cd /scratch/dsaiz/multiome_scRNA-ATAC
+MULTIOME_COHORT_ID=wt Rscript -e 'rmarkdown::render("analysis/07d_whole_wnn_cluster_diet_response.Rmd", output_file="07d_wt_whole_WNN_v3.html")'
+MULTIOME_COHORT_ID=ppar Rscript -e 'rmarkdown::render("analysis/07d_whole_wnn_cluster_diet_response.Rmd", output_file="07d_ppar_whole_WNN_v3.html")'
+MULTIOME_COHORT_ID=il17 Rscript -e 'rmarkdown::render("analysis/07d_whole_wnn_cluster_diet_response.Rmd", output_file="07d_il17_whole_WNN_v3.html")'
+```
+
+Run one cohort at a time. The HTML notebook is a run record; detailed results
+are written beneath each cohort's `07d_whole_wnn_cluster_diet_response`
+directory in the configured results tree.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+  fig.width = 11, fig.height = 7)
+REPO_ROOT <- Sys.getenv("MULTIOME_REPO_ROOT",
+  unset = getwd())
+if (!file.exists(file.path(REPO_ROOT, "config", "project_config.R"))) {
+  stop("Cannot find the teaching pipeline at REPO_ROOT: ", REPO_ROOT)
+}
+REPO_ROOT <- normalizePath(REPO_ROOT)
+COHORT_TO_RUN <- tolower(Sys.getenv("MULTIOME_COHORT_ID", unset = "wt"))
+if (!COHORT_TO_RUN %in% c("wt", "ppar", "il17")) {
+  stop("MULTIOME_COHORT_ID must be wt, ppar, or il17.")
+}
+Sys.setenv(MULTIOME_DATASET_VERSION = "v2_resequenced",
+  MULTIOME_COHORT_ID = COHORT_TO_RUN)
+source(file.path(REPO_ROOT, "config", "project_config.R"))
+suppressPackageStartupMessages({
+  library(SeuratObject)
+  library(Signac)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+})
+stopifnot(DATASET_VERSION == "v2_resequenced", COHORT_ID == COHORT_TO_RUN)
+
+STEP6_OBJECT <- file.path(OUTPUT_DIR, "06_annotation", "multiome_annotated.rds")
+DECISIONS <- file.path(DATASET_CONFIG_DIR, "cohorts", COHORT_ID,
+  "cell_state_annotations.csv")
+OUT <- file.path(OUTPUT_DIR, "07d_whole_wnn_cluster_diet_response")
+TABLES <- file.path(OUT, "tables")
+PLOTS <- file.path(OUT, "plots")
+for (p in c(OUT, TABLES, PLOTS))
+  dir.create(p, recursive = TRUE, showWarnings = FALSE)
+
+# Match the effect and feature-evaluability thresholds in teaching Step 07.
+MIN_N_EXPLORATORY <- 30L
+MIN_N_TIER_B <- 100L
+MIN_N_TIER_A <- 200L
+CPM_PSEUDOCOUNT <- 0.10
+MIN_TOTAL_COUNTS <- c(RNA = 20L, ATAC = 30L)
+MIN_DETECTION_PERCENT <- c(RNA = 5, ATAC = 1)
+CLEAR_ABS_LOG2FC <- 0.50
+RNA_MIN_DETECTION_DELTA_PP <- 5
+TOP_N_PER_DIRECTION <- c(RNA = 250L, ATAC = 500L)
+
+need <- function(ok, message) {
+  if (length(ok) != 1L || is.na(ok) || !ok) stop(message, call. = FALSE)
+}
+need_columns <- function(x, columns, label) {
+  missing <- setdiff(columns, names(x))
+  need(!length(missing), paste(label, "missing columns:",
+    paste(missing, collapse = ", ")))
+}
+write_table <- function(x, directory, filename) {
+  readr::write_csv(x, file.path(directory, filename), na = "NA")
+}
+align_counts <- function(x, cells, label) {
+  need(!is.null(colnames(x)) && !anyDuplicated(colnames(x)) &&
+    !anyDuplicated(cells), paste(label, "has missing/duplicated cell IDs."))
+  need(setequal(colnames(x), cells),
+    paste(label, "does not contain exactly the Step 06 nuclei."))
+  x <- x[, cells, drop = FALSE]
+  need(identical(colnames(x), cells) && !anyDuplicated(rownames(x)),
+    paste(label, "could not be aligned or has duplicate features."))
+  x
+}
+```
+
+## 2. Verify the saved object, pooled libraries, and approved parent labels
+
+The annotation CSV contains one row for each global WNN parent and may also
+contain approved child `annotation_unit` rows. IL17's `11_tuft` is a child of
+WNN 11, which also contains the residual annotation unit `11`. Their distinct
+labels remain in the audit; the whole WNN 11 label is marked mixed.
+
+```{r load-and-audit}
+need(file.exists(STEP6_OBJECT), paste("Missing Step 06 object:", STEP6_OBJECT))
+need(file.exists(DECISIONS), paste("Missing approved annotation CSV:", DECISIONS))
+manifest_paths <- c(STEP6_OBJECT, DECISIONS)
+manifest_info <- file.info(manifest_paths)
+write_table(tibble::tibble(path = normalizePath(manifest_paths),
+  bytes = manifest_info$size, modified = as.character(manifest_info$mtime)),
+  OUT, "00_input_manifest.csv")
+
+decisions <- readr::read_csv(DECISIONS, show_col_types = FALSE)
+need_columns(decisions, c("cluster", "cell_state", "approved",
+  "annotation_confidence"), "Step 06 decisions")
+decisions$cluster <- as.character(decisions$cluster)
+need(!anyDuplicated(decisions$cluster) && all(decisions$approved %in% TRUE),
+  "An annotation unit is duplicated or lacks approval in Step 06 decisions.")
+if (!"parent_wnn_cluster" %in% names(decisions)) {
+  # WT and PPAR approvals have only global parent rows.
+  decisions$parent_wnn_cluster <- decisions$cluster
+}
+decisions$parent_wnn_cluster <- as.character(decisions$parent_wnn_cluster)
+need(!anyNA(decisions$parent_wnn_cluster) &&
+  all(nzchar(decisions$parent_wnn_cluster)),
+  "An approved annotation unit lacks its global WNN parent.")
+is_child <- decisions$cluster != decisions$parent_wnn_cluster
+parent_decisions <- decisions[!is_child, , drop = FALSE]
+child_decisions <- decisions[is_child, , drop = FALSE]
+need(!anyDuplicated(parent_decisions$cluster) &&
+  all(child_decisions$parent_wnn_cluster %in% parent_decisions$cluster),
+  "An approved child lacks an approved global WNN parent.")
+
+obj <- readRDS(STEP6_OBJECT)
+need(all(c("RNA", "ATAC") %in% names(obj)),
+  "The Step 06 object must contain RNA and ATAC assays.")
+meta <- obj[[]]
+meta$cell_barcode <- rownames(meta)
+need_columns(meta, c("cell_barcode", "wnn_cluster", "cell_state",
+  "sample_id", "diet"), "Step 06 metadata")
+meta$wnn_cluster <- as.character(meta$wnn_cluster)
+meta$diet <- as.character(meta$diet)
+meta$sample_id <- as.character(meta$sample_id)
+if ("annotation_unit" %in% names(meta)) {
+  meta$annotation_unit <- as.character(meta$annotation_unit)
+} else {
+  need(!nrow(child_decisions),
+    "Approved focused children require annotation_unit in the Step 06 object.")
+  meta$annotation_unit <- meta$wnn_cluster
+}
+need(!anyDuplicated(meta$cell_barcode) &&
+  setequal(unique(meta$diet), c("CON", "HFD")) &&
+  setequal(unique(meta$wnn_cluster), parent_decisions$cluster) &&
+  setequal(unique(meta$annotation_unit), decisions$cluster),
+  paste("Step 06 global WNN/annotation unit identities differ from the",
+    "approved parent/child decision rows. Review the Step 06 object."))
+unit_match <- match(meta$annotation_unit, decisions$cluster)
+need(!anyNA(unit_match) &&
+  identical(meta$wnn_cluster,
+    decisions$parent_wnn_cluster[unit_match]) &&
+  identical(as.character(meta$cell_state),
+    as.character(decisions$cell_state[unit_match])),
+  "A Step 06 annotation unit has the wrong global WNN parent or approved label.")
+observed_unit_n <- table(meta$annotation_unit)
+write_table(tibble::tibble(annotation_unit = decisions$cluster,
+  parent_wnn_cluster = decisions$parent_wnn_cluster,
+  decision_n = if ("nuclei" %in% names(decisions))
+    as.integer(decisions$nuclei) else NA_integer_,
+  observed_n = as.integer(observed_unit_n[decisions$cluster])),
+  TABLES, "01_approved_annotation_unit_count_audit.csv")
+
+library_map <- dplyr::distinct(meta, sample_id, diet)
+need(nrow(library_map) == 2L && !anyDuplicated(library_map$sample_id) &&
+  setequal(library_map$diet, c("CON", "HFD")),
+  "Expected one pooled sample_id for CON and one for HFD in this cohort.")
+write_table(library_map, TABLES, "01_pooled_sample_id_and_diet.csv")
+
+k <- match(meta$wnn_cluster, parent_decisions$cluster)
+need(!anyNA(k), "Some Step 06 nuclei lack an approved WNN parent row.")
+parent_decisions$whole_cluster_label <- parent_decisions$cell_state
+parent_decisions$whole_label_basis <- "approved_parent_label"
+parent_decisions$whole_annotation_confidence <-
+  parent_decisions$annotation_confidence
+for (parent_id in unique(child_decisions$parent_wnn_cluster)) {
+  child_labels <- unique(child_decisions$cell_state[
+    child_decisions$parent_wnn_cluster == parent_id])
+  pk <- match(parent_id, parent_decisions$cluster)
+  parent_decisions$whole_cluster_label[pk] <- paste0("Mixed: ",
+    parent_decisions$cell_state[pk], " + ",
+    paste(child_labels, collapse = " + "))
+  parent_decisions$whole_label_basis[pk] <- "composite_parent_plus_child"
+  parent_decisions$whole_annotation_confidence[pk] <- "mixed"
+}
+write_table(dplyr::select(decisions, cluster, parent_wnn_cluster,
+  cell_state, annotation_confidence, approved), TABLES,
+  "01_approved_parent_and_child_annotation_units.csv")
+write_table(dplyr::select(parent_decisions, cluster, cell_state,
+  annotation_confidence, whole_cluster_label, whole_label_basis,
+  whole_annotation_confidence), TABLES,
+  "01_whole_parent_label_resolution.csv")
+meta$whole_cluster_label <- parent_decisions$whole_cluster_label[k]
+meta$parent_decision_label <- parent_decisions$cell_state[k]
+meta$annotation_confidence <-
+  parent_decisions$whole_annotation_confidence[k]
+meta$whole_label_basis <- parent_decisions$whole_label_basis[k]
+meta$refined_label_differs <- !is.na(meta$cell_state) &
+  as.character(meta$cell_state) != as.character(meta$parent_decision_label)
+label_audit <- meta |>
+  dplyr::count(wnn_cluster, annotation_unit, parent_decision_label,
+    whole_cluster_label, cell_state, refined_label_differs,
+    name = "n_nuclei") |>
+  dplyr::arrange(wnn_cluster, dplyr::desc(n_nuclei))
+write_table(label_audit, TABLES, "01_whole_vs_nucleus_label_audit.csv")
+
+units <- meta |>
+  dplyr::count(wnn_cluster, whole_cluster_label,
+    annotation_confidence, diet, name = "n") |>
+  tidyr::complete(tidyr::nesting(wnn_cluster, whole_cluster_label,
+    annotation_confidence), diet = c("CON", "HFD"), fill = list(n = 0L)) |>
+  tidyr::pivot_wider(names_from = diet, values_from = n, names_prefix = "n_") |>
+  dplyr::mutate(n_total = n_CON + n_HFD,
+    tier = dplyr::case_when(
+      pmin(n_CON, n_HFD) >= MIN_N_TIER_A ~ "A_200_per_diet",
+      pmin(n_CON, n_HFD) >= MIN_N_TIER_B ~ "B_100_per_diet",
+      pmin(n_CON, n_HFD) >= MIN_N_EXPLORATORY ~ "C_exploratory_30_per_diet",
+      TRUE ~ "composition_only"),
+    effect_evaluable = tier != "composition_only",
+    primary = tier %in% c("A_200_per_diet", "B_100_per_diet")) |>
+  dplyr::arrange(as.integer(wnn_cluster))
+need(sum(units$n_total) == nrow(meta),
+  "Whole-cluster count table did not include every Step 06 nucleus.")
+write_table(units, TABLES, "01_whole_cluster_diet_counts_and_tiers.csv")
+print(units)
+```
+
+## 3. Show population composition and eligibility
+
+The denominator is all retained Step 06 nuclei in that diet's pooled library.
+This is a descriptive difference in representation, which may also reflect
+capture and library composition.
+
+```{r population-composition}
+totals <- meta |> dplyr::count(diet, name = "library_n")
+composition <- units |>
+  dplyr::mutate(CON_percent = 100 * n_CON /
+      totals$library_n[match("CON", totals$diet)],
+    HFD_percent = 100 * n_HFD /
+      totals$library_n[match("HFD", totals$diet)],
+    difference_pp = HFD_percent - CON_percent)
+write_table(composition, TABLES, "02_whole_cluster_composition.csv")
+p_composition <- ggplot2::ggplot(composition,
+  ggplot2::aes(x = difference_pp,
+    y = reorder(paste0("W", wnn_cluster, " ", whole_cluster_label),
+      difference_pp), color = tier)) +
+  ggplot2::geom_vline(xintercept = 0, color = "grey60") +
+  ggplot2::geom_segment(ggplot2::aes(x = 0, xend = difference_pp,
+    yend = reorder(paste0("W", wnn_cluster, " ", whole_cluster_label),
+      difference_pp)), linewidth = .5) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::labs(title = paste(toupper(COHORT_ID), "whole WNN clusters"),
+    subtitle = "Percent of pooled HFD nuclei minus percent of pooled CON nuclei",
+    x = "HFD minus CON (percentage points)", y = NULL,
+    caption = "Descriptive library composition, not a replicated abundance test.") +
+  ggplot2::theme_bw(base_size = 10)
+print(p_composition)
+ggplot2::ggsave(file.path(PLOTS, "01_whole_cluster_composition.pdf"),
+  p_composition, width = 11, height = 8, device = grDevices::pdf,
+  useDingbats = FALSE)
+```
+
+## 4. Calculate whole-cluster pooled RNA and ATAC effects
+
+For each eligible whole cluster, pool raw counts within each diet and divide
+by the **total assay counts in its selected nuclei** to calculate CPM. Use
+identical pseudocounts and feature thresholds across cohorts. The RNA clear
+screen also requires at least a five-percentage-point detection change.
+ATAC clear effects require the count/detection minimum and absolute pooled
+log2FC >= 0.5. Neither rule is a hypothesis test.
+
+A separate compressed full feature table is written for each cluster. That
+keeps memory bounded and preserves counts, CPM, detection, eligibility, and
+effect size for later re-screening. The compact top table and whole-cluster
+summary are also exported for each modality.
+
+```{r pooled-effect-function}
+pooled_effect <- function(counts, meta, cluster_id, modality, depth) {
+  ix <- which(meta$wnn_cluster == cluster_id)
+  con <- ix[meta$diet[ix] == "CON"]
+  hfd <- ix[meta$diet[ix] == "HFD"]
+  need(length(con) >= MIN_N_EXPLORATORY &&
+    length(hfd) >= MIN_N_EXPLORATORY,
+    paste("Insufficient nuclei for WNN", cluster_id))
+  a <- Matrix::rowSums(counts[, con, drop = FALSE])
+  b <- Matrix::rowSums(counts[, hfd, drop = FALSE])
+  total_con <- sum(depth[con]); total_hfd <- sum(depth[hfd])
+  need(total_con > 0 && total_hfd > 0,
+    paste("Zero assay depth in WNN", cluster_id, modality))
+  con_detection <- 100 * Matrix::rowMeans(counts[, con, drop = FALSE] > 0)
+  hfd_detection <- 100 * Matrix::rowMeans(counts[, hfd, drop = FALSE] > 0)
+  con_cpm <- 1e6 * a / total_con
+  hfd_cpm <- 1e6 * b / total_hfd
+  effect <- log2((hfd_cpm + CPM_PSEUDOCOUNT) /
+    (con_cpm + CPM_PSEUDOCOUNT))
+  detected_delta <- hfd_detection - con_detection
+  evaluable <- (a + b >= MIN_TOTAL_COUNTS[[modality]]) &
+    pmax(con_detection, hfd_detection) >=
+      MIN_DETECTION_PERCENT[[modality]]
+  clear <- evaluable & abs(effect) >= CLEAR_ABS_LOG2FC &
+    (modality == "ATAC" | abs(detected_delta) >=
+      RNA_MIN_DETECTION_DELTA_PP)
+  tibble::tibble(feature = rownames(counts),
+    CON_n = length(con), HFD_n = length(hfd),
+    CON_counts = as.numeric(a), HFD_counts = as.numeric(b),
+    CON_CPM = as.numeric(con_cpm), HFD_CPM = as.numeric(hfd_cpm),
+    CON_percent_detected = as.numeric(con_detection),
+    HFD_percent_detected = as.numeric(hfd_detection),
+    detection_delta_pp = as.numeric(detected_delta),
+    log2FC_HFD_vs_CON = as.numeric(effect),
+    evaluable = as.logical(evaluable), clear_effect = as.logical(clear),
+    direction = dplyr::case_when(effect > 0 ~ "HFD_higher",
+      effect < 0 ~ "HFD_lower", TRUE ~ "unchanged"))
+}
+
+# The number to retain is evaluated outside dplyr's data mask. Use ordinary
+# indices to avoid evaluating .env or a similarly named feature-table column
+# inside slice_max()/slice_head(). Break equal-effect ties by feature name.
+select_top_clear_effects <- function(eff, n_per_direction) {
+  need(length(n_per_direction) == 1L && is.finite(n_per_direction) &&
+    n_per_direction >= 1L, "Invalid number of top features.")
+  clear_rows <- which(eff$clear_effect %in% TRUE)
+  if (!length(clear_rows)) return(eff[0, , drop = FALSE])
+  by_direction <- split(clear_rows, eff$direction[clear_rows])
+  top_rows <- unlist(lapply(by_direction, function(ix) {
+    ix <- ix[order(-abs(eff$log2FC_HFD_vs_CON[ix]), eff$feature[ix])]
+    utils::head(ix, as.integer(n_per_direction))
+  }), use.names = FALSE)
+  eff[top_rows, , drop = FALSE]
+}
+```
+
+```{r whole-cluster-effects}
+for (modality in c("RNA", "ATAC")) {
+  message("Calculating whole-cluster ", modality, " effects: ", COHORT_ID)
+  need("counts" %in% SeuratObject::Layers(obj[[modality]]),
+    paste("Joined counts layer missing from", modality))
+  counts <- align_counts(SeuratObject::LayerData(
+    obj[[modality]], layer = "counts"), meta$cell_barcode,
+    paste(COHORT_ID, modality))
+  depth <- Matrix::colSums(counts)
+  need(all(is.finite(depth)) && all(depth >= 0),
+    paste("Nonfinite or negative depth in", modality))
+  top_n <- unname(TOP_N_PER_DIRECTION[[modality]])
+  detail_dir <- file.path(TABLES, paste0(modality, "_full_by_WNN"))
+  dir.create(detail_dir, recursive = TRUE, showWarnings = FALSE)
+  summary_rows <- list(); top_rows <- list()
+  eligible <- units[units$effect_evaluable, , drop = FALSE]
+  for (j in seq_len(nrow(eligible))) {
+    row <- eligible[j, ]
+    cluster_id <- row$wnn_cluster[[1]]
+    message("  WNN ", cluster_id, ": ", row$n_CON,
+      " CON / ", row$n_HFD, " HFD")
+    eff <- pooled_effect(counts, meta, cluster_id, modality, depth) |>
+      dplyr::mutate(cohort = COHORT_ID, modality = .env$modality,
+        wnn_cluster = .env$cluster_id,
+        whole_cluster_label = row$whole_cluster_label[[1]],
+        tier = row$tier[[1]], .before = 1)
+    write_table(eff, detail_dir,
+      paste0("WNN_", cluster_id, "_pooled_effects.csv.gz"))
+    ev <- eff$evaluable
+    summary_rows[[j]] <- tibble::tibble(
+      cohort = COHORT_ID, modality = modality,
+      wnn_cluster = cluster_id,
+      whole_cluster_label = row$whole_cluster_label[[1]],
+      tier = row$tier[[1]], n_CON = row$n_CON[[1]],
+      n_HFD = row$n_HFD[[1]], total_features = nrow(eff),
+      evaluable_features = sum(ev),
+      clear_HFD_higher = sum(eff$clear_effect &
+        eff$log2FC_HFD_vs_CON > 0),
+      clear_HFD_lower = sum(eff$clear_effect &
+        eff$log2FC_HFD_vs_CON < 0),
+      median_abs_log2FC_evaluable = if (any(ev))
+        median(abs(eff$log2FC_HFD_vs_CON[ev])) else NA_real_)
+    top_rows[[j]] <- select_top_clear_effects(eff, top_n)
+    rm(eff); invisible(gc())
+  }
+  modality_summary <- dplyr::bind_rows(summary_rows)
+  write_table(modality_summary, TABLES,
+    paste0("03_", modality, "_whole_cluster_effect_summary.csv"))
+  write_table(dplyr::bind_rows(top_rows), TABLES,
+    paste0("04_", modality, "_top_descriptive_effects.csv.gz"))
+  rm(counts, depth, summary_rows, top_rows); invisible(gc())
+}
+```
+
+## 5. Review the effect counts and complete the cohort run
+
+Counts of screened features depend on population size and assay depth. The
+full per-cluster tables provide the denominators and continuous effect sizes;
+compare those before describing differences between clusters or cohorts.
+
+```{r effect-summary-figure}
+rna_summary <- readr::read_csv(file.path(TABLES,
+  "03_RNA_whole_cluster_effect_summary.csv"), show_col_types = FALSE)
+atac_summary <- readr::read_csv(file.path(TABLES,
+  "03_ATAC_whole_cluster_effect_summary.csv"), show_col_types = FALSE)
+combined <- dplyr::bind_rows(rna_summary, atac_summary)
+plot_table <- combined |>
+  tidyr::pivot_longer(c(clear_HFD_higher, clear_HFD_lower),
+    names_to = "direction", values_to = "n_features") |>
+  dplyr::mutate(display_label = paste0("W", wnn_cluster,
+    " ", whole_cluster_label))
+p_effects <- ggplot2::ggplot(plot_table,
+  ggplot2::aes(x = display_label, y = n_features, fill = direction)) +
+  ggplot2::geom_col() +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~modality, scales = "free_x") +
+  ggplot2::scale_fill_manual(values = c(clear_HFD_higher = "#56B4E9",
+    clear_HFD_lower = "#E69F00"),
+    labels = c("HFD higher", "HFD lower")) +
+  ggplot2::labs(title = paste(toupper(COHORT_ID),
+      "whole WNN cluster RNA and ATAC screens"),
+    subtitle = "One pooled CON and one pooled HFD library",
+    x = "Approved whole WNN cluster", y = "Features passing descriptive clear-effect rule",
+    caption = "Counts depend on evaluable features, cell numbers and depth; no biological-replicate P values.") +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(legend.title = ggplot2::element_blank(),
+    plot.caption = ggplot2::element_text(hjust = 0))
+print(p_effects)
+ggplot2::ggsave(file.path(PLOTS, "02_whole_cluster_RNA_ATAC_effect_counts.pdf"),
+  p_effects, width = 13, height = 9, device = grDevices::pdf,
+  useDingbats = FALSE)
+
+write_table(tibble::tibble(cohort = COHORT_ID, dataset = DATASET_VERSION,
+  analysis_unit = "whole approved WNN cluster", all_nuclei = nrow(meta),
+  all_clusters = nrow(units), primary_clusters = sum(units$primary),
+  exploratory_clusters = sum(units$tier == "C_exploratory_30_per_diet"),
+  library_design = "one pooled CON and one pooled HFD library",
+  rna_full_tables = sum(units$effect_evaluable),
+  atac_full_tables = sum(units$effect_evaluable)),
+  OUT, "05_run_summary.csv")
+writeLines(c(paste("Step 07D complete:", COHORT_ID),
+  "Unit: whole approved Step 06 WNN clusters.",
+  "One pooled library per diet; no mouse-level diet test.",
+  paste("Outputs:", OUT)), file.path(OUT, "STEP_07D_COMPLETE.txt"))
+message("Step 07D output: ", OUT)
+```
+
+## Questions for review
+
+1. Do WNN 0 in WT, annotated cycling ISC parents in PPAR/IL17, and their
+   context populations retain the expected marker identities?
+2. Are RNA and ATAC effect sizes stable enough to describe at the whole-state
+   level, and which changes merit exact-coordinate genotype comparison?
+3. Which small or diet-imbalanced states should remain exploratory?
